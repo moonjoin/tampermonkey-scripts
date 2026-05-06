@@ -48,3 +48,9 @@
 | B站省流助手 - 字幕AI摘要 Pro | B站观看 | 主动总结，视频+评论AI总结、省流 |
 | 饺子 AI 网页摘要助手 | 通用网页 | 自动弹出总结，连续对话 |
 | Folo 网站增强工具 | FOLO网页版 | 替代官方 AI 总结，接入自己 api |
+
+---
+推荐接入模型（国内环境）：
+- flash模型最优，速度快，价格便宜，忠实总结原文，且无需深度推理。
+- 各家 Flash 比：小米 MiMo‑V2‑Flash 最快，其次是 Claude Haiku 4.5，然后是 DeepSeek V4‑Flash。（2026‑05，公开基准 / 个人体验）
+<img width="772" height="1004" alt="CFWBPV" src="https://github.com/user-attachments/assets/6189d7fc-d2ec-4386-8cd7-315342dd3ff6" />
