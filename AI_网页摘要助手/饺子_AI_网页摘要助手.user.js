@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         饺子 AI 网页摘要助手
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      2.6.6
+// @version      2.6.7
 // @description  指定网站自动弹出 AI 网页摘要，支持连续对话、多预设、多模板、SPA路由，flomo、坚果云双文件云同步。
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
@@ -1456,7 +1456,7 @@
 
     panelEl.querySelector('#tabbit-close-btn').addEventListener('click', closePanel);
     panelEl.querySelector('#tabbit-settings-btn').addEventListener('click', openSettings);
-    panelEl.querySelector('#tabbit-run-btn').addEventListener('click', () => runSummary(false));
+    panelEl.querySelector('#tabbit-run-btn').onclick = () => runSummary(false);
     panelEl.querySelector('#tabbit-preview-btn').addEventListener('click', showPagePreview);
     panelEl.querySelector('#tabbit-addrule-btn').addEventListener('click', quickAddCurrentUrlToRules);
     panelEl.querySelector('#tabbit-copy-btn').addEventListener('click', copyAllConversation);
@@ -1600,8 +1600,16 @@
       if (t.id === matchedTpl.id) opt.selected = true;
       select.appendChild(opt);
     });
+    // 🆕 切换提示词预设后自动重新总结
+    select.onchange = function () {
+      const tpl = config.promptTemplates.find(t => t.id === this.value);
+      setStatus(`已切换到「${tpl?.name || '模板'}」，自动重新总结…`, 'loading');
+      // 如果有正在进行的请求，先中断
+      abortCurrentRequest();
+      // 稍延迟，确保中断完成后再发起新总结
+      setTimeout(() => runSummary(false), 100);
+    };
   }
-
   /******************************************************************
    * 13. 📋 复制 / 🌱 flomo / 🗑 清空
    ******************************************************************/
