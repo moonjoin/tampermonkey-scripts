@@ -1,7 +1,8 @@
 # tampermonkey-scripts
 个人油猴脚本聚集处：
-https://greasyfork.org/zh-CN/users/1593947-moon-join
-
+- 发布站：https://greasyfork.org/zh-CN/users/1593947-moon-join
+- 国内代理：https://home.greasyfork.org.cn/zh-hans/lookup/#?q=moonjoin
+- 解决主要痛点：自动触发AI总结，模型和提示词预设切换，基于原文连续对话，快捷发送到flomo笔记，配置坚果云同步
 ---
 
 ### 1. B站省流助手 - 字幕AI摘要 Pro
