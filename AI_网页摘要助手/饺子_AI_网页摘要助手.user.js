@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         饺子 AI 网页摘要助手
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      2.6.8
+// @version      2.6.9
 // @description  指定网站自动弹出 AI 网页摘要，支持连续对话、多预设、多模板、SPA路由，flomo、坚果云双文件云同步。
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
@@ -1600,14 +1600,15 @@
       if (t.id === matchedTpl.id) opt.selected = true;
       select.appendChild(opt);
     });
-    // 🆕 切换提示词预设后自动重新总结
+    // 🆕 切换提示词预设后追加总结（保留之前的对话内容，不修改全局默认提示词）
     select.onchange = function () {
       const tpl = config.promptTemplates.find(t => t.id === this.value);
-      setStatus(`已切换到「${tpl?.name || '模板'}」，自动重新总结…`, 'loading');
+      if (!tpl) return;
+      setStatus(`已切换到「${tpl.name}」，正在追加总结…`, 'loading');
       // 如果有正在进行的请求，先中断
       abortCurrentRequest();
-      // 稍延迟，确保中断完成后再发起新总结
-      setTimeout(() => runSummary(false), 100);
+      // 稍延迟，确保中断完成后再发起追加总结
+      setTimeout(() => runSummaryAppend(tpl), 100);
     };
   }
   /******************************************************************
@@ -1865,6 +1866,51 @@
         runBtn.disabled = false;
         runBtn.textContent = '✨ 总结';
         runBtn.onclick = () => runSummary(false);
+    }
+  }
+
+  /**
+   * 🆕 追加总结：切换预设时调用，保留现有对话，用新模板追加一次总结
+   * 不修改 config.defaultPromptTemplateId（全局默认提示词只在设置窗口修改）
+   */
+  async function runSummaryAppend(template) {
+    if (!panelEl) createPanel();
+    if (panelEl.classList.contains('tabbit-hidden')) panelEl.classList.remove('tabbit-hidden');
+    if (!checkApiConfig()) return;
+
+    const pageText = getPageText();
+    if (!pageText || pageText.length < 30) {
+      setStatus('页面正文过短', 'error', 2500); return;
+    }
+
+    // 确保页面上下文已注入（如果之前没有总结过，也能正常工作）
+    ensurePageContext();
+
+    const userPrompt = `请按以下要求重新总结当前页面（使用「${template.name}」风格）：\n\n${template.text}`;
+    // 总结指令只进对话历史（供 AI 上下文使用），不在界面显示
+    conversation.push({ role: 'user', content: userPrompt, meta: { hidden: true } });
+
+    const runBtn = panelEl.querySelector('#tabbit-run-btn');
+    runBtn.disabled = true;
+    setStatus(`使用「${template.name}」模板追加总结，模型 ${getCurrentModelDisplayName()}…`, 'loading');
+
+    // 占位
+    const placeholder = { role: 'assistant', content: '🤖 正在思考…', meta: { model: getCurrentModelDisplayName(), placeholder: true } };
+    conversation.push(placeholder);
+    renderConversation();
+
+    try {
+      const content = await callChatApi(conversation.filter(m => !m.meta?.placeholder).map(m => ({ role: m.role, content: m.content })));
+      // 替换占位
+      conversation.pop();
+      appendMessage('assistant', content, { model: `${getCurrentModelDisplayName()} · ${template.name}` });
+      setStatus('完成', 'ok', 1500);
+    } catch (err) {
+      conversation.pop();
+      appendMessage('assistant', `❌ ${err.message || err}`, { model: getCurrentModelDisplayName() });
+      setStatus('生成失败', 'error', 2500);
+    } finally {
+      runBtn.disabled = false;
     }
   }
 

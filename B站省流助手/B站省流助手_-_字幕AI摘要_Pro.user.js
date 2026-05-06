@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站省流助手 - 字幕AI摘要 Pro
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      3.5.5
+// @version      3.5.6
 // @description  自动提取B站视频字幕，通过自定义AI API生成极简摘要，支持模型切换、持续对话和评论区总结；配置项（API/模型列表）存储于localStorage，支持设置界面导入导出；支持自动解析开关、悬浮窗/面板可拖动、自动获取模型列表、flomo自动加标签
 // @author       次元饺子
 // @match        https://www.bilibili.com/video/*
@@ -1869,28 +1869,109 @@
   }
 
   // 绑定预设切换事件
+  // 🆕 切换预设时：保留之前的对话内容，追加新预设的总结；不修改全局配置
   function bindPresetChips(panel, videoInfo) {
     panel.querySelectorAll('.tabbit-preset-chip').forEach(chip => {
       chip.addEventListener('click', async function() {
         if (chip.classList.contains('disabled')) return;
         const newId = chip.dataset.presetId;
-        if (newId === CONFIG.activePresetId) return;
         const preset = (CONFIG.promptPresets || []).find(p => p.id === newId);
         if (!preset) return;
-        // 切换激活的预设
-        CONFIG.activePresetId = newId;
-        CONFIG.promptText = preset.prompt;
-        saveConfig(CONFIG);
-        // 切换 UI 高亮
+        // 只切换 UI 高亮，不修改全局 CONFIG.activePresetId / CONFIG.promptText，不 saveConfig
         panel.querySelectorAll('.tabbit-preset-chip').forEach(c => c.classList.remove('active'));
         chip.classList.add('active');
-        // 用新预设重新总结
+        // 用新预设追加总结（保留之前的对话内容）
         if (rawTranscript) {
-          conversationHistory = [];
-          await runSummary(panel, rawTranscript, videoInfo || currentVideoInfo);
+          await appendPresetSummary(panel, preset, videoInfo || currentVideoInfo);
         }
       });
     });
+  }
+
+  /**
+   * 🆕 追加预设总结：切换预设时调用，保留现有对话，用新预设的提示词追加一次总结
+   * 不修改 CONFIG.activePresetId / CONFIG.promptText，不调用 saveConfig
+   */
+  async function appendPresetSummary(panel, preset, videoInfo) {
+    const contentDiv = panel.querySelector('.tabbit-panel-content');
+    const input = panel.querySelector('.tabbit-chat-input');
+    const sendBtn = panel.querySelector('.tabbit-chat-send');
+
+    // 禁用交互
+    panel.querySelectorAll('.tabbit-model-chip').forEach(c => c.classList.add('disabled'));
+    panel.querySelectorAll('.tabbit-preset-chip').forEach(c => c.classList.add('disabled'));
+    input.disabled = true;
+    sendBtn.disabled = true;
+
+    const pageUrl = window.location.href;
+    const fullPrompt = preset.prompt + '\n\n视频URL: ' + pageUrl + '\n视频标题: ' + (videoInfo.title || '') + '\nUP主: ' + (videoInfo.upName || '') + '\n\n字幕内容:\n' + rawTranscript;
+
+    // 确保有对话消息容器
+    let messagesContainer = contentDiv.querySelector('.tabbit-chat-messages');
+    if (!messagesContainer) {
+      messagesContainer = document.createElement('div');
+      messagesContainer.className = 'tabbit-chat-messages';
+      contentDiv.appendChild(messagesContainer);
+    }
+
+    // 显示加载状态
+    const loadingMsg = document.createElement('div');
+    loadingMsg.className = 'tabbit-msg-loading';
+    loadingMsg.innerHTML = '<span></span><span></span><span></span>';
+    messagesContainer.appendChild(loadingMsg);
+    contentDiv.scrollTop = contentDiv.scrollHeight;
+
+    // 添加一个分隔标识
+    const dividerMsg = document.createElement('div');
+    dividerMsg.style.cssText = 'text-align:center;font-size:11px;color:#999;margin:8px 0;padding:4px 0;border-top:1px dashed #e0e0e0;';
+    dividerMsg.textContent = '🎨 切换风格：' + (preset.icon || '') + ' ' + preset.name;
+    messagesContainer.insertBefore(dividerMsg, loadingMsg);
+
+    try {
+      // 用新预设的提示词发起请求（不清空 conversationHistory，但这次请求独立使用新 prompt）
+      const messages = [{ role: 'user', content: fullPrompt }];
+      const reply = await callAI(messages);
+
+      // 将新的对话追加到 conversationHistory（这样后续追问可以基于最新的总结）
+      conversationHistory.push({ role: 'user', content: fullPrompt });
+      conversationHistory.push({ role: 'assistant', content: reply });
+
+      // 移除加载动画
+      loadingMsg.remove();
+
+      // 追加 AI 回复到对话区域
+      const aiWrap = document.createElement('div');
+      aiWrap.style.cssText = 'display:flex;flex-direction:column;align-items:flex-start;';
+      const aiMsg = document.createElement('div');
+      aiMsg.className = 'tabbit-msg tabbit-msg-ai';
+      aiMsg.innerHTML = parseMarkdown(reply);
+      const modelTag = document.createElement('div');
+      modelTag.className = 'tabbit-msg-model';
+      modelTag.textContent = '🤖 ' + currentModel + ' · ' + preset.name;
+      aiWrap.appendChild(aiMsg);
+      aiWrap.appendChild(modelTag);
+      messagesContainer.appendChild(aiWrap);
+
+      // 更新 rawMarkdownResult 为最新的总结
+      rawMarkdownResult = reply;
+
+      contentDiv.scrollTop = contentDiv.scrollHeight;
+    } catch (err) {
+      console.error('[省流助手-预设切换]', err);
+      loadingMsg.remove();
+      const errMsg = document.createElement('div');
+      errMsg.className = 'tabbit-msg tabbit-msg-ai';
+      errMsg.style.background = '#fff3f3';
+      errMsg.style.color = '#c00';
+      errMsg.textContent = '⚠️ ' + err.message;
+      messagesContainer.appendChild(errMsg);
+      contentDiv.scrollTop = contentDiv.scrollHeight;
+    } finally {
+      panel.querySelectorAll('.tabbit-model-chip').forEach(c => c.classList.remove('disabled'));
+      panel.querySelectorAll('.tabbit-preset-chip').forEach(c => c.classList.remove('disabled'));
+      input.disabled = false;
+      sendBtn.disabled = false;
+    }
   }
 
   async function runSummary(panel, transcript, videoInfo) {
