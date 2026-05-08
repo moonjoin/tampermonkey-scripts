@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站省流助手 - 字幕AI摘要 Pro
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      3.6.0
+// @version      3.6.1
 // @description  自动提取B站视频字幕，通过自定义AI API生成极简摘要，支持模型切换、持续对话和评论区总结；支持自动解析开关、悬浮窗/面板可拖动、自动获取模型列表、flomo自动加标签，新增总结生图功能
 // @author       次元饺子
 // @match        https://www.bilibili.com/video/*
@@ -75,7 +75,8 @@
     enableImageGen: false,
     imageGenApiUrl: '',
     imageGenApiKey: '',
-    imageGenModel: 'gemini-3.1-flash-image-preview'
+    imageGenModel: 'gemini-3.1-flash-image-preview',
+    imageGenSize: '1024x1024'
   };
 
   function loadConfig() {
@@ -1629,7 +1630,7 @@
       const imageRes = await fetch(imageApiUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + apiKey },
-        body: JSON.stringify({ model: model, prompt: imagePrompt, n: 1, size: '1024x1024', response_format: 'b64_json' })
+        body: JSON.stringify({ model: model, prompt: imagePrompt, n: 1, size: CONFIG.imageGenSize || '1024x1024', response_format: 'b64_json' })
       });
 
       if (imageRes.ok) {
@@ -1646,7 +1647,7 @@
         const imageRes2 = await fetch(imageApiUrl, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + apiKey },
-          body: JSON.stringify({ model: model, prompt: imagePrompt, n: 1, size: '1024x1024' })
+          body: JSON.stringify({ model: model, prompt: imagePrompt, n: 1, size: CONFIG.imageGenSize || '1024x1024' })
         });
         if (imageRes2.ok) {
           const imageData2 = await imageRes2.json();
@@ -2014,7 +2015,7 @@
           model: model,
           prompt: imagePrompt,
           n: 1,
-          size: '1024x1024',
+          size: CONFIG.imageGenSize || '1024x1024',
           response_format: 'b64_json'
         })
       });
@@ -2059,7 +2060,7 @@
             model: model,
             prompt: imagePrompt,
             n: 1,
-            size: '1024x1024'
+            size: CONFIG.imageGenSize || '1024x1024'
           })
         });
 
@@ -2733,7 +2734,7 @@
             <div class="tabbit-switch-row">
               <div>
                 <div class="tabbit-settings-label">🖼️ 总结生图模式</div>
-                <div class="tabbit-settings-hint" style="margin-top:2px;">开启后，字幕原文将直接发送给生图模型，由模型一站式完成：理解内容 → 自动总结 → 生成配图，输出结果为图片+文字</div>
+                <div class="tabbit-settings-hint" style="margin-top:2px;">开启后，每次总结完成时会自动调用生图模型生成配图。<br>关闭时仍可通过结果区的「生成配图」按钮手动触发生图。</div>
               </div>
               <label class="tabbit-switch">
                 <input type="checkbox" id="ts-enableImageGen" ${CONFIG.enableImageGen ? 'checked' : ''} />
@@ -2751,10 +2752,21 @@
                 <input class="tabbit-settings-input" id="ts-imageGenApiKey" type="password" value="${escapeHtml(CONFIG.imageGenApiKey || '')}" placeholder="留空则使用上方的 API Key" />
                 <div class="tabbit-settings-hint">生图模型的 API 密钥，留空则复用上方的 API Key</div>
               </div>
-              <div>
+              <div style="margin-bottom:10px;">
                 <div class="tabbit-settings-label">生图模型名称</div>
                 <input class="tabbit-settings-input" id="ts-imageGenModel" type="text" value="${escapeHtml(CONFIG.imageGenModel || 'gemini-2.0-flash-preview-image-generation')}" placeholder="gemini-2.0-flash-preview-image-generation" />
                 <div class="tabbit-settings-hint">支持图片输出的模型名称，默认 gemini-2.0-flash-preview-image-generation</div>
+              </div>
+              <div>
+                <div class="tabbit-settings-label">生图尺寸</div>
+                <select class="tabbit-settings-input" id="ts-imageGenSize" style="cursor:pointer;">
+                  <option value="1024x1024" ${(CONFIG.imageGenSize || '1024x1024') === '1024x1024' ? 'selected' : ''}>1024×1024（1:1 正方形）</option>
+                  <option value="1792x1024" ${CONFIG.imageGenSize === '1792x1024' ? 'selected' : ''}>1792×1024（16:9 横版）</option>
+                  <option value="1024x1792" ${CONFIG.imageGenSize === '1024x1792' ? 'selected' : ''}>1024×1792（9:16 竖版）</option>
+                  <option value="1536x1024" ${CONFIG.imageGenSize === '1536x1024' ? 'selected' : ''}>1536×1024（3:2 横版）</option>
+                  <option value="1024x1536" ${CONFIG.imageGenSize === '1024x1536' ? 'selected' : ''}>1024×1536（2:3 竖版）</option>
+                </select>
+                <div class="tabbit-settings-hint">生成图片的尺寸比例，同时应用于自动生图和手动生图</div>
               </div>
             </div>
           </div>
@@ -2986,6 +2998,7 @@
       CONFIG.imageGenApiUrl = (overlay.querySelector('#ts-imageGenApiUrl').value || '').trim();
       CONFIG.imageGenApiKey = (overlay.querySelector('#ts-imageGenApiKey').value || '').trim();
       CONFIG.imageGenModel = (overlay.querySelector('#ts-imageGenModel').value || '').trim() || DEFAULT_CONFIG.imageGenModel;
+      CONFIG.imageGenSize = overlay.querySelector('#ts-imageGenSize') ? overlay.querySelector('#ts-imageGenSize').value : '1024x1024';
       currentModel = CONFIG.model;
       saveConfig(CONFIG);
 
@@ -3049,6 +3062,7 @@
             if (imported.imageGenApiUrl !== undefined) overlay.querySelector('#ts-imageGenApiUrl').value = imported.imageGenApiUrl;
             if (imported.imageGenApiKey !== undefined) overlay.querySelector('#ts-imageGenApiKey').value = imported.imageGenApiKey;
             if (imported.imageGenModel) overlay.querySelector('#ts-imageGenModel').value = imported.imageGenModel;
+            if (imported.imageGenSize) { var igSizeEl = overlay.querySelector('#ts-imageGenSize'); if (igSizeEl) igSizeEl.value = imported.imageGenSize; }
             var igFields = overlay.querySelector('#ts-imageGen-fields');
             if (igFields) igFields.style.display = overlay.querySelector('#ts-enableImageGen').checked ? '' : 'none';
 
@@ -3094,6 +3108,7 @@
       overlay.querySelector('#ts-imageGenApiUrl').value = '';
       overlay.querySelector('#ts-imageGenApiKey').value = '';
       overlay.querySelector('#ts-imageGenModel').value = DEFAULT_CONFIG.imageGenModel;
+      var igSizeReset = overlay.querySelector('#ts-imageGenSize'); if (igSizeReset) igSizeReset.value = '1024x1024';
       var igFieldsReset = overlay.querySelector('#ts-imageGen-fields');
       if (igFieldsReset) igFieldsReset.style.display = 'none';
       editingPresets = JSON.parse(JSON.stringify(DEFAULT_PRESETS));
