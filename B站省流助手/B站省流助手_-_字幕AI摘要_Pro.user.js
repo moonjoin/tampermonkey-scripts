@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         B站省流助手 - 字幕AI摘要 Pro
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      3.5.6
-// @description  自动提取B站视频字幕，通过自定义AI API生成极简摘要，支持模型切换、持续对话和评论区总结；配置项（API/模型列表）存储于localStorage，支持设置界面导入导出；支持自动解析开关、悬浮窗/面板可拖动、自动获取模型列表、flomo自动加标签
+// @version      3.6.0
+// @description  自动提取B站视频字幕，通过自定义AI API生成极简摘要，支持模型切换、持续对话和评论区总结；支持自动解析开关、悬浮窗/面板可拖动、自动获取模型列表、flomo自动加标签，新增总结生图功能
 // @author       次元饺子
 // @match        https://www.bilibili.com/video/*
 // @match        https://www.bilibili.com/list/*
@@ -70,7 +70,12 @@
     autoParse: true,
     // ===== 提示词预设系统 =====
     promptPresets: DEFAULT_PRESETS,
-    activePresetId: 'preset_default'
+    activePresetId: 'preset_default',
+    // ===== 总结生图功能 =====
+    enableImageGen: false,
+    imageGenApiUrl: '',
+    imageGenApiKey: '',
+    imageGenModel: 'gemini-3.1-flash-image-preview'
   };
 
   function loadConfig() {
@@ -1587,6 +1592,130 @@
     setTimeout(() => { btn.textContent = '📋 复制评论总结'; }, 2000);
   }
 
+  // ==================== 手动生图功能 ====================
+  async function triggerManualImageGen(contentDiv, summaryText, videoInfo, btn) {
+    const apiUrl = CONFIG.imageGenApiUrl || CONFIG.apiUrl;
+    const apiKey = CONFIG.imageGenApiKey || CONFIG.apiKey;
+    const model = CONFIG.imageGenModel || 'gemini-2.0-flash-preview-image-generation';
+
+    if (!apiUrl || !apiKey) {
+      alert('请先在设置中配置生图模型的 API URL 和 API Key');
+      return;
+    }
+
+    btn.disabled = true;
+    btn.textContent = '⏳ 生成中...';
+
+    // 构建生图 prompt
+    const summaryForImage = summaryText.slice(0, 300).replace(/[#*_\[\]()]/g, '');
+    const imagePrompt = '根据以下视频内容总结，生成一张信息可视化的精美配图，风格清晰美观，适合作为视频总结的封面图：\n\n' + summaryForImage;
+
+    // 推导 images/generations 端点
+    let imageApiUrl = apiUrl.trim().replace(/\/+$/, '');
+    if (/\/chat\/completions$/.test(imageApiUrl)) {
+      imageApiUrl = imageApiUrl.replace(/\/chat\/completions$/, '/images/generations');
+    } else if (/\/completions$/.test(imageApiUrl)) {
+      imageApiUrl = imageApiUrl.replace(/\/completions$/, '/images/generations');
+    } else {
+      imageApiUrl = imageApiUrl.replace(/\/v1\/.*$/, '/v1/images/generations');
+    }
+
+    console.log('[省流助手-手动生图] 调用:', imageApiUrl, '| 模型:', model);
+
+    let imageDataUrl = '';
+
+    try {
+      // 先尝试 b64_json
+      const imageRes = await fetch(imageApiUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + apiKey },
+        body: JSON.stringify({ model: model, prompt: imagePrompt, n: 1, size: '1024x1024', response_format: 'b64_json' })
+      });
+
+      if (imageRes.ok) {
+        const imageData = await imageRes.json();
+        if (imageData.data && imageData.data.length > 0) {
+          const imgItem = imageData.data[0];
+          if (imgItem.b64_json) imageDataUrl = 'data:image/png;base64,' + imgItem.b64_json;
+          else if (imgItem.url) imageDataUrl = imgItem.url;
+        }
+      }
+
+      // 兜底：尝试 url 格式
+      if (!imageDataUrl) {
+        const imageRes2 = await fetch(imageApiUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + apiKey },
+          body: JSON.stringify({ model: model, prompt: imagePrompt, n: 1, size: '1024x1024' })
+        });
+        if (imageRes2.ok) {
+          const imageData2 = await imageRes2.json();
+          if (imageData2.data && imageData2.data.length > 0) {
+            const imgItem2 = imageData2.data[0];
+            if (imgItem2.url) imageDataUrl = imgItem2.url;
+            else if (imgItem2.b64_json) imageDataUrl = 'data:image/png;base64,' + imgItem2.b64_json;
+          }
+        }
+      }
+
+      if (!imageDataUrl) {
+        throw new Error('生图 API 未返回图片数据');
+      }
+
+      // 将图片追加到结果区域下方
+      const resultContainer = contentDiv.querySelector('.tabbit-result');
+      if (resultContainer) {
+        const imgDiv = document.createElement('div');
+        imgDiv.style.cssText = 'text-align:center;margin-top:14px;padding-top:14px;border-top:1px dashed #e0e0e0;';
+        imgDiv.innerHTML = '<div style="font-size:12px;color:#888;margin-bottom:8px;">🖼️ AI 生成配图</div>';
+        const img = document.createElement('img');
+        img.src = imageDataUrl;
+        img.style.cssText = 'max-width:100%;border-radius:10px;box-shadow:0 4px 16px rgba(0,0,0,0.12);cursor:pointer;';
+        img.title = '点击查看大图';
+        img.addEventListener('click', function() {
+          const overlay = document.createElement('div');
+          overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.85);z-index:99999999;display:flex;align-items:center;justify-content:center;cursor:zoom-out;animation:fadeIn 0.2s ease;';
+          const bigImg = document.createElement('img');
+          bigImg.src = imageDataUrl;
+          bigImg.style.cssText = 'max-width:95vw;max-height:95vh;border-radius:8px;box-shadow:0 8px 32px rgba(0,0,0,0.3);';
+          overlay.appendChild(bigImg);
+          overlay.addEventListener('click', function() { overlay.remove(); });
+          document.body.appendChild(overlay);
+        });
+        imgDiv.appendChild(img);
+
+        // 保存图片按钮
+        const saveRow = document.createElement('div');
+        saveRow.style.cssText = 'display:flex;gap:8px;justify-content:center;margin-top:8px;';
+        const saveBtn = document.createElement('button');
+        saveBtn.className = 'tabbit-copy-btn';
+        saveBtn.textContent = '💾 保存图片';
+        saveBtn.addEventListener('click', function() {
+          const a = document.createElement('a');
+          a.href = imageDataUrl;
+          a.download = sanitizeFilename(videoInfo.title || '视频总结') + '_配图.png';
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+        });
+        saveRow.appendChild(saveBtn);
+        imgDiv.appendChild(saveRow);
+
+        resultContainer.appendChild(imgDiv);
+        contentDiv.scrollTop = contentDiv.scrollHeight;
+      }
+
+      btn.textContent = '✅ 已生成';
+      btn.disabled = true;
+      console.log('[省流助手-手动生图] ✅ 图片生成成功');
+    } catch (err) {
+      console.error('[省流助手-手动生图] 失败:', err);
+      alert('生成配图失败: ' + err.message);
+      btn.textContent = '🖼️ 生成配图';
+      btn.disabled = false;
+    }
+  }
+
   function showResult(contentDiv, result, url, videoInfo) {
     rawMarkdownResult = result;
     const parsedHtml = parseMarkdown(result);
@@ -1614,8 +1743,16 @@
       flomoBtn.className = 'tabbit-copy-btn';
       flomoBtn.textContent = '🌱 flomo';
       flomoBtn.addEventListener('click', function() { sendToFlomo(rawMarkdownResult, this); });
+      // 手动生图按钮（始终显示）
+      const genImgBtn = document.createElement('button');
+      genImgBtn.className = 'tabbit-copy-btn';
+      genImgBtn.textContent = '🖼️ 生成配图';
+      genImgBtn.addEventListener('click', function() {
+        triggerManualImageGen(contentDiv, result, videoInfo, genImgBtn);
+      });
       actionsDiv.appendChild(copyBtn);
       actionsDiv.appendChild(flomoBtn);
+      actionsDiv.appendChild(genImgBtn);
       actionsDiv.appendChild(downloadBtn);
       actionsDiv.appendChild(modelTag);
     }
@@ -1791,6 +1928,254 @@
       throw new Error('API响应格式异常');
     }
     return data.choices[0].message.content;
+  }
+
+  // ==================== 生图模型 AI 调用 ====================
+  // 构建生图模式的提示词：在原有总结提示词后追加生图指令
+  function buildImageGenPrompt(basePrompt) {
+    return basePrompt + '\n\n另外，根据以上总结文字生图，目标是创造直观、吸引人的信息图，帮助用户快速理解和记忆信息。通过设计提升信息的传播力和影响力。请直接生成图片，不需要额外解释生图过程。';
+  }
+
+  // 调用生图模型 API
+  // 流程：先用 chat/completions 让模型总结字幕，再用 /v1/images/generations 生成配图
+  // 对用户来说是一键操作，内部自动完成「总结 + 生图」两步
+  async function callImageGenAI(prompt) {
+    const apiUrl = CONFIG.imageGenApiUrl || CONFIG.apiUrl;
+    const apiKey = CONFIG.imageGenApiKey || CONFIG.apiKey;
+    const model = CONFIG.imageGenModel || 'gemini-2.0-flash-preview-image-generation';
+
+    if (!apiUrl || !apiKey) {
+      throw new Error('请在设置中配置生图模型的 API URL 和 API Key');
+    }
+
+    console.log('[省流助手-生图] 开始生图流程，模型:', model, '| API:', apiUrl);
+
+    // ===== 第1步：用默认总结模型（chat/completions）获取文字总结 =====
+    const summaryApiUrl = CONFIG.apiUrl;
+    const summaryApiKey = CONFIG.apiKey;
+    const summaryModel = currentModel;
+    console.log('[省流助手-生图] 第1步：用默认模型', summaryModel, '获取文字总结...');
+    const chatRes = await fetch(summaryApiUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + summaryApiKey
+      },
+      body: JSON.stringify({
+        model: summaryModel,
+        messages: [{ role: 'user', content: prompt }],
+        temperature: 0.7,
+        max_tokens: 2000
+      })
+    });
+
+    if (!chatRes.ok) {
+      const errText = await chatRes.text();
+      throw new Error('文字总结失败: ' + chatRes.status + ' ' + errText);
+    }
+
+    const chatData = await chatRes.json();
+    const textContent = chatData.choices?.[0]?.message?.content || '';
+    console.log('[省流助手-生图] 文字总结完成，长度:', textContent.length);
+
+    if (!textContent.trim()) {
+      throw new Error('生图模型未返回文字总结内容');
+    }
+
+    // ===== 第2步：从总结中提取关键信息，构建生图 prompt =====
+    // 用总结内容的前200字作为生图描述，加上风格指令
+    const summaryForImage = textContent.slice(0, 300).replace(/[#*_\[\]()]/g, '');
+    const imagePrompt = '根据以下视频内容总结，生成一张信息可视化的精美配图，风格清晰美观，适合作为视频总结的封面图：\n\n' + summaryForImage;
+
+    // ===== 第3步：调用 /v1/images/generations 生成图片 =====
+    // 从 apiUrl 推导出 images/generations 端点
+    let imageApiUrl = apiUrl.trim().replace(/\/+$/, '');
+    if (/\/chat\/completions$/.test(imageApiUrl)) {
+      imageApiUrl = imageApiUrl.replace(/\/chat\/completions$/, '/images/generations');
+    } else if (/\/completions$/.test(imageApiUrl)) {
+      imageApiUrl = imageApiUrl.replace(/\/completions$/, '/images/generations');
+    } else {
+      // 兜底：直接拼
+      imageApiUrl = imageApiUrl.replace(/\/v1\/.*$/, '/v1/images/generations');
+    }
+
+    console.log('[省流助手-生图] 第2步：调用生图端点:', imageApiUrl);
+
+    let imageDataUrl = '';
+
+    try {
+      const imageRes = await fetch(imageApiUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer ' + apiKey
+        },
+        body: JSON.stringify({
+          model: model,
+          prompt: imagePrompt,
+          n: 1,
+          size: '1024x1024',
+          response_format: 'b64_json'
+        })
+      });
+
+      if (!imageRes.ok) {
+        const errText = await imageRes.text();
+        console.warn('[省流助手-生图] 生图端点返回错误:', imageRes.status, errText.slice(0, 200));
+        // 生图失败不阻断，仍然返回文字总结
+        console.log('[省流助手-生图] 生图失败，将只显示文字总结');
+      } else {
+        const imageData = await imageRes.json();
+        console.log('[省流助手-生图] 生图API响应:', JSON.stringify(imageData).slice(0, 300));
+
+        // 解析图片数据
+        if (imageData.data && imageData.data.length > 0) {
+          const imgItem = imageData.data[0];
+          if (imgItem.b64_json) {
+            imageDataUrl = 'data:image/png;base64,' + imgItem.b64_json;
+            console.log('[省流助手-生图] ✅ 成功获取 base64 图片，长度:', imageDataUrl.length);
+          } else if (imgItem.url) {
+            imageDataUrl = imgItem.url;
+            console.log('[省流助手-生图] ✅ 成功获取图片 URL:', imageDataUrl.slice(0, 100));
+          }
+        }
+      }
+    } catch (imgErr) {
+      console.warn('[省流助手-生图] 生图请求异常:', imgErr.message);
+      // 生图失败不阻断
+    }
+
+    // ===== 兜底：如果 b64_json 没拿到，尝试用 url 格式再请求一次 =====
+    if (!imageDataUrl) {
+      try {
+        console.log('[省流助手-生图] 尝试用 response_format=url 重新请求...');
+        const imageRes2 = await fetch(imageApiUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + apiKey
+          },
+          body: JSON.stringify({
+            model: model,
+            prompt: imagePrompt,
+            n: 1,
+            size: '1024x1024'
+          })
+        });
+
+        if (imageRes2.ok) {
+          const imageData2 = await imageRes2.json();
+          if (imageData2.data && imageData2.data.length > 0) {
+            const imgItem2 = imageData2.data[0];
+            if (imgItem2.url) {
+              imageDataUrl = imgItem2.url;
+              console.log('[省流助手-生图] ✅ 第二次尝试成功获取图片 URL');
+            } else if (imgItem2.b64_json) {
+              imageDataUrl = 'data:image/png;base64,' + imgItem2.b64_json;
+              console.log('[省流助手-生图] ✅ 第二次尝试成功获取 base64 图片');
+            }
+          }
+        }
+      } catch (e) {
+        console.warn('[省流助手-生图] 第二次生图尝试也失败:', e.message);
+      }
+    }
+
+    console.log('[省流助手-生图] 最终结果 - 有图片:', !!imageDataUrl, '| 文字长度:', textContent.length);
+
+    return { text: textContent, imageDataUrl: imageDataUrl };
+  }
+
+  // 判断当前是否启用生图模式
+  function isImageGenEnabled() {
+    return CONFIG.enableImageGen === true;
+  }
+
+  // 展示生图结果（图片 + 文字）
+  function showImageResult(contentDiv, textContent, imageDataUrl, url, videoInfo) {
+    rawMarkdownResult = textContent || '（生图模式 - 图片总结）';
+    const resultContainer = contentDiv.querySelector('.tabbit-result');
+    if (resultContainer) {
+      let html = '';
+      if (imageDataUrl) {
+        html += '<div style="text-align:center;margin-bottom:12px;">';
+        html += '<img src="' + imageDataUrl + '" style="max-width:100%;border-radius:10px;box-shadow:0 4px 16px rgba(0,0,0,0.12);cursor:pointer;" title="点击查看大图" />';
+        html += '</div>';
+      }
+      if (textContent && textContent.trim()) {
+        html += parseMarkdown(textContent);
+      }
+      if (!imageDataUrl && !textContent) {
+        html += '<div style="color:#999;text-align:center;padding:20px;">⚠️ 生图模型未返回图片或文字内容</div>';
+      }
+      resultContainer.innerHTML = html;
+
+      // 点击图片查看大图
+      const img = resultContainer.querySelector('img');
+      if (img) {
+        img.addEventListener('click', function() {
+          const overlay = document.createElement('div');
+          overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.85);z-index:99999999;display:flex;align-items:center;justify-content:center;cursor:zoom-out;animation:fadeIn 0.2s ease;';
+          const bigImg = document.createElement('img');
+          bigImg.src = imageDataUrl;
+          bigImg.style.cssText = 'max-width:95vw;max-height:95vh;border-radius:8px;box-shadow:0 8px 32px rgba(0,0,0,0.3);';
+          overlay.appendChild(bigImg);
+          overlay.addEventListener('click', function() { overlay.remove(); });
+          document.body.appendChild(overlay);
+        });
+      }
+    }
+
+    const actionsDiv = contentDiv.querySelector('.tabbit-result-actions');
+    if (actionsDiv) {
+      actionsDiv.innerHTML = '';
+      if (imageDataUrl) {
+        const saveImgBtn = document.createElement('button');
+        saveImgBtn.className = 'tabbit-copy-btn';
+        saveImgBtn.textContent = '💾 保存图片';
+        saveImgBtn.addEventListener('click', function() {
+          const a = document.createElement('a');
+          a.href = imageDataUrl;
+          const safeTitle = sanitizeFilename(videoInfo.title || '视频总结') || '视频总结';
+          a.download = safeTitle + '_总结.png';
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+        });
+        actionsDiv.appendChild(saveImgBtn);
+      }
+      if (textContent && textContent.trim()) {
+        const copyBtn = document.createElement('button');
+        copyBtn.className = 'tabbit-copy-btn';
+        copyBtn.textContent = '📋 复制文字';
+        copyBtn.addEventListener('click', function() {
+          copyToClipboard(markdownToPlainText(textContent));
+          copyBtn.textContent = '✅ 已复制';
+          setTimeout(function() { copyBtn.textContent = '📋 复制文字'; }, 2000);
+        });
+        actionsDiv.appendChild(copyBtn);
+      }
+      const downloadBtn = document.createElement('button');
+      downloadBtn.className = 'tabbit-download-btn';
+      downloadBtn.textContent = '💾 下载字幕';
+      downloadBtn.addEventListener('click', function() {
+        downloadTranscript(rawTranscript, videoInfo.title, videoInfo.upName, videoInfo.bvid);
+      });
+      const modelTag = document.createElement('span');
+      modelTag.style.cssText = 'font-size:11px;color:#999;margin-left:auto;';
+      modelTag.textContent = '🖼️ ' + (CONFIG.imageGenModel || 'gemini-2.0-flash-preview-image-generation');
+      actionsDiv.appendChild(downloadBtn);
+      actionsDiv.appendChild(modelTag);
+    }
+
+    const urlDiv = contentDiv.querySelector('.tabbit-url');
+    if (urlDiv) {
+      const link = urlDiv.querySelector('a');
+      if (link) {
+        link.href = url;
+        link.textContent = url;
+      }
+    }
   }
 
   // ==================== 自动获取模型列表 ====================
@@ -1993,6 +2378,11 @@
 
     const presetBarHtml = renderPresetBarHtml();
 
+    const useImageGen = isImageGenEnabled();
+    const loadingHint = useImageGen
+      ? '🖼️ ' + (CONFIG.imageGenModel || 'gemini-2.0-flash-preview-image-generation') + ' 正在用「' + escapeHtml(activePresetName) + '」生成图文总结...'
+      : '🤖 ' + currentModel + ' 正在用「' + escapeHtml(activePresetName) + '」分析字幕...';
+
     contentDiv.innerHTML = `
       <div class="tabbit-video-info">
         <div class="tabbit-video-title">${escapeHtml(videoInfo.title || '未知标题')}</div>
@@ -2001,37 +2391,66 @@
       ${presetBarHtml}
       <div class="tabbit-loading">
         <div class="tabbit-spinner"></div>
-        <span>🤖 ${currentModel} 正在用「${escapeHtml(activePresetName)}」分析字幕...</span>
+        <span>${loadingHint}</span>
       </div>
     `;
     bindPresetChips(panel, videoInfo);
 
     try {
-      const messages = [{ role: 'user', content: fullPrompt }];
-      const reply = await callAI(messages);
+      if (useImageGen) {
+        // ===== 生图模式：先总结文字，再自动生成配图 =====
+        const result = await callImageGenAI(fullPrompt);
 
-      conversationHistory = [
-        { role: 'user', content: fullPrompt },
-        { role: 'assistant', content: reply }
-      ];
+        conversationHistory = [
+          { role: 'user', content: fullPrompt },
+          { role: 'assistant', content: result.text || '（图片总结）' }
+        ];
 
-      contentDiv.innerHTML = `
-        <div class="tabbit-video-info">
-          <div class="tabbit-video-title">${escapeHtml(videoInfo.title || '未知标题')}</div>
-          <div>UP主: ${escapeHtml(videoInfo.upName || '未知')}</div>
-        </div>
-        ${presetBarHtml}
-        <div class="tabbit-result"></div>
-        <div class="tabbit-result-actions"></div>
-        <div class="tabbit-url">🔗 <a href="" target="_blank"></a></div>
-        <button class="tabbit-comment-summary-btn" id="tabbit-comment-btn">
-          <span class="tabbit-btn-icon">💬</span>
-          <span>总结评论区</span>
-        </button>
-        <div class="tabbit-chat-messages"></div>
-      `;
-      bindPresetChips(panel, videoInfo);
-      showResult(contentDiv, reply, pageUrl, videoInfo);
+        contentDiv.innerHTML = `
+          <div class="tabbit-video-info">
+            <div class="tabbit-video-title">${escapeHtml(videoInfo.title || '未知标题')}</div>
+            <div>UP主: ${escapeHtml(videoInfo.upName || '未知')}</div>
+          </div>
+          ${presetBarHtml}
+          <div class="tabbit-result"></div>
+          <div class="tabbit-result-actions"></div>
+          <div class="tabbit-url">🔗 <a href="" target="_blank"></a></div>
+          <button class="tabbit-comment-summary-btn" id="tabbit-comment-btn">
+            <span class="tabbit-btn-icon">💬</span>
+            <span>总结评论区</span>
+          </button>
+          <div class="tabbit-chat-messages"></div>
+        `;
+        bindPresetChips(panel, videoInfo);
+        showImageResult(contentDiv, result.text, result.imageDataUrl, pageUrl, videoInfo);
+      } else {
+        // ===== 普通文字总结模式 =====
+        const messages = [{ role: 'user', content: fullPrompt }];
+        const reply = await callAI(messages);
+
+        conversationHistory = [
+          { role: 'user', content: fullPrompt },
+          { role: 'assistant', content: reply }
+        ];
+
+        contentDiv.innerHTML = `
+          <div class="tabbit-video-info">
+            <div class="tabbit-video-title">${escapeHtml(videoInfo.title || '未知标题')}</div>
+            <div>UP主: ${escapeHtml(videoInfo.upName || '未知')}</div>
+          </div>
+          ${presetBarHtml}
+          <div class="tabbit-result"></div>
+          <div class="tabbit-result-actions"></div>
+          <div class="tabbit-url">🔗 <a href="" target="_blank"></a></div>
+          <button class="tabbit-comment-summary-btn" id="tabbit-comment-btn">
+            <span class="tabbit-btn-icon">💬</span>
+            <span>总结评论区</span>
+          </button>
+          <div class="tabbit-chat-messages"></div>
+        `;
+        bindPresetChips(panel, videoInfo);
+        showResult(contentDiv, reply, pageUrl, videoInfo);
+      }
 
       const commentBtn = contentDiv.querySelector('#tabbit-comment-btn');
       if (commentBtn) {
@@ -2310,6 +2729,36 @@
             <div class="tabbit-settings-hint">视频时长低于此秒数时自动跳过字幕获取，设为 0 则不跳过</div>
           </div>
 
+          <div class="tabbit-settings-group" style="background:linear-gradient(135deg,#f0f4ff 0%,#fff5f8 100%);border:1px solid #d6e0ff;border-radius:10px;padding:14px 16px;">
+            <div class="tabbit-switch-row">
+              <div>
+                <div class="tabbit-settings-label">🖼️ 总结生图模式</div>
+                <div class="tabbit-settings-hint" style="margin-top:2px;">开启后，字幕原文将直接发送给生图模型，由模型一站式完成：理解内容 → 自动总结 → 生成配图，输出结果为图片+文字</div>
+              </div>
+              <label class="tabbit-switch">
+                <input type="checkbox" id="ts-enableImageGen" ${CONFIG.enableImageGen ? 'checked' : ''} />
+                <span class="tabbit-slider"></span>
+              </label>
+            </div>
+            <div id="ts-imageGen-fields" style="margin-top:12px;${CONFIG.enableImageGen ? '' : 'display:none;'}">
+              <div style="margin-bottom:10px;">
+                <div class="tabbit-settings-label">生图模型 API URL</div>
+                <input class="tabbit-settings-input" id="ts-imageGenApiUrl" type="text" value="${escapeHtml(CONFIG.imageGenApiUrl || '')}" placeholder="留空则使用上方的 API URL" />
+                <div class="tabbit-settings-hint">生图模型的 API 地址（OpenAI 兼容格式），留空则复用上方的 API URL</div>
+              </div>
+              <div style="margin-bottom:10px;">
+                <div class="tabbit-settings-label">生图模型 API Key</div>
+                <input class="tabbit-settings-input" id="ts-imageGenApiKey" type="password" value="${escapeHtml(CONFIG.imageGenApiKey || '')}" placeholder="留空则使用上方的 API Key" />
+                <div class="tabbit-settings-hint">生图模型的 API 密钥，留空则复用上方的 API Key</div>
+              </div>
+              <div>
+                <div class="tabbit-settings-label">生图模型名称</div>
+                <input class="tabbit-settings-input" id="ts-imageGenModel" type="text" value="${escapeHtml(CONFIG.imageGenModel || 'gemini-2.0-flash-preview-image-generation')}" placeholder="gemini-2.0-flash-preview-image-generation" />
+                <div class="tabbit-settings-hint">支持图片输出的模型名称，默认 gemini-2.0-flash-preview-image-generation</div>
+              </div>
+            </div>
+          </div>
+
           <div class="tabbit-settings-group">
             <div class="tabbit-settings-label">🎨 视频摘要预设（多个总结风格，可在面板中切换）</div>
             <div class="tabbit-preset-manage-list" id="ts-preset-list"></div>
@@ -2414,6 +2863,15 @@
       });
       renderPresetEditList();
     });
+
+    // ===== 生图开关交互：切换显示/隐藏详细配置 =====
+    const imageGenToggle = overlay.querySelector('#ts-enableImageGen');
+    const imageGenFields = overlay.querySelector('#ts-imageGen-fields');
+    if (imageGenToggle && imageGenFields) {
+      imageGenToggle.addEventListener('change', function() {
+        imageGenFields.style.display = imageGenToggle.checked ? '' : 'none';
+      });
+    }
 
     function closeSettings() { overlay.remove(); }
     overlay.querySelector('#tabbit-settings-close').addEventListener('click', closeSettings);
@@ -2523,6 +2981,11 @@
       const newSkipDuration = parseInt(overlay.querySelector('#ts-skipDuration').value, 10);
       CONFIG.skipDuration = isNaN(newSkipDuration) ? 60 : newSkipDuration;
       CONFIG.autoParse = newAutoParse;
+      // 生图配置
+      CONFIG.enableImageGen = overlay.querySelector('#ts-enableImageGen').checked;
+      CONFIG.imageGenApiUrl = (overlay.querySelector('#ts-imageGenApiUrl').value || '').trim();
+      CONFIG.imageGenApiKey = (overlay.querySelector('#ts-imageGenApiKey').value || '').trim();
+      CONFIG.imageGenModel = (overlay.querySelector('#ts-imageGenModel').value || '').trim() || DEFAULT_CONFIG.imageGenModel;
       currentModel = CONFIG.model;
       saveConfig(CONFIG);
 
@@ -2581,6 +3044,13 @@
             if (imported.commentPromptText) overlay.querySelector('#ts-commentPromptText').value = imported.commentPromptText;
             if (imported.skipDuration !== undefined) overlay.querySelector('#ts-skipDuration').value = imported.skipDuration;
             if (imported.autoParse !== undefined) overlay.querySelector('#ts-autoParse').checked = !!imported.autoParse;
+            // 导入生图配置
+            if (imported.enableImageGen !== undefined) overlay.querySelector('#ts-enableImageGen').checked = !!imported.enableImageGen;
+            if (imported.imageGenApiUrl !== undefined) overlay.querySelector('#ts-imageGenApiUrl').value = imported.imageGenApiUrl;
+            if (imported.imageGenApiKey !== undefined) overlay.querySelector('#ts-imageGenApiKey').value = imported.imageGenApiKey;
+            if (imported.imageGenModel) overlay.querySelector('#ts-imageGenModel').value = imported.imageGenModel;
+            var igFields = overlay.querySelector('#ts-imageGen-fields');
+            if (igFields) igFields.style.display = overlay.querySelector('#ts-enableImageGen').checked ? '' : 'none';
 
             if (Array.isArray(imported.promptPresets) && imported.promptPresets.length > 0) {
               editingPresets = JSON.parse(JSON.stringify(imported.promptPresets));
@@ -2619,6 +3089,13 @@
       overlay.querySelector('#ts-commentPromptText').value = COMMENT_PROMPT_TEXT;
       overlay.querySelector('#ts-skipDuration').value = DEFAULT_CONFIG.skipDuration;
       overlay.querySelector('#ts-autoParse').checked = DEFAULT_CONFIG.autoParse;
+      // 重置生图配置
+      overlay.querySelector('#ts-enableImageGen').checked = false;
+      overlay.querySelector('#ts-imageGenApiUrl').value = '';
+      overlay.querySelector('#ts-imageGenApiKey').value = '';
+      overlay.querySelector('#ts-imageGenModel').value = DEFAULT_CONFIG.imageGenModel;
+      var igFieldsReset = overlay.querySelector('#ts-imageGen-fields');
+      if (igFieldsReset) igFieldsReset.style.display = 'none';
       editingPresets = JSON.parse(JSON.stringify(DEFAULT_PRESETS));
       editingActiveId = 'preset_default';
       renderPresetEditList();
