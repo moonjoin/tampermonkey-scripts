@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站省流助手 - 字幕AI摘要 Pro
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      3.6.1
+// @version      3.6.2
 // @description  自动提取B站视频字幕，通过自定义AI API生成极简摘要，支持模型切换、持续对话和评论区总结；支持自动解析开关、悬浮窗/面板可拖动、自动获取模型列表、flomo自动加标签，新增总结生图功能
 // @author       次元饺子
 // @match        https://www.bilibili.com/video/*
@@ -20,6 +20,9 @@
   const PROMPT_TEXT = '我极度没有耐心，不想动脑子，脾气暴躁且阅读困难。请用最直白的大白话给我解释这视频到底在说什么，在能解释清楚的前提下废话越少越好，禁止使用任何专业术语。请按以下顺序直接输出：1.【结论】直接告诉我核心意思；2.【具体讲了啥】用极简的白话说明来龙去脉；3.【关键点】列出最重要的几个要点；4.【对我有什么用】直接说明价值，如果是纯广告或水视频请直接告诉我避雷；5.【原链接】在最后附上视频原始链接。记住，不要任何寒暄、铺垫和解释，直接开始回答！';
 
   const COMMENT_PROMPT_TEXT = '你是一个专业的评论分析助手。请对以下B站视频评论进行总结分析，包括：\n1. 评论整体情感倾向（正面/负面/中性）\n2. 主要讨论话题（列出3-5个）\n3. 有趣/高赞评论摘录\n4. 我理解能力差、没耐心，别讲铺垫、别讲背景、别讲废话，只告诉我：这东西核心结论是什么、有哪几个关键点、对我有什么用。';
+
+  // 🆕 统一的生图专用提示词（自动生图 / 手动生图 共用同一份，可在设置中修改）
+  const IMAGE_GEN_PROMPT_TEXT = '根据以下视频内容总结，生成一张信息可视化的精美配图，风格清晰美观，适合作为视频总结的封面图：\n\n{summary}';
 
   // ==================== localStorage 配置存储层 ====================
   const STORAGE_KEY = 'bili_summary_pro_config';
@@ -76,7 +79,9 @@
     imageGenApiUrl: '',
     imageGenApiKey: '',
     imageGenModel: 'gemini-3.1-flash-image-preview',
-    imageGenSize: '1024x1024'
+    imageGenSize: '1024x1024',
+    // 🆕 生图专用提示词（自动 + 手动生图共用），{summary} 会被替换为视频总结内容
+    imageGenPromptText: IMAGE_GEN_PROMPT_TEXT
   };
 
   function loadConfig() {
@@ -119,6 +124,9 @@
   let POSITIONS = loadPositions();
   const INIT_DELAY_MS = 2000;
   const MAX_CONVERSATION_HISTORY = 21;
+  // 生图模式下，传给生图模型的「视频总结」最大字数
+  // 设为 500 是为了兼顾各家生图模型的 prompt 长度限制（如 SD ~225 tokens、DALL·E ~4000 字符）
+  const IMAGE_GEN_SUMMARY_MAX_LEN = 5000;
 
   class BiliRiskControlError extends Error {
     constructor(message) {
@@ -1607,9 +1615,12 @@
     btn.disabled = true;
     btn.textContent = '⏳ 生成中...';
 
-    // 构建生图 prompt
-    const summaryForImage = summaryText.slice(0, 300).replace(/[#*_\[\]()]/g, '');
-    const imagePrompt = '根据以下视频内容总结，生成一张信息可视化的精美配图，风格清晰美观，适合作为视频总结的封面图：\n\n' + summaryForImage;
+    // 构建生图 prompt（使用统一的、可在设置中修改的生图提示词模板）
+    const summaryForImage = textContent.slice(0, IMAGE_GEN_SUMMARY_MAX_LEN).replace(/[#*_\[\]()]/g, '');
+    const promptTemplate = CONFIG.imageGenPromptText || IMAGE_GEN_PROMPT_TEXT;
+    const imagePrompt = promptTemplate.includes('{summary}')
+      ? promptTemplate.replace('{summary}', summaryForImage)
+      : promptTemplate + '\n\n' + summaryForImage;
 
     // 推导 images/generations 端点
     let imageApiUrl = apiUrl.trim().replace(/\/+$/, '');
@@ -1931,12 +1942,6 @@
     return data.choices[0].message.content;
   }
 
-  // ==================== 生图模型 AI 调用 ====================
-  // 构建生图模式的提示词：在原有总结提示词后追加生图指令
-  function buildImageGenPrompt(basePrompt) {
-    return basePrompt + '\n\n另外，根据以上总结文字生图，目标是创造直观、吸引人的信息图，帮助用户快速理解和记忆信息。通过设计提升信息的传播力和影响力。请直接生成图片，不需要额外解释生图过程。';
-  }
-
   // 调用生图模型 API
   // 流程：先用 chat/completions 让模型总结字幕，再用 /v1/images/generations 生成配图
   // 对用户来说是一键操作，内部自动完成「总结 + 生图」两步
@@ -1984,9 +1989,12 @@
     }
 
     // ===== 第2步：从总结中提取关键信息，构建生图 prompt =====
-    // 用总结内容的前200字作为生图描述，加上风格指令
-    const summaryForImage = textContent.slice(0, 300).replace(/[#*_\[\]()]/g, '');
-    const imagePrompt = '根据以下视频内容总结，生成一张信息可视化的精美配图，风格清晰美观，适合作为视频总结的封面图：\n\n' + summaryForImage;
+    // 用总结内容的前300字作为生图描述，使用统一的、可在设置中修改的生图提示词模板
+    const summaryForImage = textContent.slice(0, IMAGE_GEN_SUMMARY_MAX_LEN).replace(/[#*_\[\]()]/g, '');
+    const promptTemplate = CONFIG.imageGenPromptText || IMAGE_GEN_PROMPT_TEXT;
+    const imagePrompt = promptTemplate.includes('{summary}')
+      ? promptTemplate.replace('{summary}', summaryForImage)
+      : promptTemplate + '\n\n' + summaryForImage;
 
     // ===== 第3步：调用 /v1/images/generations 生成图片 =====
     // 从 apiUrl 推导出 images/generations 端点
@@ -2768,6 +2776,11 @@
                 </select>
                 <div class="tabbit-settings-hint">生成图片的尺寸比例，同时应用于自动生图和手动生图</div>
               </div>
+              <div style="margin-top:10px;">
+                <div class="tabbit-settings-label">🎨 生图提示词（自动+手动生图共用）</div>
+                <textarea class="tabbit-settings-textarea" id="ts-imageGenPromptText" placeholder="生图提示词，使用 {summary} 作为视频总结的占位符...">${escapeHtml(CONFIG.imageGenPromptText || IMAGE_GEN_PROMPT_TEXT)}</textarea>
+                <div class="tabbit-settings-hint">用于指导生图模型的提示词模板。使用 <code style="background:#eef;padding:1px 4px;border-radius:3px;">{summary}</code> 占位符表示视频总结内容（运行时自动替换）。如不写占位符，总结会自动追加在末尾。</div>
+              </div>
             </div>
           </div>
 
@@ -2999,6 +3012,9 @@
       CONFIG.imageGenApiKey = (overlay.querySelector('#ts-imageGenApiKey').value || '').trim();
       CONFIG.imageGenModel = (overlay.querySelector('#ts-imageGenModel').value || '').trim() || DEFAULT_CONFIG.imageGenModel;
       CONFIG.imageGenSize = overlay.querySelector('#ts-imageGenSize') ? overlay.querySelector('#ts-imageGenSize').value : '1024x1024';
+      // 🆕 保存生图提示词（统一供自动生图和手动生图使用）
+      const newImageGenPromptText = (overlay.querySelector('#ts-imageGenPromptText').value || '').trim();
+      CONFIG.imageGenPromptText = newImageGenPromptText || IMAGE_GEN_PROMPT_TEXT;
       currentModel = CONFIG.model;
       saveConfig(CONFIG);
 
@@ -3063,6 +3079,8 @@
             if (imported.imageGenApiKey !== undefined) overlay.querySelector('#ts-imageGenApiKey').value = imported.imageGenApiKey;
             if (imported.imageGenModel) overlay.querySelector('#ts-imageGenModel').value = imported.imageGenModel;
             if (imported.imageGenSize) { var igSizeEl = overlay.querySelector('#ts-imageGenSize'); if (igSizeEl) igSizeEl.value = imported.imageGenSize; }
+            // 🆕 导入生图提示词
+            if (imported.imageGenPromptText !== undefined) overlay.querySelector('#ts-imageGenPromptText').value = imported.imageGenPromptText;
             var igFields = overlay.querySelector('#ts-imageGen-fields');
             if (igFields) igFields.style.display = overlay.querySelector('#ts-enableImageGen').checked ? '' : 'none';
 
@@ -3109,6 +3127,8 @@
       overlay.querySelector('#ts-imageGenApiKey').value = '';
       overlay.querySelector('#ts-imageGenModel').value = DEFAULT_CONFIG.imageGenModel;
       var igSizeReset = overlay.querySelector('#ts-imageGenSize'); if (igSizeReset) igSizeReset.value = '1024x1024';
+      // 🆕 重置生图提示词
+      overlay.querySelector('#ts-imageGenPromptText').value = IMAGE_GEN_PROMPT_TEXT;
       var igFieldsReset = overlay.querySelector('#ts-imageGen-fields');
       if (igFieldsReset) igFieldsReset.style.display = 'none';
       editingPresets = JSON.parse(JSON.stringify(DEFAULT_PRESETS));
