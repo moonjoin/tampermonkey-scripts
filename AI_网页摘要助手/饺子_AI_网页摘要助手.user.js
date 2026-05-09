@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         饺子 AI 网页摘要助手
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      2.6.9
+// @version      2.7.0
 // @description  指定网站自动弹出 AI 网页摘要，支持连续对话、多预设、多模板、SPA路由，flomo、坚果云双文件云同步。
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
@@ -536,44 +536,263 @@
   let currentRequest = null;
   let currentReject = null;
 
-  function callChatApi(messages) {
+  function callChatApi(messages, onDelta) {
     const profile = getCurrentProfile();
+    const useStream = typeof onDelta === 'function';
+    const apiUrl = profile.apiUrl;
+    const apiKey = profile.apiKey;
     const body = {
       model: profile.currentModel,
       messages,
       temperature: getCurrentTemperature(),
       max_tokens: getCurrentMaxTokens()
     };
+
     return new Promise((resolve, reject) => {
       currentReject = reject;
-      currentRequest = GM_xmlhttpRequest({
-        method: 'POST',
-        url: profile.apiUrl,
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${profile.apiKey}`
-        },
-        data: JSON.stringify(body),
-        timeout: 120000,
-        onload(res) {
-          currentRequest = null; currentReject = null;
+
+      // ============ 非流式：保留原逻辑 ============
+      if (!useStream) {
+        currentRequest = GM_xmlhttpRequest({
+          method: 'POST',
+          url: apiUrl,
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${apiKey}`
+          },
+          data: JSON.stringify(body),
+          timeout: 120000,
+          onload(res) {
+            currentRequest = null; currentReject = null;
+            try {
+              if (res.status < 200 || res.status >= 300) {
+                reject(new Error(formatApiError(res.status, res.responseText))); return;
+              }
+              const data = JSON.parse(res.responseText);
+              const content = data?.choices?.[0]?.message?.content;
+              if (!content) { reject(new Error('API 响应格式异常')); return; }
+              resolve(content);
+            } catch (err) { reject(err); }
+          },
+          onerror(err) {
+            currentRequest = null; currentReject = null;
+            reject(new Error('网络请求失败：' + JSON.stringify(err)));
+          },
+          ontimeout() {
+            currentRequest = null; currentReject = null;
+            reject(new Error('API 请求超时。'));
+          }
+        });
+        return;
+      }
+
+      // ============ 流式：优先 fetch + ReadableStream ============
+      let fullText = '';
+
+      const doFetchStream = async () => {
+        const controller = new AbortController();
+        // 暴露 abort 句柄,让 abortCurrentRequest 能停掉
+        currentRequest = { abort: () => controller.abort() };
+
+        let buffer = '';
+
+        const processLine = (line) => {
+          line = line.replace(/\r$/, '').trim();
+          if (!line) return true;
+          if (line.startsWith(':')) return true;          // SSE 注释行
+          if (!line.startsWith('data:')) return true;
+          const payload = line.slice(5).trim();
+          if (payload === '[DONE]') return false;
           try {
-            if (res.status < 200 || res.status >= 300) {
-              reject(new Error(formatApiError(res.status, res.responseText))); return;
+            const obj = JSON.parse(payload);
+            if (obj.error) {
+              throw new Error(obj.error.message || JSON.stringify(obj.error));
             }
-            const data = JSON.parse(res.responseText);
-            const content = data?.choices?.[0]?.message?.content;
-            if (!content) { reject(new Error('API 响应格式异常')); return; }
-            resolve(content);
-          } catch (err) { reject(err); }
-        },
-        onerror(err) {
+            const delta = obj.choices?.[0]?.delta?.content
+                       ?? obj.choices?.[0]?.message?.content
+                       ?? obj.choices?.[0]?.delta?.reasoning_content
+                       ?? '';
+            if (delta) {
+              fullText += delta;
+              try { onDelta(delta, fullText); } catch (e) { console.warn(e); }
+            }
+          } catch (e) {
+            if (e.message && e.message.indexOf('JSON') === -1) throw e;
+            // 非合法 JSON 行,忽略
+          }
+          return true;
+        };
+
+        try {
+          const resp = await fetch(apiUrl, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': 'Bearer ' + apiKey,
+              'Accept': 'text/event-stream'
+            },
+            body: JSON.stringify({ ...body, stream: true }),
+            signal: controller.signal
+          });
+
+          if (!resp.ok) {
+            const errText = await resp.text();
+            throw new Error(formatApiError(resp.status, errText));
+          }
+
+          const ctype = resp.headers.get('content-type') || '';
+          // 服务端没返回 SSE → 一次性 JSON 兜底
+          if (!ctype.includes('text/event-stream') && !resp.body) {
+            const text = await resp.text();
+            try {
+              const data = JSON.parse(text);
+              const content = data?.choices?.[0]?.message?.content || '';
+              if (content) {
+                try { onDelta(content, content); } catch (e) {}
+                currentRequest = null; currentReject = null;
+                resolve(content);
+                return true;
+              }
+            } catch (e) {}
+            throw new Error('服务端未返回流式响应');
+          }
+
+          const reader = resp.body.getReader();
+          const decoder = new TextDecoder('utf-8');
+          let done = false;
+          while (!done) {
+            const { value, done: rDone } = await reader.read();
+            done = rDone;
+            if (value) {
+              buffer += decoder.decode(value, { stream: !done });
+              let idx;
+              while ((idx = buffer.indexOf('\n')) !== -1) {
+                const line = buffer.slice(0, idx);
+                buffer = buffer.slice(idx + 1);
+                const cont = processLine(line);
+                if (!cont) { done = true; break; }
+              }
+            }
+          }
+          // flush 残余
+          if (buffer.trim()) processLine(buffer);
+
           currentRequest = null; currentReject = null;
-          reject(new Error('网络请求失败：' + JSON.stringify(err)));
-        },
-        ontimeout() {
-          currentRequest = null; currentReject = null;
-          reject(new Error('API 请求超时。'));
+          if (fullText) {
+            resolve(fullText);
+          } else {
+            reject(new Error('流式响应为空'));
+          }
+          return true;
+        } catch (e) {
+          if (e.name === 'AbortError') {
+            currentRequest = null; currentReject = null;
+            reject(new Error('已取消'));
+            return true;
+          }
+          console.warn('[饺子AI] fetch 流式失败,尝试降级 GM_xmlhttpRequest:', e);
+          return { fallback: true, error: e };
+        }
+      };
+
+      // ============ 兜底：GM_xmlhttpRequest 流式（多数环境不真流式,但能拿结果）============
+      const doGMFallback = () => {
+        let receivedLen = 0;
+        let buffer = '';
+        let aborted = false;
+
+        const flushBuffer = () => {
+          let idx;
+          while ((idx = buffer.indexOf('\n')) !== -1) {
+            let line = buffer.slice(0, idx);
+            buffer = buffer.slice(idx + 1);
+            line = line.replace(/\r$/, '').trim();
+            if (!line) continue;
+            if (line.startsWith(':')) continue;
+            if (!line.startsWith('data:')) continue;
+            const payload = line.slice(5).trim();
+            if (payload === '[DONE]') { aborted = true; return; }
+            try {
+              const obj = JSON.parse(payload);
+              if (obj.error) {
+                reject(new Error('API Error: ' + (obj.error.message || JSON.stringify(obj.error))));
+                aborted = true;
+                return;
+              }
+              const delta = obj.choices?.[0]?.delta?.content
+                         ?? obj.choices?.[0]?.message?.content
+                         ?? '';
+              if (delta) {
+                fullText += delta;
+                try { onDelta(delta, fullText); } catch (e) { console.warn(e); }
+              }
+            } catch (e) {}
+          }
+        };
+
+        currentRequest = GM_xmlhttpRequest({
+          method: 'POST',
+          url: apiUrl,
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + apiKey,
+            'Accept': 'text/event-stream'
+          },
+          data: JSON.stringify({ ...body, stream: true }),
+          responseType: 'stream',
+          timeout: 180000,
+          onprogress: (e) => {
+            if (aborted) return;
+            const text = e.responseText || '';
+            if (text.length <= receivedLen) return;
+            const newChunk = text.substring(receivedLen);
+            receivedLen = text.length;
+            buffer += newChunk;
+            flushBuffer();
+          },
+          onload: (res) => {
+            currentRequest = null; currentReject = null;
+            if (aborted && fullText) { resolve(fullText); return; }
+            const text = res.responseText || '';
+            if (text.length > receivedLen) {
+              buffer += text.substring(receivedLen);
+              receivedLen = text.length;
+              flushBuffer();
+            }
+            if (fullText) { resolve(fullText); return; }
+            // 全部失败 → 试试当成普通 JSON
+            if (text.trim().startsWith('<')) {
+              reject(new Error('URL 错误（返回了 HTML）')); return;
+            }
+            try {
+              const data = JSON.parse(text);
+              if (data.error) { reject(new Error('API Error: ' + data.error.message)); return; }
+              const content = data?.choices?.[0]?.message?.content || '';
+              if (content) {
+                try { onDelta(content, content); } catch (e) {}
+                resolve(content);
+              } else {
+                reject(new Error('流式响应为空'));
+              }
+            } catch (e) {
+              reject(new Error('流式解析失败'));
+            }
+          },
+          onerror: () => {
+            currentRequest = null; currentReject = null;
+            reject(new Error('网络请求失败'));
+          },
+          ontimeout: () => {
+            currentRequest = null; currentReject = null;
+            reject(new Error('API 请求超时'));
+          }
+        });
+      };
+
+      // 先 fetch,失败再降级
+      doFetchStream().then(result => {
+        if (result && result.fallback) {
+          doGMFallback();
         }
       });
     });
@@ -630,7 +849,7 @@
     if (!panelEl) return;
     const body = panelEl.querySelector('#tabbit-body');
     if (!body) return;
-       const visibleMsgs = conversation.filter(m => m.role !== 'system' && !m.meta?.hidden);
+    const visibleMsgs = conversation.filter(m => m.role !== 'system' && !m.meta?.hidden);
     if (!visibleMsgs.length) {
       body.innerHTML = `<p class="tabbit-placeholder">点击「✨ 总结当前页面」开始，或在下方输入框直接提问。</p>`;
       return;
@@ -639,7 +858,8 @@
       if (m.role === 'user') {
         return `<div class="tabbit-msg tabbit-msg-user"><div class="tabbit-msg-role">🙋 我</div><div class="tabbit-msg-content">${_md(m.content)}</div></div>`;
       } else {
-        return `<div class="tabbit-msg tabbit-msg-assistant"><div class="tabbit-msg-role">🤖 ${escapeAttr(m.meta?.model || 'AI')}</div><div class="tabbit-msg-content">${_md(m.content)}</div></div>`;
+        const cursor = m.meta?.streaming ? '<span class="tabbit-cursor">▍</span>' : '';
+        return `<div class="tabbit-msg tabbit-msg-assistant"><div class="tabbit-msg-role">🤖 ${escapeAttr(m.meta?.model || 'AI')}${m.meta?.streaming ? ' · 输出中…' : ''}</div><div class="tabbit-msg-content">${_md(m.content)}${cursor}</div></div>`;
       }
     }).join('');
     body.scrollTop = body.scrollHeight;
@@ -1323,6 +1543,14 @@
         font-size: .85em;
         padding: 1px 5px;
       }
+              /* 🌊 流式光标 */
+      .tabbit-cursor {
+        display: inline-block;
+        width: 6px; margin-left: 2px;
+        animation: tabbitBlink 1s steps(2, start) infinite;
+        color: #8b5cf6; font-weight: bold;
+      }
+      @keyframes tabbitBlink { to { visibility: hidden; } }
     `;
     if (typeof GM_addStyle === 'function') GM_addStyle(css);
     else {
@@ -1832,13 +2060,11 @@
       setStatus('页面正文过短', 'error', 2500); return;
     }
 
-    // 重新开始一次"总结"会话：清空旧对话 + 注入页面 system + 投放第一条 user
     conversation = [];
     pageContextLoaded = false;
     ensurePageContext();
 
     const userPrompt = `请按以下要求总结当前页面：\n\n${template.text}`;
-    // 总结指令只进对话历史（供 AI 上下文使用），不在界面显示
     conversation.push({ role: 'user', content: userPrompt, meta: { hidden: true } });
 
     const runBtn = panelEl.querySelector('#tabbit-run-btn');
@@ -1847,25 +2073,48 @@
     runBtn.onclick = abortCurrentRequest;
     setStatus(`使用「${template.name}」模板，模型 ${getCurrentModelDisplayName()}…`, 'loading');
 
-    // 占位
-    const placeholder = { role: 'assistant', content: '🤖 正在思考…', meta: { model: getCurrentModelDisplayName(), placeholder: true } };
-    conversation.push(placeholder);
+    // 🌊 流式占位
+    const streamingMsg = { role: 'assistant', content: '', meta: { model: getCurrentModelDisplayName(), streaming: true } };
+    conversation.push(streamingMsg);
     renderConversation();
 
+    // 节流渲染（避免每个 token 都全量重渲）
+    let renderTimer = null;
+    const scheduleRender = () => {
+      if (renderTimer) return;
+      renderTimer = setTimeout(() => { renderTimer = null; renderConversation(); }, 60);
+    };
+
     try {
-      const content = await callChatApi(conversation.filter(m => !m.meta?.placeholder).map(m => ({ role: m.role, content: m.content })));
-      // 替换占位
-      conversation.pop();
-      appendMessage('assistant', content, { model: getCurrentModelDisplayName() });
+      const messagesForApi = conversation
+        .filter(m => !m.meta?.streaming)
+        .map(m => ({ role: m.role, content: m.content }));
+
+      const finalText = await callChatApi(messagesForApi, (delta, full) => {
+        streamingMsg.content = full;
+        scheduleRender();
+      });
+
+      streamingMsg.content = finalText;
+      streamingMsg.meta.streaming = false;
+      if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
+      renderConversation();
       setStatus('完成', 'ok', 1500);
     } catch (err) {
-      conversation.pop();
-      appendMessage('assistant', `❌ ${err.message || err}`, { model: getCurrentModelDisplayName() });
+      if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
+      // 已有部分输出则保留 + 追加错误；否则替换
+      if (streamingMsg.content) {
+        streamingMsg.content += `\n\n❌ ${err.message || err}`;
+      } else {
+        streamingMsg.content = `❌ ${err.message || err}`;
+      }
+      streamingMsg.meta.streaming = false;
+      renderConversation();
       setStatus('生成失败', 'error', 2500);
     } finally {
-        runBtn.disabled = false;
-        runBtn.textContent = '✨ 总结';
-        runBtn.onclick = () => runSummary(false);
+      runBtn.disabled = false;
+      runBtn.textContent = '✨ 总结';
+      runBtn.onclick = () => runSummary(false);
     }
   }
 
@@ -1883,34 +2132,56 @@
       setStatus('页面正文过短', 'error', 2500); return;
     }
 
-    // 确保页面上下文已注入（如果之前没有总结过，也能正常工作）
     ensurePageContext();
 
     const userPrompt = `请按以下要求重新总结当前页面（使用「${template.name}」风格）：\n\n${template.text}`;
-    // 总结指令只进对话历史（供 AI 上下文使用），不在界面显示
     conversation.push({ role: 'user', content: userPrompt, meta: { hidden: true } });
 
     const runBtn = panelEl.querySelector('#tabbit-run-btn');
-    runBtn.disabled = true;
+    runBtn.disabled = false;
+    runBtn.textContent = '⏹ 停止';
+    runBtn.onclick = abortCurrentRequest;
     setStatus(`使用「${template.name}」模板追加总结，模型 ${getCurrentModelDisplayName()}…`, 'loading');
 
-    // 占位
-    const placeholder = { role: 'assistant', content: '🤖 正在思考…', meta: { model: getCurrentModelDisplayName(), placeholder: true } };
-    conversation.push(placeholder);
+    const streamingMsg = { role: 'assistant', content: '', meta: { model: `${getCurrentModelDisplayName()} · ${template.name}`, streaming: true } };
+    conversation.push(streamingMsg);
     renderConversation();
 
+    let renderTimer = null;
+    const scheduleRender = () => {
+      if (renderTimer) return;
+      renderTimer = setTimeout(() => { renderTimer = null; renderConversation(); }, 60);
+    };
+
     try {
-      const content = await callChatApi(conversation.filter(m => !m.meta?.placeholder).map(m => ({ role: m.role, content: m.content })));
-      // 替换占位
-      conversation.pop();
-      appendMessage('assistant', content, { model: `${getCurrentModelDisplayName()} · ${template.name}` });
+      const messagesForApi = conversation
+        .filter(m => !m.meta?.streaming)
+        .map(m => ({ role: m.role, content: m.content }));
+
+      const finalText = await callChatApi(messagesForApi, (delta, full) => {
+        streamingMsg.content = full;
+        scheduleRender();
+      });
+
+      streamingMsg.content = finalText;
+      streamingMsg.meta.streaming = false;
+      if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
+      renderConversation();
       setStatus('完成', 'ok', 1500);
     } catch (err) {
-      conversation.pop();
-      appendMessage('assistant', `❌ ${err.message || err}`, { model: getCurrentModelDisplayName() });
+      if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
+      if (streamingMsg.content) {
+        streamingMsg.content += `\n\n❌ ${err.message || err}`;
+      } else {
+        streamingMsg.content = `❌ ${err.message || err}`;
+      }
+      streamingMsg.meta.streaming = false;
+      renderConversation();
       setStatus('生成失败', 'error', 2500);
     } finally {
       runBtn.disabled = false;
+      runBtn.textContent = '✨ 总结';
+      runBtn.onclick = () => runSummary(false);
     }
   }
 
@@ -1922,7 +2193,6 @@
     const text = (input.value || '').trim();
     if (!text) return;
 
-    // 第一次提问也注入页面上下文
     ensurePageContext();
     appendMessage('user', text);
     input.value = '';
@@ -1931,20 +2201,40 @@
     sendBtn.disabled = true; sendBtn.textContent = '...';
     setStatus(`AI 思考中（${getCurrentModelDisplayName()}）…`, 'loading');
 
-    const placeholder = { role: 'assistant', content: '🤖 正在思考…', meta: { model: getCurrentModelDisplayName(), placeholder: true } };
-    conversation.push(placeholder);
+    const streamingMsg = { role: 'assistant', content: '', meta: { model: getCurrentModelDisplayName(), streaming: true } };
+    conversation.push(streamingMsg);
     renderConversation();
 
+    let renderTimer = null;
+    const scheduleRender = () => {
+      if (renderTimer) return;
+      renderTimer = setTimeout(() => { renderTimer = null; renderConversation(); }, 60);
+    };
+
     try {
-      const content = await callChatApi(
-        conversation.filter(m => !m.meta?.placeholder).map(m => ({ role: m.role, content: m.content }))
-      );
-      conversation.pop();
-      appendMessage('assistant', content, { model: getCurrentModelDisplayName() });
+      const messagesForApi = conversation
+        .filter(m => !m.meta?.streaming)
+        .map(m => ({ role: m.role, content: m.content }));
+
+      const finalText = await callChatApi(messagesForApi, (delta, full) => {
+        streamingMsg.content = full;
+        scheduleRender();
+      });
+
+      streamingMsg.content = finalText;
+      streamingMsg.meta.streaming = false;
+      if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
+      renderConversation();
       setStatus('完成', 'ok', 1200);
     } catch (err) {
-      conversation.pop();
-      appendMessage('assistant', `❌ ${err.message || err}`, { model: getCurrentModelDisplayName() });
+      if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
+      if (streamingMsg.content) {
+        streamingMsg.content += `\n\n❌ ${err.message || err}`;
+      } else {
+        streamingMsg.content = `❌ ${err.message || err}`;
+      }
+      streamingMsg.meta.streaming = false;
+      renderConversation();
       setStatus('生成失败', 'error', 2500);
     } finally {
       sendBtn.disabled = false; sendBtn.textContent = '发送';

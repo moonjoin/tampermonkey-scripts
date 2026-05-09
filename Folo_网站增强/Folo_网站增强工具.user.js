@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Folo 网站增强工具 (v13.4 flomo集成版)
+// @name         Folo 网站增强工具
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      13.4.4
+// @version      13.4.5
 // @description  Folo 增强：Jina Reader + Readability + 启发式三级抓取 + AI 总结 + 自动总结 + 后续对话 + 多配置管理 + 坚果云 WebDAV 同步 + 复制对话 + 保存到 flomo
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
@@ -1206,32 +1206,231 @@
     }
 
     // ==================== 6. AI 调用 ====================
-    function callAIChat(messages, onSuccess, onError) {
+    function callAIChat(messages, onSuccess, onError, onChunk) {
         const config = getActiveConfig();
         if (!config.apiKey) {
             onError && onError("请先配置 API Key");
             return;
         }
         const finalUrl = normalizeApiUrl(config.apiUrl);
-        GM_xmlhttpRequest({
-            method: "POST", url: finalUrl,
-            headers: { "Content-Type": "application/json", "Authorization": "Bearer " + config.apiKey },
-            data: JSON.stringify({ model: config.model, messages: messages }),
-            onload: (res) => {
-                if (res.responseText.trim().startsWith("<")) {
-                    onError && onError("URL 错误 (返回了 HTML)");
-                    return;
-                }
-                try {
-                    const data = JSON.parse(res.responseText);
-                    if (data.error) onError && onError("API Error: " + data.error.message);
-                    else {
-                        const content = data.choices?.[0]?.message?.content || "无内容";
-                        onSuccess && onSuccess(content);
+        const useStream = typeof onChunk === 'function';
+
+        // 非流式：保持原逻辑
+        if (!useStream) {
+            GM_xmlhttpRequest({
+                method: "POST", url: finalUrl,
+                headers: { "Content-Type": "application/json", "Authorization": "Bearer " + config.apiKey },
+                data: JSON.stringify({ model: config.model, messages: messages }),
+                onload: (res) => {
+                    if (res.responseText.trim().startsWith("<")) {
+                        onError && onError("URL 错误 (返回了 HTML)");
+                        return;
                     }
-                } catch(e) { onError && onError("解析失败：" + e.message); }
-            },
-            onerror: () => onError && onError("网络错误")
+                    try {
+                        const data = JSON.parse(res.responseText);
+                        if (data.error) onError && onError("API Error: " + data.error.message);
+                        else {
+                            const content = data.choices?.[0]?.message?.content || "无内容";
+                            onSuccess && onSuccess(content);
+                        }
+                    } catch(e) { onError && onError("解析失败：" + e.message); }
+                },
+                onerror: () => onError && onError("网络错误")
+            });
+            return;
+        }
+
+        // 流式：优先用 fetch + ReadableStream（真流式）
+        const doFetchStream = async () => {
+            const controller = new AbortController();
+            let fullText = '';
+            let buffer = '';
+
+            const processLine = (line) => {
+                line = line.replace(/\r$/, '').trim();
+                if (!line) return true;
+                if (line.startsWith(':')) return true;
+                if (!line.startsWith('data:')) return true;
+                const payload = line.slice(5).trim();
+                if (payload === '[DONE]') return false;
+                try {
+                    const obj = JSON.parse(payload);
+                    if (obj.error) {
+                        throw new Error(obj.error.message || JSON.stringify(obj.error));
+                    }
+                    const delta = obj.choices?.[0]?.delta?.content
+                               || obj.choices?.[0]?.message?.content
+                               || '';
+                    if (delta) {
+                        fullText += delta;
+                        try { onChunk(delta, fullText); } catch(e) { console.warn(e); }
+                    }
+                } catch(e) {
+                    if (e.message && e.message.indexOf('JSON') === -1) throw e;
+                    // 非合法 JSON 行,忽略
+                }
+                return true;
+            };
+
+            try {
+                const resp = await fetch(finalUrl, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': 'Bearer ' + config.apiKey,
+                        'Accept': 'text/event-stream'
+                    },
+                    body: JSON.stringify({ model: config.model, messages: messages, stream: true }),
+                    signal: controller.signal
+                });
+
+                if (!resp.ok) {
+                    const errText = await resp.text();
+                    throw new Error(`HTTP ${resp.status}: ${errText.substring(0, 200)}`);
+                }
+
+                const ctype = resp.headers.get('content-type') || '';
+                // 如果服务端没返回 SSE,降级一次性
+                if (!ctype.includes('text/event-stream') && !resp.body) {
+                    const text = await resp.text();
+                    try {
+                        const data = JSON.parse(text);
+                        const content = data.choices?.[0]?.message?.content || '';
+                        if (content) {
+                            try { onChunk(content, content); } catch(e){}
+                            onSuccess && onSuccess(content);
+                            return true;
+                        }
+                    } catch(e){}
+                    throw new Error('服务端未返回流式响应');
+                }
+
+                const reader = resp.body.getReader();
+                const decoder = new TextDecoder('utf-8');
+                let done = false;
+                while (!done) {
+                    const { value, done: rDone } = await reader.read();
+                    done = rDone;
+                    if (value) {
+                        buffer += decoder.decode(value, { stream: !done });
+                        let idx;
+                        while ((idx = buffer.indexOf('\n')) !== -1) {
+                            const line = buffer.slice(0, idx);
+                            buffer = buffer.slice(idx + 1);
+                            const cont = processLine(line);
+                            if (!cont) { done = true; break; }
+                        }
+                    }
+                }
+                // 处理残余 buffer
+                if (buffer.trim()) processLine(buffer);
+
+                if (fullText) {
+                    onSuccess && onSuccess(fullText);
+                } else {
+                    onError && onError('流式响应为空');
+                }
+                return true;
+            } catch (e) {
+                console.warn('[fetch stream 失败,尝试降级]', e);
+                return { fallback: true, error: e };
+            }
+        };
+
+        // 兜底：GM_xmlhttpRequest（虽然多数环境不真流式,但起码能拿到结果）
+        const doGMFallback = () => {
+            let receivedLen = 0;
+            let buffer = '';
+            let fullText = '';
+            let aborted = false;
+
+            const flushBuffer = () => {
+                let idx;
+                while ((idx = buffer.indexOf('\n')) !== -1) {
+                    let line = buffer.slice(0, idx);
+                    buffer = buffer.slice(idx + 1);
+                    line = line.replace(/\r$/, '').trim();
+                    if (!line) continue;
+                    if (line.startsWith(':')) continue;
+                    if (line.startsWith('data:')) {
+                        const payload = line.slice(5).trim();
+                        if (payload === '[DONE]') { aborted = true; return; }
+                        try {
+                            const obj = JSON.parse(payload);
+                            if (obj.error) {
+                                onError && onError("API Error: " + (obj.error.message || JSON.stringify(obj.error)));
+                                aborted = true;
+                                return;
+                            }
+                            const delta = obj.choices?.[0]?.delta?.content
+                                       || obj.choices?.[0]?.message?.content
+                                       || '';
+                            if (delta) {
+                                fullText += delta;
+                                try { onChunk(delta, fullText); } catch(e) { console.warn(e); }
+                            }
+                        } catch(e) {}
+                    }
+                }
+            };
+
+            GM_xmlhttpRequest({
+                method: "POST", url: finalUrl,
+                headers: {
+                    "Content-Type": "application/json",
+                    "Authorization": "Bearer " + config.apiKey,
+                    "Accept": "text/event-stream"
+                },
+                data: JSON.stringify({ model: config.model, messages: messages, stream: true }),
+                responseType: 'stream',
+                onprogress: (e) => {
+                    if (aborted) return;
+                    const text = e.responseText || '';
+                    if (text.length <= receivedLen) return;
+                    const newChunk = text.substring(receivedLen);
+                    receivedLen = text.length;
+                    buffer += newChunk;
+                    flushBuffer();
+                },
+                onload: (res) => {
+                    if (aborted && fullText) { onSuccess && onSuccess(fullText); return; }
+                    const text = res.responseText || '';
+                    if (text.length > receivedLen) {
+                        buffer += text.substring(receivedLen);
+                        receivedLen = text.length;
+                        flushBuffer();
+                    }
+                    if (fullText) {
+                        onSuccess && onSuccess(fullText);
+                    } else {
+                        if (text.trim().startsWith("<")) {
+                            onError && onError("URL 错误 (返回了 HTML)");
+                            return;
+                        }
+                        try {
+                            const data = JSON.parse(text);
+                            if (data.error) onError && onError("API Error: " + data.error.message);
+                            else {
+                                const content = data.choices?.[0]?.message?.content || "无内容";
+                                try { onChunk(content, content); } catch(e){}
+                                onSuccess && onSuccess(content);
+                            }
+                        } catch(e) {
+                            onError && onError("流式解析失败,且非合法 JSON");
+                        }
+                    }
+                },
+                onerror: () => onError && onError("网络错误"),
+                ontimeout: () => onError && onError("请求超时")
+            });
+        };
+
+        // 先尝试 fetch,失败再降级
+        doFetchStream().then(result => {
+            if (result && result.fallback) {
+                console.log('[Folo增强] fetch 流式失败,降级到 GM_xmlhttpRequest');
+                doGMFallback();
+            }
         });
     }
 
@@ -1282,6 +1481,18 @@
 
         const userMessage = config.prompt + "\n\n" + fullContent;
 
+        // 流式渲染状态
+        let streamStarted = false;
+        const renderStream = (delta, full) => {
+            if (!streamStarted) {
+                streamStarted = true;
+                btn.innerText = "AI 输出中...";
+                resultDiv.innerHTML = '';
+            }
+            // 实时 markdown 渲染（每次 chunk 全量重渲）
+            resultDiv.innerHTML = _md(full) + '<span style="opacity:0.5;animation:fadeIn 0.5s infinite alternate">▍</span>';
+        };
+
         callAIChat(
             [
                 { role: "system", content: systemPrompt },
@@ -1321,7 +1532,8 @@
             (errMsg) => {
                 btn.disabled = false; btn.innerText = "重试";
                 resultDiv.innerHTML = `<span style="color:red">${errMsg}</span>`;
-            }
+            },
+            renderStream  // 👈 第 4 个参数：流式回调
         );
     }
 
@@ -1525,6 +1737,16 @@
 
         sendBtn.disabled = true; sendBtn.innerText = '发送中';
 
+        let chatStreamStarted = false;
+        const onChatChunk = (delta, full) => {
+            if (!chatStreamStarted) {
+                chatStreamStarted = true;
+            }
+            aiMsg.innerHTML = `<span class="role-label">🤖 AI</span>` + _md(full)
+                + '<span style="opacity:0.5;">▍</span>';
+            historyDiv.scrollTop = historyDiv.scrollHeight;
+        };
+
         callAIChat(
             wrapper.__chatHistory,
             (content) => {
@@ -1537,7 +1759,8 @@
                 sendBtn.disabled = false; sendBtn.innerText = '发送';
                 aiMsg.innerHTML = `<span class="role-label">🤖 AI</span><span style="color:red">${errMsg}</span>`;
                 wrapper.__chatHistory.pop();
-            }
+            },
+            onChatChunk  // 👈 流式回调
         );
     }
 
