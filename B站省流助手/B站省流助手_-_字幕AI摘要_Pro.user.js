@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         B站省流助手 - 字幕AI摘要 Pro
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      3.6.2
-// @description  自动提取B站视频字幕，通过自定义AI API生成极简摘要，支持模型切换、持续对话和评论区总结；支持自动解析开关、悬浮窗/面板可拖动、自动获取模型列表、flomo自动加标签，新增总结生图功能
+// @version      3.7.0
+// @description  自动提取B站视频字幕，通过自定义AI API生成极简摘要，支持模型切换、持续对话和评论区总结；支持自动解析开关、悬浮窗/面板可拖动、自动获取模型列表、flomo自动加标签，新增总结生图功能；v3.7.0 全面流式输出
 // @author       次元饺子
 // @match        https://www.bilibili.com/video/*
 // @match        https://www.bilibili.com/list/*
@@ -21,7 +21,6 @@
 
   const COMMENT_PROMPT_TEXT = '你是一个专业的评论分析助手。请对以下B站视频评论进行总结分析，包括：\n1. 评论整体情感倾向（正面/负面/中性）\n2. 主要讨论话题（列出3-5个）\n3. 有趣/高赞评论摘录\n4. 我理解能力差、没耐心，别讲铺垫、别讲背景、别讲废话，只告诉我：这东西核心结论是什么、有哪几个关键点、对我有什么用。';
 
-  // 🆕 统一的生图专用提示词（自动生图 / 手动生图 共用同一份，可在设置中修改）
   const IMAGE_GEN_PROMPT_TEXT = '根据以下视频内容总结，生成一张信息可视化的精美配图，风格清晰美观，适合作为视频总结的封面图：\n\n{summary}';
 
   // ==================== localStorage 配置存储层 ====================
@@ -71,16 +70,13 @@
     commentPromptText: COMMENT_PROMPT_TEXT,
     skipDuration: 60,
     autoParse: true,
-    // ===== 提示词预设系统 =====
     promptPresets: DEFAULT_PRESETS,
     activePresetId: 'preset_default',
-    // ===== 总结生图功能 =====
     enableImageGen: false,
     imageGenApiUrl: '',
     imageGenApiKey: '',
     imageGenModel: 'gemini-3.1-flash-image-preview',
     imageGenSize: '1024x1024',
-    // 🆕 生图专用提示词（自动 + 手动生图共用），{summary} 会被替换为视频总结内容
     imageGenPromptText: IMAGE_GEN_PROMPT_TEXT
   };
 
@@ -105,7 +101,6 @@
     }
   }
 
-  // ===== 位置存储（面板和悬浮按钮的拖动位置）=====
   function loadPositions() {
     try {
       const raw = localStorage.getItem(POSITION_KEY);
@@ -119,14 +114,13 @@
     } catch(e) {}
   }
 
-  // 运行时配置
   let CONFIG = loadConfig();
   let POSITIONS = loadPositions();
   const INIT_DELAY_MS = 2000;
   const MAX_CONVERSATION_HISTORY = 21;
-  // 生图模式下，传给生图模型的「视频总结」最大字数
-  // 设为 500 是为了兼顾各家生图模型的 prompt 长度限制（如 SD ~225 tokens、DALL·E ~4000 字符）
   const IMAGE_GEN_SUMMARY_MAX_LEN = 5000;
+  // 🆕 流式渲染节流间隔（ms），控制 UI 重绘频率
+  const STREAM_RENDER_THROTTLE = 80;
 
   class BiliRiskControlError extends Error {
     constructor(message) {
@@ -141,7 +135,6 @@
     'Origin': 'https://www.bilibili.com'
   };
 
-  // ==================== 评论区防Ban配置 ====================
   const COMMENT_CONFIG = {
     pageSize: 20,
     maxPages: 8,
@@ -161,7 +154,7 @@
   let conversationHistory = [];
   let commentConversationHistory = [];
   let isCommentSummarizing = false;
-  let hasParsed = false; // 是否已执行过解析
+  let hasParsed = false;
 
   // ==================== 视频信息获取 ====================
   function getVideoInfo() {
@@ -483,6 +476,20 @@
       @keyframes pulseGlow {
         0%, 100% { box-shadow: 0 2px 8px rgba(251,114,153,0.3); }
         50% { box-shadow: 0 2px 16px rgba(251,114,153,0.6); }
+      }
+      /* 🆕 流式打字光标 */
+      @keyframes tabbitBlink {
+        0%, 50% { opacity: 1; }
+        50.01%, 100% { opacity: 0; }
+      }
+      .tabbit-typing-cursor {
+        display: inline-block;
+        width: 2px;
+        height: 1em;
+        background: #667eea;
+        vertical-align: text-bottom;
+        margin-left: 2px;
+        animation: tabbitBlink 1s steps(2) infinite;
       }
       #tabbit-ai-summary-panel {
         position: fixed;
@@ -1020,7 +1027,6 @@
         display: none;
       }
 
-      /* 开关样式 */
       .tabbit-switch {
         position: relative;
         display: inline-block;
@@ -1062,7 +1068,6 @@
         margin-bottom: 0;
       }
 
-      /* 输入+按钮组合 */
       .tabbit-input-with-btn {
         display: flex;
         gap: 8px;
@@ -1109,7 +1114,6 @@
         gap: 4px;
       }
 
-      /* ==================== 悬浮唤出按钮 ==================== */
       @keyframes tabbitFloatIn {
         from { opacity: 0; transform: scale(0.5); }
         to { opacity: 1; transform: scale(1); }
@@ -1157,7 +1161,6 @@
         writing-mode: vertical-rl;
         letter-spacing: 3px;
       }
-            /* ==================== 预设切换栏 ==================== */
       .tabbit-preset-bar {
         background: linear-gradient(135deg, #fff5f8 0%, #f0f4ff 100%);
         border: 1px solid #ffd6e3;
@@ -1210,7 +1213,6 @@
       }
       .tabbit-preset-icon { font-size: 13px; }
 
-      /* ==================== 预设管理列表（设置面板内）==================== */
       .tabbit-preset-manage-list {
         display: flex;
         flex-direction: column;
@@ -1291,9 +1293,6 @@
   }
 
   // ==================== 拖动功能 ====================
-  // 让目标元素 target 通过 handle（默认 = target）拖动；拖动结束后调用 onEnd(left, top)
-  // 当 handle === target 时，认为整个元素都是拖动手柄（不忽略按钮）
-  // 当 handle !== target 时（比如 header），会自动忽略 handle 内部的按钮区域
   function makeDraggable(target, handle, onEnd) {
     handle = handle || target;
     const handleIsTarget = (handle === target);
@@ -1304,8 +1303,6 @@
 
     handle.addEventListener('mousedown', function(e) {
       if (e.button !== 0) return;
-      // 仅当 handle 不是 target 本身时，忽略 handle 内部按钮等可交互元素
-      // （避免点击面板 header 上的关闭/设置按钮时触发拖动）
       if (!handleIsTarget) {
         if (e.target.tagName === 'BUTTON' || e.target.closest('button')) return;
         if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
@@ -1317,7 +1314,6 @@
       startY = e.clientY;
       startLeft = rect.left;
       startTop = rect.top;
-      // 切换为 left/top 定位（去掉 right/bottom/transform，避免位置突变）
       target.style.left = startLeft + 'px';
       target.style.top = startTop + 'px';
       target.style.right = 'auto';
@@ -1335,7 +1331,6 @@
       if (Math.abs(dx) + Math.abs(dy) > 3) moved = true;
       let newLeft = startLeft + dx;
       let newTop = startTop + dy;
-      // 限制在视口内
       const rect = target.getBoundingClientRect();
       const maxLeft = window.innerWidth - rect.width;
       const maxTop = window.innerHeight - rect.height;
@@ -1428,10 +1423,8 @@
     `;
     document.body.appendChild(panel);
 
-    // 应用保存的位置
     applyPanelPosition(panel);
 
-    // 绑定拖动
     const header = panel.querySelector('.tabbit-panel-header');
     makeDraggable(panel, header, function(left, top) {
       POSITIONS.panel = { left, top };
@@ -1484,7 +1477,6 @@
     }
   }
 
-  // showFloatBtn(panelOrNull) ：当 panel=null 时表示纯悬浮模式（未解析过），点击会触发解析
   function showFloatBtn(panel) {
     const old = document.querySelector('#tabbit-float-btn');
     if (old) old.remove();
@@ -1502,7 +1494,6 @@
       POSITIONS.floatBtn = { left, top };
       savePositions(POSITIONS);
       dragMoved = true;
-      // 短暂屏蔽 click，避免拖动后误触
       setTimeout(() => { dragMoved = false; }, 150);
     });
 
@@ -1510,13 +1501,11 @@
       if (dragMoved) return;
       hideFloatBtn();
       if (panel) {
-        // 已解析：恢复面板显示
         panel.style.animation = 'none';
         panel.style.display = 'flex';
         void panel.offsetWidth;
         panel.style.animation = 'slideInRight 0.3s ease';
       } else {
-        // 未解析：触发解析流程
         await startParsing();
       }
     });
@@ -1615,14 +1604,12 @@
     btn.disabled = true;
     btn.textContent = '⏳ 生成中...';
 
-    // 构建生图 prompt（使用统一的、可在设置中修改的生图提示词模板）
-    const summaryForImage = textContent.slice(0, IMAGE_GEN_SUMMARY_MAX_LEN).replace(/[#*_\[\]()]/g, '');
+    const summaryForImage = (summaryText || '').slice(0, IMAGE_GEN_SUMMARY_MAX_LEN).replace(/[#*_\[\]()]/g, '');
     const promptTemplate = CONFIG.imageGenPromptText || IMAGE_GEN_PROMPT_TEXT;
     const imagePrompt = promptTemplate.includes('{summary}')
       ? promptTemplate.replace('{summary}', summaryForImage)
       : promptTemplate + '\n\n' + summaryForImage;
 
-    // 推导 images/generations 端点
     let imageApiUrl = apiUrl.trim().replace(/\/+$/, '');
     if (/\/chat\/completions$/.test(imageApiUrl)) {
       imageApiUrl = imageApiUrl.replace(/\/chat\/completions$/, '/images/generations');
@@ -1637,7 +1624,6 @@
     let imageDataUrl = '';
 
     try {
-      // 先尝试 b64_json
       const imageRes = await fetch(imageApiUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + apiKey },
@@ -1653,7 +1639,6 @@
         }
       }
 
-      // 兜底：尝试 url 格式
       if (!imageDataUrl) {
         const imageRes2 = await fetch(imageApiUrl, {
           method: 'POST',
@@ -1674,7 +1659,6 @@
         throw new Error('生图 API 未返回图片数据');
       }
 
-      // 将图片追加到结果区域下方
       const resultContainer = contentDiv.querySelector('.tabbit-result');
       if (resultContainer) {
         const imgDiv = document.createElement('div');
@@ -1696,7 +1680,6 @@
         });
         imgDiv.appendChild(img);
 
-        // 保存图片按钮
         const saveRow = document.createElement('div');
         saveRow.style.cssText = 'display:flex;gap:8px;justify-content:center;margin-top:8px;';
         const saveBtn = document.createElement('button');
@@ -1728,12 +1711,12 @@
     }
   }
 
-  function showResult(contentDiv, result, url, videoInfo) {
+  // 🆕 流式总结的最终装配（流式结束时调用，挂上完整的按钮区）
+  function finalizeSummaryUI(contentDiv, result, url, videoInfo) {
     rawMarkdownResult = result;
-    const parsedHtml = parseMarkdown(result);
     const resultContainer = contentDiv.querySelector('.tabbit-result');
     if (resultContainer) {
-      resultContainer.innerHTML = parsedHtml;
+      resultContainer.innerHTML = parseMarkdown(result);
     }
     const actionsDiv = contentDiv.querySelector('.tabbit-result-actions');
     if (actionsDiv) {
@@ -1755,7 +1738,6 @@
       flomoBtn.className = 'tabbit-copy-btn';
       flomoBtn.textContent = '🌱 flomo';
       flomoBtn.addEventListener('click', function() { sendToFlomo(rawMarkdownResult, this); });
-      // 手动生图按钮（始终显示）
       const genImgBtn = document.createElement('button');
       genImgBtn.className = 'tabbit-copy-btn';
       genImgBtn.textContent = '🖼️ 生成配图';
@@ -1914,6 +1896,7 @@
   }
 
   // ==================== AI 调用 ====================
+  // 兼容旧逻辑：非流式
   async function callAI(messages) {
     if (!CONFIG.apiUrl || !CONFIG.apiKey || !currentModel) {
       throw new Error('请点击右上角 ⚙️ 设置按钮，填写 apiUrl、apiKey 和 model');
@@ -1942,10 +1925,174 @@
     return data.choices[0].message.content;
   }
 
-  // 调用生图模型 API
-  // 流程：先用 chat/completions 让模型总结字幕，再用 /v1/images/generations 生成配图
-  // 对用户来说是一键操作，内部自动完成「总结 + 生图」两步
-  async function callImageGenAI(prompt) {
+  /**
+   * 🆕 流式 AI 调用
+   * @param {Array} messages - 消息列表
+   * @param {Function} onDelta - 每收到一段时回调，参数 (fullText, deltaText)
+   * @param {Object} options - { apiUrl, apiKey, model } 自定义参数（可选）
+   * @returns {Promise<string>} 完整文本
+   * 失败时自动降级到非流式
+   */
+  async function callAIStream(messages, onDelta, options) {
+    options = options || {};
+    const apiUrl = options.apiUrl || CONFIG.apiUrl;
+    const apiKey = options.apiKey || CONFIG.apiKey;
+    const model = options.model || currentModel;
+
+    if (!apiUrl || !apiKey || !model) {
+      throw new Error('请点击右上角 ⚙️ 设置按钮，填写 apiUrl、apiKey 和 model');
+    }
+
+    let res;
+    try {
+      res = await fetch(apiUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer ' + apiKey
+        },
+        body: JSON.stringify({
+          model: model,
+          messages: messages,
+          temperature: 0.7,
+          max_tokens: 2000,
+          stream: true
+        })
+      });
+    } catch (netErr) {
+      throw new Error('网络请求失败: ' + netErr.message);
+    }
+
+    if (!res.ok) {
+      const errText = await res.text().catch(() => '');
+      throw new Error('API 错误: ' + res.status + ' ' + errText);
+    }
+
+    // 检测 Content-Type，如果不是 SSE 则降级为非流式 JSON 解析
+    const ct = (res.headers.get('content-type') || '').toLowerCase();
+    if (!ct.includes('text/event-stream') && !res.body) {
+      console.warn('[省流助手-流式] API 不支持 stream，降级为一次性返回');
+      const data = await res.json();
+      const fullText = data.choices?.[0]?.message?.content || '';
+      if (typeof onDelta === 'function' && fullText) {
+        try { onDelta(fullText, fullText); } catch (e) {}
+      }
+      return fullText;
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder('utf-8');
+    let fullText = '';
+    let buffer = '';
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed || !trimmed.startsWith('data:')) continue;
+          const dataStr = trimmed.slice(5).trim();
+          if (dataStr === '[DONE]') continue;
+          try {
+            const json = JSON.parse(dataStr);
+            // OpenAI 兼容格式：choices[0].delta.content
+            const delta = json.choices?.[0]?.delta?.content
+                       || json.choices?.[0]?.message?.content
+                       || '';
+            if (delta) {
+              fullText += delta;
+              if (typeof onDelta === 'function') {
+                try { onDelta(fullText, delta); } catch (e) {}
+              }
+            }
+          } catch (e) {
+            // 单行解析失败不影响整体
+          }
+        }
+      }
+    } catch (streamErr) {
+      // 流读取异常，如果已经有部分内容，返回部分；否则抛出
+      if (!fullText) {
+        // 🆕 抛错前也要取消挂起的延迟回调
+        if (typeof onDelta === 'function' && typeof onDelta.cancel === 'function') {
+          onDelta.cancel();
+        }
+        throw new Error('流式读取失败: ' + streamErr.message);
+      }
+      console.warn('[省流助手-流式] 流中断，使用已收到内容:', streamErr.message);
+    }
+
+    // 🆕 流式结束后立即取消挂起的延迟节流回调，
+    // 避免它在调用方做最终 markdown 渲染之后才触发，把渲染结果覆盖回纯文本
+    if (typeof onDelta === 'function' && typeof onDelta.cancel === 'function') {
+      onDelta.cancel();
+    }
+
+    if (!fullText.trim()) {
+      throw new Error('AI 未返回任何内容');
+    }
+    return fullText;
+  }
+
+  /**
+   * 🆕 创建一个节流回调，包装原始 onDelta，避免高频重绘
+   * 返回的函数带有 .cancel() 方法，可在流式结束后取消未触发的延迟回调，
+   * 防止延迟回调覆盖最终的 markdown 渲染（重要！）
+   */
+  function createThrottledDelta(onDelta, intervalMs) {
+    intervalMs = intervalMs || STREAM_RENDER_THROTTLE;
+    let lastCall = 0;
+    let pendingFull = null;
+    let timer = null;
+    const throttled = function(fullText, delta) {
+      pendingFull = fullText;
+      const now = Date.now();
+      if (now - lastCall >= intervalMs) {
+        lastCall = now;
+        if (timer) { clearTimeout(timer); timer = null; }
+        try { onDelta(pendingFull, delta); } catch (e) {}
+      } else if (!timer) {
+        const wait = intervalMs - (now - lastCall);
+        timer = setTimeout(function() {
+          timer = null;
+          lastCall = Date.now();
+          try { onDelta(pendingFull, ''); } catch (e) {}
+        }, wait);
+      }
+    };
+    // 🆕 取消挂起的延迟回调（流式结束后调用）
+    throttled.cancel = function() {
+      if (timer) { clearTimeout(timer); timer = null; }
+    };
+    return throttled;
+  }
+
+  // 🆕 生图模式 - 第1步：流式获取文字总结
+  async function generateSummaryText(prompt, onDelta) {
+    const summaryApiUrl = CONFIG.apiUrl;
+    const summaryApiKey = CONFIG.apiKey;
+    const summaryModel = currentModel;
+    console.log('[省流助手-生图] 第1步：用默认模型', summaryModel, '流式获取文字总结...');
+    const textContent = await callAIStream(
+      [{ role: 'user', content: prompt }],
+      onDelta,
+      { apiUrl: summaryApiUrl, apiKey: summaryApiKey, model: summaryModel }
+    );
+    console.log('[省流助手-生图] 文字总结完成，长度:', textContent.length);
+    if (!textContent.trim()) {
+      throw new Error('生图模型未返回文字总结内容');
+    }
+    return textContent;
+  }
+
+  // 🆕 生图模式 - 第2步：根据已有的总结文字生成配图
+  async function generateImageFromSummary(textContent) {
     const apiUrl = CONFIG.imageGenApiUrl || CONFIG.apiUrl;
     const apiKey = CONFIG.imageGenApiKey || CONFIG.apiKey;
     const model = CONFIG.imageGenModel || 'gemini-2.0-flash-preview-image-generation';
@@ -1954,64 +2101,23 @@
       throw new Error('请在设置中配置生图模型的 API URL 和 API Key');
     }
 
-    console.log('[省流助手-生图] 开始生图流程，模型:', model, '| API:', apiUrl);
-
-    // ===== 第1步：用默认总结模型（chat/completions）获取文字总结 =====
-    const summaryApiUrl = CONFIG.apiUrl;
-    const summaryApiKey = CONFIG.apiKey;
-    const summaryModel = currentModel;
-    console.log('[省流助手-生图] 第1步：用默认模型', summaryModel, '获取文字总结...');
-    const chatRes = await fetch(summaryApiUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': 'Bearer ' + summaryApiKey
-      },
-      body: JSON.stringify({
-        model: summaryModel,
-        messages: [{ role: 'user', content: prompt }],
-        temperature: 0.7,
-        max_tokens: 2000
-      })
-    });
-
-    if (!chatRes.ok) {
-      const errText = await chatRes.text();
-      throw new Error('文字总结失败: ' + chatRes.status + ' ' + errText);
-    }
-
-    const chatData = await chatRes.json();
-    const textContent = chatData.choices?.[0]?.message?.content || '';
-    console.log('[省流助手-生图] 文字总结完成，长度:', textContent.length);
-
-    if (!textContent.trim()) {
-      throw new Error('生图模型未返回文字总结内容');
-    }
-
-    // ===== 第2步：从总结中提取关键信息，构建生图 prompt =====
-    // 用总结内容的前300字作为生图描述，使用统一的、可在设置中修改的生图提示词模板
     const summaryForImage = textContent.slice(0, IMAGE_GEN_SUMMARY_MAX_LEN).replace(/[#*_\[\]()]/g, '');
     const promptTemplate = CONFIG.imageGenPromptText || IMAGE_GEN_PROMPT_TEXT;
     const imagePrompt = promptTemplate.includes('{summary}')
       ? promptTemplate.replace('{summary}', summaryForImage)
       : promptTemplate + '\n\n' + summaryForImage;
 
-    // ===== 第3步：调用 /v1/images/generations 生成图片 =====
-    // 从 apiUrl 推导出 images/generations 端点
     let imageApiUrl = apiUrl.trim().replace(/\/+$/, '');
     if (/\/chat\/completions$/.test(imageApiUrl)) {
       imageApiUrl = imageApiUrl.replace(/\/chat\/completions$/, '/images/generations');
     } else if (/\/completions$/.test(imageApiUrl)) {
       imageApiUrl = imageApiUrl.replace(/\/completions$/, '/images/generations');
     } else {
-      // 兜底：直接拼
       imageApiUrl = imageApiUrl.replace(/\/v1\/.*$/, '/v1/images/generations');
     }
-
     console.log('[省流助手-生图] 第2步：调用生图端点:', imageApiUrl);
 
     let imageDataUrl = '';
-
     try {
       const imageRes = await fetch(imageApiUrl, {
         method: 'POST',
@@ -2028,36 +2134,22 @@
         })
       });
 
-      if (!imageRes.ok) {
-        const errText = await imageRes.text();
-        console.warn('[省流助手-生图] 生图端点返回错误:', imageRes.status, errText.slice(0, 200));
-        // 生图失败不阻断，仍然返回文字总结
-        console.log('[省流助手-生图] 生图失败，将只显示文字总结');
-      } else {
+      if (imageRes.ok) {
         const imageData = await imageRes.json();
-        console.log('[省流助手-生图] 生图API响应:', JSON.stringify(imageData).slice(0, 300));
-
-        // 解析图片数据
         if (imageData.data && imageData.data.length > 0) {
           const imgItem = imageData.data[0];
-          if (imgItem.b64_json) {
-            imageDataUrl = 'data:image/png;base64,' + imgItem.b64_json;
-            console.log('[省流助手-生图] ✅ 成功获取 base64 图片，长度:', imageDataUrl.length);
-          } else if (imgItem.url) {
-            imageDataUrl = imgItem.url;
-            console.log('[省流助手-生图] ✅ 成功获取图片 URL:', imageDataUrl.slice(0, 100));
-          }
+          if (imgItem.b64_json) imageDataUrl = 'data:image/png;base64,' + imgItem.b64_json;
+          else if (imgItem.url) imageDataUrl = imgItem.url;
         }
+      } else {
+        console.warn('[省流助手-生图] 生图端点返回错误:', imageRes.status);
       }
     } catch (imgErr) {
       console.warn('[省流助手-生图] 生图请求异常:', imgErr.message);
-      // 生图失败不阻断
     }
 
-    // ===== 兜底：如果 b64_json 没拿到，尝试用 url 格式再请求一次 =====
     if (!imageDataUrl) {
       try {
-        console.log('[省流助手-生图] 尝试用 response_format=url 重新请求...');
         const imageRes2 = await fetch(imageApiUrl, {
           method: 'POST',
           headers: {
@@ -2071,18 +2163,12 @@
             size: CONFIG.imageGenSize || '1024x1024'
           })
         });
-
         if (imageRes2.ok) {
           const imageData2 = await imageRes2.json();
           if (imageData2.data && imageData2.data.length > 0) {
             const imgItem2 = imageData2.data[0];
-            if (imgItem2.url) {
-              imageDataUrl = imgItem2.url;
-              console.log('[省流助手-生图] ✅ 第二次尝试成功获取图片 URL');
-            } else if (imgItem2.b64_json) {
-              imageDataUrl = 'data:image/png;base64,' + imgItem2.b64_json;
-              console.log('[省流助手-生图] ✅ 第二次尝试成功获取 base64 图片');
-            }
+            if (imgItem2.url) imageDataUrl = imgItem2.url;
+            else if (imgItem2.b64_json) imageDataUrl = 'data:image/png;base64,' + imgItem2.b64_json;
           }
         }
       } catch (e) {
@@ -2090,38 +2176,45 @@
       }
     }
 
-    console.log('[省流助手-生图] 最终结果 - 有图片:', !!imageDataUrl, '| 文字长度:', textContent.length);
-
-    return { text: textContent, imageDataUrl: imageDataUrl };
+    if (!imageDataUrl) {
+      throw new Error('生图 API 未返回图片数据');
+    }
+    console.log('[省流助手-生图] ✅ 图片生成成功');
+    return imageDataUrl;
   }
 
-  // 判断当前是否启用生图模式
   function isImageGenEnabled() {
     return CONFIG.enableImageGen === true;
   }
 
-  // 展示生图结果（图片 + 文字）
   function showImageResult(contentDiv, textContent, imageDataUrl, url, videoInfo) {
     rawMarkdownResult = textContent || '（生图模式 - 图片总结）';
     const resultContainer = contentDiv.querySelector('.tabbit-result');
     if (resultContainer) {
       let html = '';
-      if (imageDataUrl) {
-        html += '<div style="text-align:center;margin-bottom:12px;">';
+      if (imageDataUrl && imageDataUrl !== 'ERROR') {
+        html += '<div class="tabbit-img-wrap" style="text-align:center;margin-bottom:12px;">';
         html += '<img src="' + imageDataUrl + '" style="max-width:100%;border-radius:10px;box-shadow:0 4px 16px rgba(0,0,0,0.12);cursor:pointer;" title="点击查看大图" />';
+        html += '</div>';
+      } else if (imageDataUrl === 'ERROR') {
+        html += '<div class="tabbit-img-wrap" style="text-align:center;margin-bottom:12px;padding:14px;background:#fff3f3;border:1px solid #ffcccc;border-radius:10px;color:#c00;font-size:13px;">⚠️ 配图生成失败，仅显示文字总结</div>';
+      } else {
+        html += '<div class="tabbit-img-wrap tabbit-img-loading" style="text-align:center;margin-bottom:12px;padding:30px 14px;background:linear-gradient(135deg,#f0f4ff 0%,#fff5f8 100%);border:1px dashed #c5d3ff;border-radius:10px;">';
+        html += '<div class="tabbit-spinner" style="margin:0 auto 10px;"></div>';
+        html += '<div style="font-size:13px;color:#667eea;font-weight:600;">🖼️ 配图生成中，请稍候...</div>';
+        html += '<div style="font-size:11px;color:#999;margin-top:4px;">文字总结已就绪，可先阅读</div>';
         html += '</div>';
       }
       if (textContent && textContent.trim()) {
-        html += parseMarkdown(textContent);
+        html += '<div class="tabbit-text-wrap">' + parseMarkdown(textContent) + '</div>';
       }
       if (!imageDataUrl && !textContent) {
         html += '<div style="color:#999;text-align:center;padding:20px;">⚠️ 生图模型未返回图片或文字内容</div>';
       }
       resultContainer.innerHTML = html;
 
-      // 点击图片查看大图
       const img = resultContainer.querySelector('img');
-      if (img) {
+      if (img && imageDataUrl && imageDataUrl !== 'ERROR') {
         img.addEventListener('click', function() {
           const overlay = document.createElement('div');
           overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.85);z-index:99999999;display:flex;align-items:center;justify-content:center;cursor:zoom-out;animation:fadeIn 0.2s ease;';
@@ -2138,7 +2231,7 @@
     const actionsDiv = contentDiv.querySelector('.tabbit-result-actions');
     if (actionsDiv) {
       actionsDiv.innerHTML = '';
-      if (imageDataUrl) {
+      if (imageDataUrl && imageDataUrl !== 'ERROR') {
         const saveImgBtn = document.createElement('button');
         saveImgBtn.className = 'tabbit-copy-btn';
         saveImgBtn.textContent = '💾 保存图片';
@@ -2163,6 +2256,12 @@
           setTimeout(function() { copyBtn.textContent = '📋 复制文字'; }, 2000);
         });
         actionsDiv.appendChild(copyBtn);
+
+        const flomoBtn = document.createElement('button');
+        flomoBtn.className = 'tabbit-copy-btn';
+        flomoBtn.textContent = '🌱 flomo';
+        flomoBtn.addEventListener('click', function() { sendToFlomo(textContent, this); });
+        actionsDiv.appendChild(flomoBtn);
       }
       const downloadBtn = document.createElement('button');
       downloadBtn.className = 'tabbit-download-btn';
@@ -2187,13 +2286,58 @@
     }
   }
 
+  function updateImageResult(contentDiv, imageDataUrl, videoInfo) {
+    const resultContainer = contentDiv.querySelector('.tabbit-result');
+    if (!resultContainer) return;
+    const wrap = resultContainer.querySelector('.tabbit-img-wrap');
+    if (!wrap) return;
+
+    if (!imageDataUrl || imageDataUrl === 'ERROR') {
+      wrap.outerHTML = '<div class="tabbit-img-wrap" style="text-align:center;margin-bottom:12px;padding:14px;background:#fff3f3;border:1px solid #ffcccc;border-radius:10px;color:#c00;font-size:13px;">⚠️ 配图生成失败，仅显示文字总结</div>';
+      return;
+    }
+
+    wrap.classList.remove('tabbit-img-loading');
+    wrap.removeAttribute('style');
+    wrap.style.cssText = 'text-align:center;margin-bottom:12px;animation:fadeIn 0.4s ease;';
+    wrap.innerHTML = '<img src="' + imageDataUrl + '" style="max-width:100%;border-radius:10px;box-shadow:0 4px 16px rgba(0,0,0,0.12);cursor:pointer;" title="点击查看大图" />';
+
+    const img = wrap.querySelector('img');
+    if (img) {
+      img.addEventListener('click', function() {
+        const overlay = document.createElement('div');
+        overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.85);z-index:99999999;display:flex;align-items:center;justify-content:center;cursor:zoom-out;animation:fadeIn 0.2s ease;';
+        const bigImg = document.createElement('img');
+        bigImg.src = imageDataUrl;
+        bigImg.style.cssText = 'max-width:95vw;max-height:95vh;border-radius:8px;box-shadow:0 8px 32px rgba(0,0,0,0.3);';
+        overlay.appendChild(bigImg);
+        overlay.addEventListener('click', function() { overlay.remove(); });
+        document.body.appendChild(overlay);
+      });
+    }
+
+    const actionsDiv = contentDiv.querySelector('.tabbit-result-actions');
+    if (actionsDiv && !actionsDiv.querySelector('.tabbit-save-img-btn')) {
+      const saveImgBtn = document.createElement('button');
+      saveImgBtn.className = 'tabbit-copy-btn tabbit-save-img-btn';
+      saveImgBtn.textContent = '💾 保存图片';
+      saveImgBtn.addEventListener('click', function() {
+        const a = document.createElement('a');
+        a.href = imageDataUrl;
+        const safeTitle = sanitizeFilename(videoInfo.title || '视频总结') || '视频总结';
+        a.download = safeTitle + '_总结.png';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+      });
+      actionsDiv.insertBefore(saveImgBtn, actionsDiv.firstChild);
+    }
+  }
+
   // ==================== 自动获取模型列表 ====================
-  // 从 apiUrl 推导出 /v1/models 接口地址
   function deriveModelsUrl(apiUrl) {
     if (!apiUrl) return '';
-    // 常见格式: https://xxxx/v1/chat/completions  -> https://xxxx/v1/models
     let url = apiUrl.trim();
-    // 去掉 trailing slash
     url = url.replace(/\/+$/, '');
     if (/\/chat\/completions$/.test(url)) {
       return url.replace(/\/chat\/completions$/, '/models');
@@ -2201,11 +2345,9 @@
     if (/\/completions$/.test(url)) {
       return url.replace(/\/completions$/, '/models');
     }
-    // 如果用户填的是 base url，例如 https://xxx/v1
     if (/\/v\d+$/.test(url)) {
       return url + '/models';
     }
-    // 兜底：直接拼 /models
     return url + '/models';
   }
 
@@ -2227,7 +2369,6 @@
       throw new Error('HTTP ' + res.status + ': ' + errText.slice(0, 200));
     }
     const data = await res.json();
-    // 兼容 OpenAI 标准格式: { data: [ { id: 'xxx' }, ... ] }
     let models = [];
     if (Array.isArray(data?.data)) {
       models = data.data.map(m => m.id || m.model || m.name).filter(Boolean);
@@ -2243,7 +2384,6 @@
   }
 
   // ==================== 摘要主流程 ====================
-  // 渲染预设切换栏的 HTML
   function renderPresetBarHtml() {
     const presets = CONFIG.promptPresets || [];
     if (presets.length === 0) return '';
@@ -2262,8 +2402,6 @@
     `;
   }
 
-  // 绑定预设切换事件
-  // 🆕 切换预设时：保留之前的对话内容，追加新预设的总结；不修改全局配置
   function bindPresetChips(panel, videoInfo) {
     panel.querySelectorAll('.tabbit-preset-chip').forEach(chip => {
       chip.addEventListener('click', async function() {
@@ -2271,10 +2409,8 @@
         const newId = chip.dataset.presetId;
         const preset = (CONFIG.promptPresets || []).find(p => p.id === newId);
         if (!preset) return;
-        // 只切换 UI 高亮，不修改全局 CONFIG.activePresetId / CONFIG.promptText，不 saveConfig
         panel.querySelectorAll('.tabbit-preset-chip').forEach(c => c.classList.remove('active'));
         chip.classList.add('active');
-        // 用新预设追加总结（保留之前的对话内容）
         if (rawTranscript) {
           await appendPresetSummary(panel, preset, videoInfo || currentVideoInfo);
         }
@@ -2283,15 +2419,13 @@
   }
 
   /**
-   * 🆕 追加预设总结：切换预设时调用，保留现有对话，用新预设的提示词追加一次总结
-   * 不修改 CONFIG.activePresetId / CONFIG.promptText，不调用 saveConfig
+   * 🆕 流式版：追加预设总结
    */
   async function appendPresetSummary(panel, preset, videoInfo) {
     const contentDiv = panel.querySelector('.tabbit-panel-content');
     const input = panel.querySelector('.tabbit-chat-input');
     const sendBtn = panel.querySelector('.tabbit-chat-send');
 
-    // 禁用交互
     panel.querySelectorAll('.tabbit-model-chip').forEach(c => c.classList.add('disabled'));
     panel.querySelectorAll('.tabbit-preset-chip').forEach(c => c.classList.add('disabled'));
     input.disabled = true;
@@ -2300,7 +2434,6 @@
     const pageUrl = window.location.href;
     const fullPrompt = preset.prompt + '\n\n视频URL: ' + pageUrl + '\n视频标题: ' + (videoInfo.title || '') + '\nUP主: ' + (videoInfo.upName || '') + '\n\n字幕内容:\n' + rawTranscript;
 
-    // 确保有对话消息容器
     let messagesContainer = contentDiv.querySelector('.tabbit-chat-messages');
     if (!messagesContainer) {
       messagesContainer = document.createElement('div');
@@ -2308,57 +2441,54 @@
       contentDiv.appendChild(messagesContainer);
     }
 
-    // 显示加载状态
-    const loadingMsg = document.createElement('div');
-    loadingMsg.className = 'tabbit-msg-loading';
-    loadingMsg.innerHTML = '<span></span><span></span><span></span>';
-    messagesContainer.appendChild(loadingMsg);
-    contentDiv.scrollTop = contentDiv.scrollHeight;
-
-    // 添加一个分隔标识
+    // 分隔标识
     const dividerMsg = document.createElement('div');
     dividerMsg.style.cssText = 'text-align:center;font-size:11px;color:#999;margin:8px 0;padding:4px 0;border-top:1px dashed #e0e0e0;';
     dividerMsg.textContent = '🎨 切换风格：' + (preset.icon || '') + ' ' + preset.name;
-    messagesContainer.insertBefore(dividerMsg, loadingMsg);
+    messagesContainer.appendChild(dividerMsg);
+
+    // 🆕 流式 AI 气泡（直接创建，不用 loading 三点）
+    const aiWrap = document.createElement('div');
+    aiWrap.style.cssText = 'display:flex;flex-direction:column;align-items:flex-start;';
+    const aiMsg = document.createElement('div');
+    aiMsg.className = 'tabbit-msg tabbit-msg-ai';
+    aiMsg.innerHTML = '<span class="tabbit-typing-cursor"></span>';
+    const modelTag = document.createElement('div');
+    modelTag.className = 'tabbit-msg-model';
+    modelTag.textContent = '🤖 ' + currentModel + ' · ' + preset.name;
+    aiWrap.appendChild(aiMsg);
+    aiWrap.appendChild(modelTag);
+    messagesContainer.appendChild(aiWrap);
+    contentDiv.scrollTop = contentDiv.scrollHeight;
 
     try {
-      // 用新预设的提示词发起请求（不清空 conversationHistory，但这次请求独立使用新 prompt）
       const messages = [{ role: 'user', content: fullPrompt }];
-      const reply = await callAI(messages);
 
-      // 将新的对话追加到 conversationHistory（这样后续追问可以基于最新的总结）
+      // 流式渲染：纯文本 + 光标，结束后切 markdown
+      const onDelta = createThrottledDelta(function(fullText) {
+        aiMsg.textContent = fullText;
+        aiMsg.appendChild(document.createElement('span')); // 占位
+        const cursor = document.createElement('span');
+        cursor.className = 'tabbit-typing-cursor';
+        aiMsg.appendChild(cursor);
+        contentDiv.scrollTop = contentDiv.scrollHeight;
+      });
+
+      const reply = await callAIStream(messages, onDelta);
+
+      // 结束后切换到 markdown 渲染
+      aiMsg.innerHTML = parseMarkdown(reply);
+
       conversationHistory.push({ role: 'user', content: fullPrompt });
       conversationHistory.push({ role: 'assistant', content: reply });
-
-      // 移除加载动画
-      loadingMsg.remove();
-
-      // 追加 AI 回复到对话区域
-      const aiWrap = document.createElement('div');
-      aiWrap.style.cssText = 'display:flex;flex-direction:column;align-items:flex-start;';
-      const aiMsg = document.createElement('div');
-      aiMsg.className = 'tabbit-msg tabbit-msg-ai';
-      aiMsg.innerHTML = parseMarkdown(reply);
-      const modelTag = document.createElement('div');
-      modelTag.className = 'tabbit-msg-model';
-      modelTag.textContent = '🤖 ' + currentModel + ' · ' + preset.name;
-      aiWrap.appendChild(aiMsg);
-      aiWrap.appendChild(modelTag);
-      messagesContainer.appendChild(aiWrap);
-
-      // 更新 rawMarkdownResult 为最新的总结
       rawMarkdownResult = reply;
 
       contentDiv.scrollTop = contentDiv.scrollHeight;
     } catch (err) {
       console.error('[省流助手-预设切换]', err);
-      loadingMsg.remove();
-      const errMsg = document.createElement('div');
-      errMsg.className = 'tabbit-msg tabbit-msg-ai';
-      errMsg.style.background = '#fff3f3';
-      errMsg.style.color = '#c00';
-      errMsg.textContent = '⚠️ ' + err.message;
-      messagesContainer.appendChild(errMsg);
+      aiMsg.style.background = '#fff3f3';
+      aiMsg.style.color = '#c00';
+      aiMsg.textContent = '⚠️ ' + err.message;
       contentDiv.scrollTop = contentDiv.scrollHeight;
     } finally {
       panel.querySelectorAll('.tabbit-model-chip').forEach(c => c.classList.remove('disabled'));
@@ -2368,6 +2498,9 @@
     }
   }
 
+  /**
+   * 🆕 流式版：初始总结
+   */
   async function runSummary(panel, transcript, videoInfo) {
     const contentDiv = panel.querySelector('.tabbit-panel-content');
     const input = panel.querySelector('.tabbit-chat-input');
@@ -2379,42 +2512,63 @@
     sendBtn.disabled = true;
 
     const pageUrl = window.location.href;
-    // 优先用当前激活的预设；fallback 到 promptText
     const activePreset = (CONFIG.promptPresets || []).find(p => p.id === CONFIG.activePresetId);
     const activePrompt = (activePreset && activePreset.prompt) || CONFIG.promptText || PROMPT_TEXT;
     const activePresetName = activePreset ? activePreset.name : '默认';
     const fullPrompt = activePrompt + '\n\n视频URL: ' + pageUrl + '\n视频标题: ' + (videoInfo.title || '') + '\nUP主: ' + (videoInfo.upName || '') + '\n\n字幕内容:\n' + transcript;
 
     const presetBarHtml = renderPresetBarHtml();
-
     const useImageGen = isImageGenEnabled();
-    const loadingHint = useImageGen
-      ? '🖼️ ' + (CONFIG.imageGenModel || 'gemini-2.0-flash-preview-image-generation') + ' 正在用「' + escapeHtml(activePresetName) + '」生成图文总结...'
-      : '🤖 ' + currentModel + ' 正在用「' + escapeHtml(activePresetName) + '」分析字幕...';
 
+    // 直接渲染最终骨架，把"AI 思考"展示在 .tabbit-result 里（带光标）
     contentDiv.innerHTML = `
       <div class="tabbit-video-info">
         <div class="tabbit-video-title">${escapeHtml(videoInfo.title || '未知标题')}</div>
         <div>UP主: ${escapeHtml(videoInfo.upName || '未知')}</div>
       </div>
       ${presetBarHtml}
-      <div class="tabbit-loading">
-        <div class="tabbit-spinner"></div>
-        <span>${loadingHint}</span>
-      </div>
+      ${useImageGen ? `
+        <div class="tabbit-result"></div>
+      ` : `
+        <div class="tabbit-result"><span class="tabbit-typing-cursor"></span></div>
+        <div class="tabbit-result-actions"></div>
+        <div class="tabbit-url">🔗 <a href="" target="_blank"></a></div>
+      `}
     `;
     bindPresetChips(panel, videoInfo);
 
     try {
       if (useImageGen) {
-        // ===== 生图模式：先总结文字，再自动生成配图 =====
-        const result = await callImageGenAI(fullPrompt);
+        // ===== 生图模式：流式文字 + 异步图片 =====
+        const resultContainer = contentDiv.querySelector('.tabbit-result');
+        // 先显示文字流式 + 图片占位
+        resultContainer.innerHTML =
+          '<div class="tabbit-img-wrap tabbit-img-loading" style="text-align:center;margin-bottom:12px;padding:30px 14px;background:linear-gradient(135deg,#f0f4ff 0%,#fff5f8 100%);border:1px dashed #c5d3ff;border-radius:10px;">' +
+            '<div class="tabbit-spinner" style="margin:0 auto 10px;"></div>' +
+            '<div style="font-size:13px;color:#667eea;font-weight:600;">🖼️ 配图生成中，请稍候...</div>' +
+            '<div style="font-size:11px;color:#999;margin-top:4px;">文字总结正在流式输出</div>' +
+          '</div>' +
+          '<div class="tabbit-text-wrap"><span class="tabbit-typing-cursor"></span></div>';
+
+        const textWrap = resultContainer.querySelector('.tabbit-text-wrap');
+
+        // 流式回调：用 textContent 渲染（流式期间）
+        const onDelta = createThrottledDelta(function(fullText) {
+          textWrap.textContent = fullText;
+          const cursor = document.createElement('span');
+          cursor.className = 'tabbit-typing-cursor';
+          textWrap.appendChild(cursor);
+          contentDiv.scrollTop = contentDiv.scrollHeight;
+        });
+
+        const textContent = await generateSummaryText(fullPrompt, onDelta);
 
         conversationHistory = [
           { role: 'user', content: fullPrompt },
-          { role: 'assistant', content: result.text || '（图片总结）' }
+          { role: 'assistant', content: textContent }
         ];
 
+        // 流式结束：把骨架完整化（actions + url + 评论按钮）
         contentDiv.innerHTML = `
           <div class="tabbit-video-info">
             <div class="tabbit-video-title">${escapeHtml(videoInfo.title || '未知标题')}</div>
@@ -2431,17 +2585,51 @@
           <div class="tabbit-chat-messages"></div>
         `;
         bindPresetChips(panel, videoInfo);
-        showImageResult(contentDiv, result.text, result.imageDataUrl, pageUrl, videoInfo);
+        showImageResult(contentDiv, textContent, '', pageUrl, videoInfo);
+
+        const commentBtn = contentDiv.querySelector('#tabbit-comment-btn');
+        if (commentBtn) {
+          commentBtn.addEventListener('click', () => runCommentSummary(panel, videoInfo));
+        }
+        input.disabled = false;
+        sendBtn.disabled = false;
+        input.placeholder = '基于视频内容继续提问...';
+        panel.querySelectorAll('.tabbit-model-chip').forEach(c => c.classList.remove('disabled'));
+        panel.querySelectorAll('.tabbit-preset-chip').forEach(c => c.classList.remove('disabled'));
+
+        // 第2阶段：异步生图
+        generateImageFromSummary(textContent)
+          .then(function(imageDataUrl) {
+            updateImageResult(contentDiv, imageDataUrl, videoInfo);
+          })
+          .catch(function(imgErr) {
+            console.warn('[省流助手-生图] 图片生成失败:', imgErr.message);
+            updateImageResult(contentDiv, 'ERROR', videoInfo);
+          });
+
+        return;
       } else {
-        // ===== 普通文字总结模式 =====
+        // ===== 普通文字总结模式（流式） =====
+        const resultContainer = contentDiv.querySelector('.tabbit-result');
         const messages = [{ role: 'user', content: fullPrompt }];
-        const reply = await callAI(messages);
+
+        // 流式期间：纯文本 + 光标
+        const onDelta = createThrottledDelta(function(fullText) {
+          resultContainer.textContent = fullText;
+          const cursor = document.createElement('span');
+          cursor.className = 'tabbit-typing-cursor';
+          resultContainer.appendChild(cursor);
+          contentDiv.scrollTop = contentDiv.scrollHeight;
+        });
+
+        const reply = await callAIStream(messages, onDelta);
 
         conversationHistory = [
           { role: 'user', content: fullPrompt },
           { role: 'assistant', content: reply }
         ];
 
+        // 流式结束：补齐完整骨架（评论按钮 + 对话区 + actions）
         contentDiv.innerHTML = `
           <div class="tabbit-video-info">
             <div class="tabbit-video-title">${escapeHtml(videoInfo.title || '未知标题')}</div>
@@ -2458,7 +2646,7 @@
           <div class="tabbit-chat-messages"></div>
         `;
         bindPresetChips(panel, videoInfo);
-        showResult(contentDiv, reply, pageUrl, videoInfo);
+        finalizeSummaryUI(contentDiv, reply, pageUrl, videoInfo);
       }
 
       const commentBtn = contentDiv.querySelector('#tabbit-comment-btn');
@@ -2496,7 +2684,7 @@
     }
   }
 
-  // ==================== 评论区总结主流程 ====================
+  // ==================== 评论区总结主流程（流式） ====================
   async function runCommentSummary(panel, videoInfo) {
     if (isCommentSummarizing) return;
     isCommentSummarizing = true;
@@ -2536,30 +2724,47 @@
       });
       if (comments.length === 0) throw new Error('该视频没有评论');
 
-      if (statusEl) statusEl.textContent = '已获取 ' + comments.length + ' 条评论，正在AI总结...';
+      if (statusEl) statusEl.textContent = '已获取 ' + comments.length + ' 条评论，AI 正在流式总结...';
 
       const commentsText = formatCommentsText(comments);
       const activeCommentPrompt = CONFIG.commentPromptText || COMMENT_PROMPT_TEXT;
       const fullPrompt = activeCommentPrompt + '\n\n评论内容如下：\n' + commentsText;
 
+      // 准备流式渲染容器（替换掉 loading）
+      commentSection.innerHTML = `
+        <div class="tabbit-comment-section-title">💬 评论区总结 <span style="font-size:11px;color:#999;font-weight:400;">（${comments.length}条评论）</span></div>
+        <div class="tabbit-comment-result"><span class="tabbit-typing-cursor"></span></div>
+      `;
+      const resultEl = commentSection.querySelector('.tabbit-comment-result');
+
       const messages = [{ role: 'user', content: fullPrompt }];
-      const reply = await callAI(messages);
+
+      const onDelta = createThrottledDelta(function(fullText) {
+        resultEl.textContent = fullText;
+        const cursor = document.createElement('span');
+        cursor.className = 'tabbit-typing-cursor';
+        resultEl.appendChild(cursor);
+        contentDiv.scrollTop = contentDiv.scrollHeight;
+      });
+
+      const reply = await callAIStream(messages, onDelta);
 
       commentConversationHistory = [
         { role: 'user', content: fullPrompt },
         { role: 'assistant', content: reply }
       ];
 
-      const parsedHtml = parseMarkdown(reply);
-      commentSection.innerHTML = `
-        <div class="tabbit-comment-section-title">💬 评论区总结 <span style="font-size:11px;color:#999;font-weight:400;">（${comments.length}条评论）</span></div>
-        <div class="tabbit-comment-result">${parsedHtml}</div>
-        <div class="tabbit-comment-actions">
-          <button class="tabbit-copy-btn" id="tabbit-copy-comment">📋 复制评论总结</button>
-          <button class="tabbit-copy-btn" id="tabbit-flomo-comment">🌱 flomo</button>
-          <span style="font-size:11px;color:#999;margin-left:auto;">🤖 ${currentModel}</span>
-        </div>
+      // 流式结束：切换到 markdown + 加按钮
+      resultEl.innerHTML = parseMarkdown(reply);
+
+      const actionsDiv = document.createElement('div');
+      actionsDiv.className = 'tabbit-comment-actions';
+      actionsDiv.innerHTML = `
+        <button class="tabbit-copy-btn" id="tabbit-copy-comment">📋 复制评论总结</button>
+        <button class="tabbit-copy-btn" id="tabbit-flomo-comment">🌱 flomo</button>
+        <span style="font-size:11px;color:#999;margin-left:auto;">🤖 ${currentModel}</span>
       `;
+      commentSection.appendChild(actionsDiv);
 
       const copyCommentBtn = commentSection.querySelector('#tabbit-copy-comment');
       if (copyCommentBtn) {
@@ -2587,7 +2792,7 @@
     }
   }
 
-  // ==================== 对话功能 ====================
+  // ==================== 对话功能（流式） ====================
   async function handleSend(panel) {
     const input = panel.querySelector('.tabbit-chat-input');
     const sendBtn = panel.querySelector('.tabbit-chat-send');
@@ -2616,10 +2821,18 @@
     input.disabled = true;
     sendBtn.disabled = true;
 
-    const loadingMsg = document.createElement('div');
-    loadingMsg.className = 'tabbit-msg-loading';
-    loadingMsg.innerHTML = '<span></span><span></span><span></span>';
-    messagesContainer.appendChild(loadingMsg);
+    // 🆕 直接创建流式 AI 气泡（带光标）
+    const aiWrap = document.createElement('div');
+    aiWrap.style.cssText = 'display:flex;flex-direction:column;align-items:flex-start;';
+    const aiMsg = document.createElement('div');
+    aiMsg.className = 'tabbit-msg tabbit-msg-ai';
+    aiMsg.innerHTML = '<span class="tabbit-typing-cursor"></span>';
+    const modelTag = document.createElement('div');
+    modelTag.className = 'tabbit-msg-model';
+    modelTag.textContent = '🤖 ' + currentModel;
+    aiWrap.appendChild(aiMsg);
+    aiWrap.appendChild(modelTag);
+    messagesContainer.appendChild(aiWrap);
 
     const contentDiv = panel.querySelector('.tabbit-panel-content');
     contentDiv.scrollTop = contentDiv.scrollHeight;
@@ -2632,34 +2845,27 @@
         sentMessages = [conversationHistory[0], ...conversationHistory.slice(-(MAX_CONVERSATION_HISTORY - 1))];
       }
 
-      const reply = await callAI(sentMessages);
+      const onDelta = createThrottledDelta(function(fullText) {
+        aiMsg.textContent = fullText;
+        const cursor = document.createElement('span');
+        cursor.className = 'tabbit-typing-cursor';
+        aiMsg.appendChild(cursor);
+        contentDiv.scrollTop = contentDiv.scrollHeight;
+      });
+
+      const reply = await callAIStream(sentMessages, onDelta);
       conversationHistory.push({ role: 'assistant', content: reply });
 
-      loadingMsg.remove();
-      const aiWrap = document.createElement('div');
-      aiWrap.style.cssText = 'display:flex;flex-direction:column;align-items:flex-start;';
-      const aiMsg = document.createElement('div');
-      aiMsg.className = 'tabbit-msg tabbit-msg-ai';
+      // 结束后切换到 markdown 渲染
       aiMsg.innerHTML = parseMarkdown(reply);
-      const modelTag = document.createElement('div');
-      modelTag.className = 'tabbit-msg-model';
-      modelTag.textContent = '🤖 ' + currentModel;
-      aiWrap.appendChild(aiMsg);
-      aiWrap.appendChild(modelTag);
-      messagesContainer.appendChild(aiWrap);
-
       contentDiv.scrollTop = contentDiv.scrollHeight;
     } catch (err) {
       console.error('[省流助手-对话]', err);
-      loadingMsg.remove();
       conversationHistory.pop();
 
-      const errMsg = document.createElement('div');
-      errMsg.className = 'tabbit-msg tabbit-msg-ai';
-      errMsg.style.background = '#fff3f3';
-      errMsg.style.color = '#c00';
-      errMsg.textContent = '⚠️ ' + err.message;
-      messagesContainer.appendChild(errMsg);
+      aiMsg.style.background = '#fff3f3';
+      aiMsg.style.color = '#c00';
+      aiMsg.textContent = '⚠️ ' + err.message;
       contentDiv.scrollTop = contentDiv.scrollHeight;
     } finally {
       input.disabled = false;
@@ -2815,7 +3021,6 @@
     `;
     document.body.appendChild(overlay);
 
-    // ===== 预设编辑区 =====
     let editingPresets = JSON.parse(JSON.stringify(CONFIG.promptPresets || DEFAULT_PRESETS));
     let editingActiveId = CONFIG.activePresetId || (editingPresets[0] && editingPresets[0].id);
 
@@ -2889,7 +3094,6 @@
       renderPresetEditList();
     });
 
-    // ===== 生图开关交互：切换显示/隐藏详细配置 =====
     const imageGenToggle = overlay.querySelector('#ts-enableImageGen');
     const imageGenFields = overlay.querySelector('#ts-imageGen-fields');
     if (imageGenToggle && imageGenFields) {
@@ -2904,7 +3108,6 @@
       if (e.target === overlay) closeSettings();
     });
 
-    // ===== 自动获取模型 =====
     async function doFetchModels(append) {
       const apiUrl = overlay.querySelector('#ts-apiUrl').value.trim();
       const apiKey = overlay.querySelector('#ts-apiKey').value.trim();
@@ -2937,7 +3140,6 @@
     overlay.querySelector('#ts-fetch-models').addEventListener('click', function() { doFetchModels(false); });
     overlay.querySelector('#ts-append-models').addEventListener('click', function() { doFetchModels(true); });
 
-    // ===== 重置位置 =====
     overlay.querySelector('#ts-reset-pos').addEventListener('click', function() {
       POSITIONS = {};
       savePositions(POSITIONS);
@@ -2958,7 +3160,6 @@
       alert('位置已重置');
     });
 
-    // ===== 保存 =====
     overlay.querySelector('#ts-save').addEventListener('click', function() {
       const newApiUrl = overlay.querySelector('#ts-apiUrl').value.trim();
       const newApiKey = overlay.querySelector('#ts-apiKey').value.trim();
@@ -3006,13 +3207,11 @@
       const newSkipDuration = parseInt(overlay.querySelector('#ts-skipDuration').value, 10);
       CONFIG.skipDuration = isNaN(newSkipDuration) ? 60 : newSkipDuration;
       CONFIG.autoParse = newAutoParse;
-      // 生图配置
       CONFIG.enableImageGen = overlay.querySelector('#ts-enableImageGen').checked;
       CONFIG.imageGenApiUrl = (overlay.querySelector('#ts-imageGenApiUrl').value || '').trim();
       CONFIG.imageGenApiKey = (overlay.querySelector('#ts-imageGenApiKey').value || '').trim();
       CONFIG.imageGenModel = (overlay.querySelector('#ts-imageGenModel').value || '').trim() || DEFAULT_CONFIG.imageGenModel;
       CONFIG.imageGenSize = overlay.querySelector('#ts-imageGenSize') ? overlay.querySelector('#ts-imageGenSize').value : '1024x1024';
-      // 🆕 保存生图提示词（统一供自动生图和手动生图使用）
       const newImageGenPromptText = (overlay.querySelector('#ts-imageGenPromptText').value || '').trim();
       CONFIG.imageGenPromptText = newImageGenPromptText || IMAGE_GEN_PROMPT_TEXT;
       currentModel = CONFIG.model;
@@ -3043,12 +3242,10 @@
       setTimeout(function() { savedEl.style.display = 'none'; }, 2000);
     });
 
-    // ===== 导出 =====
     overlay.querySelector('#ts-export').addEventListener('click', function() {
       triggerDownload(JSON.stringify(CONFIG, null, 2), 'bili-summary-config.json', 'application/json');
     });
 
-    // ===== 导入 =====
     overlay.querySelector('#ts-import').addEventListener('click', function() {
       const fileInput = document.createElement('input');
       fileInput.type = 'file';
@@ -3073,13 +3270,11 @@
             if (imported.commentPromptText) overlay.querySelector('#ts-commentPromptText').value = imported.commentPromptText;
             if (imported.skipDuration !== undefined) overlay.querySelector('#ts-skipDuration').value = imported.skipDuration;
             if (imported.autoParse !== undefined) overlay.querySelector('#ts-autoParse').checked = !!imported.autoParse;
-            // 导入生图配置
             if (imported.enableImageGen !== undefined) overlay.querySelector('#ts-enableImageGen').checked = !!imported.enableImageGen;
             if (imported.imageGenApiUrl !== undefined) overlay.querySelector('#ts-imageGenApiUrl').value = imported.imageGenApiUrl;
             if (imported.imageGenApiKey !== undefined) overlay.querySelector('#ts-imageGenApiKey').value = imported.imageGenApiKey;
             if (imported.imageGenModel) overlay.querySelector('#ts-imageGenModel').value = imported.imageGenModel;
             if (imported.imageGenSize) { var igSizeEl = overlay.querySelector('#ts-imageGenSize'); if (igSizeEl) igSizeEl.value = imported.imageGenSize; }
-            // 🆕 导入生图提示词
             if (imported.imageGenPromptText !== undefined) overlay.querySelector('#ts-imageGenPromptText').value = imported.imageGenPromptText;
             var igFields = overlay.querySelector('#ts-imageGen-fields');
             if (igFields) igFields.style.display = overlay.querySelector('#ts-enableImageGen').checked ? '' : 'none';
@@ -3109,7 +3304,6 @@
       fileInput.click();
     });
 
-    // ===== 重置默认 =====
     overlay.querySelector('#ts-reset').addEventListener('click', function() {
       if (!confirm('确定要重置所有配置为默认值吗？')) return;
       overlay.querySelector('#ts-apiUrl').value = DEFAULT_CONFIG.apiUrl;
@@ -3121,13 +3315,11 @@
       overlay.querySelector('#ts-commentPromptText').value = COMMENT_PROMPT_TEXT;
       overlay.querySelector('#ts-skipDuration').value = DEFAULT_CONFIG.skipDuration;
       overlay.querySelector('#ts-autoParse').checked = DEFAULT_CONFIG.autoParse;
-      // 重置生图配置
       overlay.querySelector('#ts-enableImageGen').checked = false;
       overlay.querySelector('#ts-imageGenApiUrl').value = '';
       overlay.querySelector('#ts-imageGenApiKey').value = '';
       overlay.querySelector('#ts-imageGenModel').value = DEFAULT_CONFIG.imageGenModel;
       var igSizeReset = overlay.querySelector('#ts-imageGenSize'); if (igSizeReset) igSizeReset.value = '1024x1024';
-      // 🆕 重置生图提示词
       overlay.querySelector('#ts-imageGenPromptText').value = IMAGE_GEN_PROMPT_TEXT;
       var igFieldsReset = overlay.querySelector('#ts-imageGen-fields');
       if (igFieldsReset) igFieldsReset.style.display = 'none';
@@ -3167,7 +3359,6 @@
   }
 
   // ==================== 自动启动主流程 ====================
-  // 真正执行解析的函数（开启面板 + 开始解析）
   async function startParsing() {
     if (hasParsed) return;
     hasParsed = true;
@@ -3228,11 +3419,10 @@
     await runSummary(panel, transcript, videoInfo);
   }
 
-  // 仅显示悬浮窗，不解析（autoParse=false 时使用）
   function showFloatOnlyMode() {
     console.log('[省流助手] 自动解析已关闭，仅显示悬浮唤出按钮');
     createStyles();
-    showFloatBtn(null); // 传 null 表示点击会触发解析
+    showFloatBtn(null);
   }
 
   function init() {
