@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         B站省流助手 - 字幕AI摘要 Pro
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      3.7.0
-// @description  自动提取B站视频字幕，通过自定义AI API生成极简摘要，支持模型切换、持续对话和评论区总结；支持自动解析开关、悬浮窗/面板可拖动、自动获取模型列表、flomo自动加标签，新增总结生图功能；v3.7.0 全面流式输出
+// @version      3.7.1
+// @description  自动提取B站视频字幕，通过自定义AI API生成极简摘要，支持模型切换、持续对话和评论区总结；支持自动解析开关、自动获取模型列表、flomo自动加标签，新增总结生图功能；v3.7.1 增加打断总结功能，在"无字幕"状态下，新增"手动上传字幕"按钮
 // @author       次元饺子
 // @match        https://www.bilibili.com/video/*
 // @match        https://www.bilibili.com/list/*
@@ -155,6 +155,8 @@
   let commentConversationHistory = [];
   let isCommentSummarizing = false;
   let hasParsed = false;
+  // 🆕 当前正在进行的 AI 任务的 AbortController（用于打断流式输出）
+  let currentAbortController = null;
 
   // ==================== 视频信息获取 ====================
   function getVideoInfo() {
@@ -737,6 +739,14 @@
         transform: none;
         box-shadow: none;
       }
+            /* 🆕 手动上传字幕按钮（绿色调，区分手动获取） */
+      .tabbit-manual-upload-btn {
+        background: linear-gradient(135deg, #43a047 0%, #2e7d32 100%);
+      }
+      .tabbit-manual-upload-btn:hover {
+        background: linear-gradient(135deg, #388e3c 0%, #1b5e20 100%);
+        box-shadow: 0 4px 20px rgba(67,160,71,0.45);
+      }
       .tabbit-manual-fetch-btn .tabbit-btn-icon { font-size: 18px; }
 
       .tabbit-comment-summary-btn:disabled {
@@ -879,6 +889,46 @@
       .tabbit-chat-send:disabled {
         opacity: 0.5;
         cursor: not-allowed;
+      }
+      .tabbit-chat-send:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
+      /* 🆕 打断按钮样式（替代发送按钮） */
+      .tabbit-chat-send.tabbit-abort-mode {
+        background: linear-gradient(135deg, #ff6b6b 0%, #ee5253 100%);
+        opacity: 1 !important;
+        cursor: pointer !important;
+        animation: pulseGlow 1.5s ease-in-out infinite;
+      }
+      .tabbit-chat-send.tabbit-abort-mode:hover {
+        transform: scale(1.1);
+      }
+      /* 🆕 内联打断按钮（用于初始总结/评论总结/预设切换的流式过程中） */
+      .tabbit-inline-abort-btn {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 6px 14px;
+        margin-top: 10px;
+        background: linear-gradient(135deg, #ff6b6b 0%, #ee5253 100%);
+        color: white;
+        border: none;
+        border-radius: 16px;
+        font-size: 12px;
+        font-weight: 600;
+        cursor: pointer;
+        transition: transform 0.15s;
+        box-shadow: 0 2px 8px rgba(238,82,83,0.35);
+      }
+      .tabbit-inline-abort-btn:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 4px 12px rgba(238,82,83,0.5);
+      }
+      .tabbit-inline-abort-btn:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+        transform: none;
       }
 
       .md-h1 { font-size: 18px; font-weight: 700; color: #1a1a2e; margin: 12px 0 10px; padding-bottom: 6px; border-bottom: 2px solid #667eea; }
@@ -1467,6 +1517,65 @@
     return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   }
 
+  // 🆕 ==================== 中断控制 ====================
+  function abortCurrentTask() {
+    if (currentAbortController) {
+      try {
+        currentAbortController.abort();
+        console.log('[省流助手] 用户主动打断当前任务');
+      } catch(e) {
+        console.warn('[省流助手] 打断异常:', e.message);
+      }
+      currentAbortController = null;
+    }
+  }
+
+  // 🆕 判断错误是否为用户主动打断
+  function isAbortError(err) {
+    return err && (err.name === 'AbortError' || /aborted|abort/i.test(err.message || ''));
+  }
+
+  // 🆕 在指定容器内插入"打断"按钮，返回按钮元素
+  function insertInlineAbortBtn(container, onAbort) {
+    const btn = document.createElement('button');
+    btn.className = 'tabbit-inline-abort-btn';
+    btn.innerHTML = '⏹ 打断生成';
+    btn.addEventListener('click', function() {
+      btn.disabled = true;
+      btn.innerHTML = '⏳ 打断中...';
+      if (typeof onAbort === 'function') onAbort();
+    });
+    container.appendChild(btn);
+    return btn;
+  }
+
+  // 🆕 把发送按钮切换为"打断"模式
+  function setSendBtnAsAbort(sendBtn, onAbort) {
+    if (!sendBtn) return;
+    sendBtn.classList.add('tabbit-abort-mode');
+    sendBtn.disabled = false;
+    sendBtn.innerHTML = '⏹';
+    sendBtn.title = '打断生成';
+    sendBtn._abortHandler = function(e) {
+      e.preventDefault();
+      e.stopPropagation();
+      if (typeof onAbort === 'function') onAbort();
+    };
+    sendBtn.addEventListener('click', sendBtn._abortHandler, true);
+  }
+
+  // 🆕 还原发送按钮
+  function restoreSendBtn(sendBtn) {
+    if (!sendBtn) return;
+    sendBtn.classList.remove('tabbit-abort-mode');
+    sendBtn.innerHTML = '➤';
+    sendBtn.title = '发送 (Enter)';
+    if (sendBtn._abortHandler) {
+      sendBtn.removeEventListener('click', sendBtn._abortHandler, true);
+      sendBtn._abortHandler = null;
+    }
+  }
+
   // ==================== 悬浮按钮 ====================
   function applyFloatBtnPosition(btn) {
     if (POSITIONS.floatBtn) {
@@ -1789,6 +1898,10 @@
         <span class="tabbit-btn-icon">🔄</span>
         <span>手动获取字幕总结</span>
       </button>
+      <button class="tabbit-manual-fetch-btn tabbit-manual-upload-btn" id="tabbit-manual-upload-btn">
+        <span class="tabbit-btn-icon">📤</span>
+        <span>手动上传字幕（srt/txt/粘贴）</span>
+      </button>
       <button class="tabbit-comment-summary-btn" id="tabbit-comment-btn">
         <span class="tabbit-btn-icon">💬</span>
         <span>总结评论区</span>
@@ -1798,6 +1911,12 @@
     const manualFetchBtn = contentDiv.querySelector('#tabbit-manual-fetch-btn');
     if (manualFetchBtn) {
       manualFetchBtn.addEventListener('click', () => manualFetchSubtitle(panel, videoInfo));
+    }
+
+    // 🆕 手动上传字幕按钮
+    const manualUploadBtn = contentDiv.querySelector('#tabbit-manual-upload-btn');
+    if (manualUploadBtn) {
+      manualUploadBtn.addEventListener('click', () => openManualUploadDialog(panel, videoInfo));
     }
 
     const commentBtn = contentDiv.querySelector('#tabbit-comment-btn');
@@ -1825,7 +1944,140 @@
       }, resetAfterMs);
     }
   }
+  // ==================== 手动上传字幕 ====================
+  // 解析 SRT 字幕文件，提取纯文本
+  function parseSrtContent(srtText) {
+    if (!srtText) return '';
+    const lines = srtText.split(/\r?\n/);
+    const textLines = [];
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i].trim();
+      if (!line) continue;
+      // 跳过纯数字行（序号）
+      if (/^\d+$/.test(line)) continue;
+      // 跳过时间轴行 00:00:00,000 --> 00:00:00,000
+      if (/^\d{1,2}:\d{2}:\d{2}[,.]\d{1,3}\s*-->\s*\d{1,2}:\d{2}:\d{2}[,.]\d{1,3}/.test(line)) continue;
+      // 移除 HTML 标签（如 <i>、<b>、<font>）
+      const cleaned = line.replace(/<[^>]+>/g, '').trim();
+      if (cleaned) textLines.push(cleaned);
+    }
+    return textLines.join('\n');
+  }
 
+  // 智能解析上传的内容：自动判断是 SRT 还是普通文本
+  function parseUploadedContent(rawText, filename) {
+    if (!rawText) return '';
+    const isSrt = (filename && /\.srt$/i.test(filename)) ||
+                  /\d{1,2}:\d{2}:\d{2}[,.]\d{1,3}\s*-->\s*\d{1,2}:\d{2}:\d{2}[,.]\d{1,3}/.test(rawText);
+    if (isSrt) {
+      console.log('[省流助手-手动上传] 识别为 SRT 格式，开始解析');
+      return parseSrtContent(rawText);
+    }
+    console.log('[省流助手-手动上传] 识别为纯文本格式');
+    return rawText.trim();
+  }
+
+  // 打开手动上传字幕对话框
+  function openManualUploadDialog(panel, videoInfo) {
+    const oldOverlay = document.querySelector('#tabbit-upload-overlay');
+    if (oldOverlay) oldOverlay.remove();
+
+    const overlay = document.createElement('div');
+    overlay.id = 'tabbit-upload-overlay';
+    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.45);z-index:10000000;display:flex;align-items:center;justify-content:center;animation:fadeIn 0.2s ease;';
+
+    overlay.innerHTML = `
+      <div style="background:white;border-radius:16px;box-shadow:0 12px 40px rgba(0,0,0,0.2);width:520px;max-width:95vw;max-height:88vh;display:flex;flex-direction:column;overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+        <div style="display:flex;justify-content:space-between;align-items:center;padding:16px 20px;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:white;font-weight:600;font-size:16px;">
+          <span>📤 手动上传字幕</span>
+          <button id="tabbit-upload-close" style="background:none;border:none;color:white;font-size:24px;cursor:pointer;opacity:0.85;line-height:1;padding:0 4px;">&times;</button>
+        </div>
+        <div style="padding:20px;overflow-y:auto;flex:1;">
+          <div style="background:#e8f4f8;border-radius:8px;padding:10px 14px;margin-bottom:14px;font-size:12.5px;color:#555;line-height:1.6;">
+            💡 支持 <strong>.srt</strong> / <strong>.txt</strong> 文件上传，或直接在下方文本框粘贴字幕内容。<br>
+            推荐👉【<a href="https://meetings.feishu.cn/minutes/recommend-invite?vcInviteCode=ABDEUNHHT" style="color:#ff4444; font-weight:bold; text-decoration:none;">🔗飞书妙记</a>】视频转文字，每月300分钟免费转写时长。
+          </div>
+
+          <div style="margin-bottom:14px;">
+            <div style="font-size:12px;font-weight:600;color:#666;margin-bottom:6px;letter-spacing:0.4px;text-transform:uppercase;">📁 上传文件</div>
+            <input type="file" id="tabbit-upload-file" accept=".srt,.txt,text/plain" style="width:100%;padding:8px;border:1px dashed #aaa;border-radius:8px;font-size:13px;cursor:pointer;background:#fafbfc;" />
+          </div>
+
+          <div style="text-align:center;margin:10px 0;color:#999;font-size:12px;">— 或 —</div>
+
+          <div>
+            <div style="font-size:12px;font-weight:600;color:#666;margin-bottom:6px;letter-spacing:0.4px;text-transform:uppercase;">📝 直接粘贴文本</div>
+            <textarea id="tabbit-upload-text" placeholder="在此粘贴字幕文本（SRT 格式或纯文本均可）..." style="width:100%;padding:10px 12px;border:1px solid #d8d8e0;border-radius:8px;font-size:12.5px;font-family:Consolas,Monaco,monospace;outline:none;box-sizing:border-box;resize:vertical;min-height:180px;line-height:1.6;color:#333;"></textarea>
+            <div style="font-size:11px;color:#aaa;margin-top:4px;" id="tabbit-upload-hint">字符数：0</div>
+          </div>
+        </div>
+        <div style="padding:14px 20px;background:#f8f9fa;border-top:1px solid #e8e8ef;display:flex;gap:8px;align-items:center;">
+          <span style="flex:1;font-size:11px;color:#999;">📌 文件上传后会自动填充到文本框</span>
+          <button id="tabbit-upload-cancel" style="padding:8px 16px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;border:1px solid #ddd;background:#f0f0f5;color:#555;">取消</button>
+          <button id="tabbit-upload-confirm" style="padding:8px 18px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;border:none;background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:white;">✅ 确认并总结</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+
+    const fileInput = overlay.querySelector('#tabbit-upload-file');
+    const textArea = overlay.querySelector('#tabbit-upload-text');
+    const hintEl = overlay.querySelector('#tabbit-upload-hint');
+    let uploadedFilename = '';
+
+    function updateHint() {
+      hintEl.textContent = '字符数：' + textArea.value.length;
+    }
+    textArea.addEventListener('input', updateHint);
+
+    fileInput.addEventListener('change', function() {
+      const file = fileInput.files[0];
+      if (!file) return;
+      uploadedFilename = file.name;
+      const reader = new FileReader();
+      reader.onload = function(e) {
+        textArea.value = e.target.result || '';
+        updateHint();
+        console.log('[省流助手-手动上传] 文件已读取:', file.name, '大小:', file.size, 'bytes');
+      };
+      reader.onerror = function() {
+        alert('文件读取失败');
+      };
+      reader.readAsText(file, 'utf-8');
+    });
+
+    function closeDialog() { overlay.remove(); }
+    overlay.querySelector('#tabbit-upload-close').addEventListener('click', closeDialog);
+    overlay.querySelector('#tabbit-upload-cancel').addEventListener('click', closeDialog);
+    overlay.addEventListener('click', function(e) {
+      if (e.target === overlay) closeDialog();
+    });
+
+    overlay.querySelector('#tabbit-upload-confirm').addEventListener('click', async function() {
+      const rawText = textArea.value.trim();
+      if (!rawText) {
+        alert('请先上传文件或粘贴字幕内容');
+        return;
+      }
+      const transcript = parseUploadedContent(rawText, uploadedFilename);
+      if (!transcript || !transcript.trim()) {
+        alert('解析后内容为空，请检查字幕格式');
+        return;
+      }
+      console.log('[省流助手-手动上传] 解析完成，文本长度:', transcript.length);
+      closeDialog();
+
+      // ✅ 走与自动获取字幕完全一致的后续流程
+      rawTranscript = transcript;
+      const freshVideoInfo = getVideoInfo();
+      if (freshVideoInfo.bvid) {
+        videoInfo = freshVideoInfo;
+        currentVideoInfo = videoInfo;
+      }
+      panel.querySelectorAll('.tabbit-model-chip').forEach(c => c.classList.remove('disabled'));
+      await runSummary(panel, transcript, videoInfo);
+    });
+  }
   async function manualFetchSubtitle(panel, videoInfo) {
     console.log('[省流助手] 手动获取字幕...');
     const contentDiv = panel.querySelector('.tabbit-panel-content');
@@ -1926,18 +2178,18 @@
   }
 
   /**
-   * 🆕 流式 AI 调用
+   * 🆕 流式 AI 调用（真正支持 AbortSignal 打断）
    * @param {Array} messages - 消息列表
    * @param {Function} onDelta - 每收到一段时回调，参数 (fullText, deltaText)
-   * @param {Object} options - { apiUrl, apiKey, model } 自定义参数（可选）
+   * @param {Object} options - { apiUrl, apiKey, model, signal } 自定义参数（可选）
    * @returns {Promise<string>} 完整文本
-   * 失败时自动降级到非流式
    */
   async function callAIStream(messages, onDelta, options) {
     options = options || {};
     const apiUrl = options.apiUrl || CONFIG.apiUrl;
     const apiKey = options.apiKey || CONFIG.apiKey;
     const model = options.model || currentModel;
+    const signal = options.signal; // 🆕 AbortSignal
 
     if (!apiUrl || !apiKey || !model) {
       throw new Error('请点击右上角 ⚙️ 设置按钮，填写 apiUrl、apiKey 和 model');
@@ -1957,9 +2209,16 @@
           temperature: 0.7,
           max_tokens: 2000,
           stream: true
-        })
+        }),
+        signal: signal // 🆕 关键！把 AbortSignal 传给 fetch
       });
     } catch (netErr) {
+      // 🆕 区分用户主动打断和真实网络错误
+      if (isAbortError(netErr)) {
+        const abortErr = new Error('用户已打断');
+        abortErr.name = 'AbortError';
+        throw abortErr;
+      }
       throw new Error('网络请求失败: ' + netErr.message);
     }
 
@@ -1968,7 +2227,6 @@
       throw new Error('API 错误: ' + res.status + ' ' + errText);
     }
 
-    // 检测 Content-Type，如果不是 SSE 则降级为非流式 JSON 解析
     const ct = (res.headers.get('content-type') || '').toLowerCase();
     if (!ct.includes('text/event-stream') && !res.body) {
       console.warn('[省流助手-流式] API 不支持 stream，降级为一次性返回');
@@ -1984,9 +2242,29 @@
     const decoder = new TextDecoder('utf-8');
     let fullText = '';
     let buffer = '';
+    let userAborted = false;
+
+    // 🆕 监听 signal abort，立即取消 reader
+    const onAbortSignal = function() {
+      userAborted = true;
+      try { reader.cancel(); } catch(e) {}
+    };
+    if (signal) {
+      if (signal.aborted) {
+        onAbortSignal();
+      } else {
+        signal.addEventListener('abort', onAbortSignal);
+      }
+    }
 
     try {
       while (true) {
+        // 🆕 每轮循环检查打断状态
+        if (signal && signal.aborted) {
+          userAborted = true;
+          try { reader.cancel(); } catch(e) {}
+          break;
+        }
         const { done, value } = await reader.read();
         if (done) break;
         buffer += decoder.decode(value, { stream: true });
@@ -2001,7 +2279,6 @@
           if (dataStr === '[DONE]') continue;
           try {
             const json = JSON.parse(dataStr);
-            // OpenAI 兼容格式：choices[0].delta.content
             const delta = json.choices?.[0]?.delta?.content
                        || json.choices?.[0]?.message?.content
                        || '';
@@ -2011,27 +2288,40 @@
                 try { onDelta(fullText, delta); } catch (e) {}
               }
             }
-          } catch (e) {
-            // 单行解析失败不影响整体
-          }
+          } catch (e) {}
         }
       }
     } catch (streamErr) {
-      // 流读取异常，如果已经有部分内容，返回部分；否则抛出
-      if (!fullText) {
-        // 🆕 抛错前也要取消挂起的延迟回调
+      // 🆕 区分用户打断
+      if (isAbortError(streamErr)) {
+        userAborted = true;
+      } else if (!fullText) {
         if (typeof onDelta === 'function' && typeof onDelta.cancel === 'function') {
           onDelta.cancel();
         }
+        if (signal) signal.removeEventListener('abort', onAbortSignal);
         throw new Error('流式读取失败: ' + streamErr.message);
+      } else {
+        console.warn('[省流助手-流式] 流中断，使用已收到内容:', streamErr.message);
       }
-      console.warn('[省流助手-流式] 流中断，使用已收到内容:', streamErr.message);
     }
 
-    // 🆕 流式结束后立即取消挂起的延迟节流回调，
-    // 避免它在调用方做最终 markdown 渲染之后才触发，把渲染结果覆盖回纯文本
+    // 🆕 移除 signal 监听
+    if (signal) signal.removeEventListener('abort', onAbortSignal);
+
     if (typeof onDelta === 'function' && typeof onDelta.cancel === 'function') {
       onDelta.cancel();
+    }
+
+    // 🆕 如果是用户主动打断
+    if (userAborted) {
+      if (fullText.trim()) {
+        return fullText + '\n\n_⏹ 已被用户打断_';
+      } else {
+        const abortErr = new Error('用户已打断');
+        abortErr.name = 'AbortError';
+        throw abortErr;
+      }
     }
 
     if (!fullText.trim()) {
@@ -2092,7 +2382,7 @@
   }
 
   // 🆕 生图模式 - 第2步：根据已有的总结文字生成配图
-  async function generateImageFromSummary(textContent) {
+  async function generateImageFromSummary(textContent, signal) {
     const apiUrl = CONFIG.imageGenApiUrl || CONFIG.apiUrl;
     const apiKey = CONFIG.imageGenApiKey || CONFIG.apiKey;
     const model = CONFIG.imageGenModel || 'gemini-2.0-flash-preview-image-generation';
@@ -2131,7 +2421,8 @@
           n: 1,
           size: CONFIG.imageGenSize || '1024x1024',
           response_format: 'b64_json'
-        })
+        }),
+        signal: signal  // 🆕 加这一行
       });
 
       if (imageRes.ok) {
@@ -2145,6 +2436,7 @@
         console.warn('[省流助手-生图] 生图端点返回错误:', imageRes.status);
       }
     } catch (imgErr) {
+      if (isAbortError(imgErr)) throw imgErr; // 🆕 打断直接抛出
       console.warn('[省流助手-生图] 生图请求异常:', imgErr.message);
     }
 
@@ -2161,7 +2453,8 @@
             prompt: imagePrompt,
             n: 1,
             size: CONFIG.imageGenSize || '1024x1024'
-          })
+          }),
+          signal: signal  // 🆕 加这一行
         });
         if (imageRes2.ok) {
           const imageData2 = await imageRes2.json();
@@ -2172,6 +2465,7 @@
           }
         }
       } catch (e) {
+        if (isAbortError(imgErr)) throw e; // 🆕 打断直接抛出
         console.warn('[省流助手-生图] 第二次生图尝试也失败:', e.message);
       }
     }
@@ -2331,6 +2625,11 @@
         document.body.removeChild(a);
       });
       actionsDiv.insertBefore(saveImgBtn, actionsDiv.firstChild);
+
+      // 🆕 图片就绪后自动触发下载（异步 + 容错，避免影响主流程）
+      setTimeout(function() {
+        try { saveImgBtn.click(); } catch(e) { console.warn('[省流助手] 自动下载失败', e); }
+      }, 0);
     }
   }
 
@@ -2419,87 +2718,7 @@
   }
 
   /**
-   * 🆕 流式版：追加预设总结
-   */
-  async function appendPresetSummary(panel, preset, videoInfo) {
-    const contentDiv = panel.querySelector('.tabbit-panel-content');
-    const input = panel.querySelector('.tabbit-chat-input');
-    const sendBtn = panel.querySelector('.tabbit-chat-send');
-
-    panel.querySelectorAll('.tabbit-model-chip').forEach(c => c.classList.add('disabled'));
-    panel.querySelectorAll('.tabbit-preset-chip').forEach(c => c.classList.add('disabled'));
-    input.disabled = true;
-    sendBtn.disabled = true;
-
-    const pageUrl = window.location.href;
-    const fullPrompt = preset.prompt + '\n\n视频URL: ' + pageUrl + '\n视频标题: ' + (videoInfo.title || '') + '\nUP主: ' + (videoInfo.upName || '') + '\n\n字幕内容:\n' + rawTranscript;
-
-    let messagesContainer = contentDiv.querySelector('.tabbit-chat-messages');
-    if (!messagesContainer) {
-      messagesContainer = document.createElement('div');
-      messagesContainer.className = 'tabbit-chat-messages';
-      contentDiv.appendChild(messagesContainer);
-    }
-
-    // 分隔标识
-    const dividerMsg = document.createElement('div');
-    dividerMsg.style.cssText = 'text-align:center;font-size:11px;color:#999;margin:8px 0;padding:4px 0;border-top:1px dashed #e0e0e0;';
-    dividerMsg.textContent = '🎨 切换风格：' + (preset.icon || '') + ' ' + preset.name;
-    messagesContainer.appendChild(dividerMsg);
-
-    // 🆕 流式 AI 气泡（直接创建，不用 loading 三点）
-    const aiWrap = document.createElement('div');
-    aiWrap.style.cssText = 'display:flex;flex-direction:column;align-items:flex-start;';
-    const aiMsg = document.createElement('div');
-    aiMsg.className = 'tabbit-msg tabbit-msg-ai';
-    aiMsg.innerHTML = '<span class="tabbit-typing-cursor"></span>';
-    const modelTag = document.createElement('div');
-    modelTag.className = 'tabbit-msg-model';
-    modelTag.textContent = '🤖 ' + currentModel + ' · ' + preset.name;
-    aiWrap.appendChild(aiMsg);
-    aiWrap.appendChild(modelTag);
-    messagesContainer.appendChild(aiWrap);
-    contentDiv.scrollTop = contentDiv.scrollHeight;
-
-    try {
-      const messages = [{ role: 'user', content: fullPrompt }];
-
-      // 流式渲染：纯文本 + 光标，结束后切 markdown
-      const onDelta = createThrottledDelta(function(fullText) {
-        aiMsg.textContent = fullText;
-        aiMsg.appendChild(document.createElement('span')); // 占位
-        const cursor = document.createElement('span');
-        cursor.className = 'tabbit-typing-cursor';
-        aiMsg.appendChild(cursor);
-        contentDiv.scrollTop = contentDiv.scrollHeight;
-      });
-
-      const reply = await callAIStream(messages, onDelta);
-
-      // 结束后切换到 markdown 渲染
-      aiMsg.innerHTML = parseMarkdown(reply);
-
-      conversationHistory.push({ role: 'user', content: fullPrompt });
-      conversationHistory.push({ role: 'assistant', content: reply });
-      rawMarkdownResult = reply;
-
-      contentDiv.scrollTop = contentDiv.scrollHeight;
-    } catch (err) {
-      console.error('[省流助手-预设切换]', err);
-      aiMsg.style.background = '#fff3f3';
-      aiMsg.style.color = '#c00';
-      aiMsg.textContent = '⚠️ ' + err.message;
-      contentDiv.scrollTop = contentDiv.scrollHeight;
-    } finally {
-      panel.querySelectorAll('.tabbit-model-chip').forEach(c => c.classList.remove('disabled'));
-      panel.querySelectorAll('.tabbit-preset-chip').forEach(c => c.classList.remove('disabled'));
-      input.disabled = false;
-      sendBtn.disabled = false;
-    }
-  }
-
-  /**
-   * 🆕 流式版：初始总结
+   * 🆕 流式版：初始总结（支持打断）
    */
   async function runSummary(panel, transcript, videoInfo) {
     const contentDiv = panel.querySelector('.tabbit-panel-content');
@@ -2514,13 +2733,11 @@
     const pageUrl = window.location.href;
     const activePreset = (CONFIG.promptPresets || []).find(p => p.id === CONFIG.activePresetId);
     const activePrompt = (activePreset && activePreset.prompt) || CONFIG.promptText || PROMPT_TEXT;
-    const activePresetName = activePreset ? activePreset.name : '默认';
     const fullPrompt = activePrompt + '\n\n视频URL: ' + pageUrl + '\n视频标题: ' + (videoInfo.title || '') + '\nUP主: ' + (videoInfo.upName || '') + '\n\n字幕内容:\n' + transcript;
 
     const presetBarHtml = renderPresetBarHtml();
     const useImageGen = isImageGenEnabled();
 
-    // 直接渲染最终骨架，把"AI 思考"展示在 .tabbit-result 里（带光标）
     contentDiv.innerHTML = `
       <div class="tabbit-video-info">
         <div class="tabbit-video-title">${escapeHtml(videoInfo.title || '未知标题')}</div>
@@ -2537,11 +2754,25 @@
     `;
     bindPresetChips(panel, videoInfo);
 
+    // 🆕 创建 AbortController + 在 result 区域插入打断按钮
+    abortCurrentTask();
+    currentAbortController = new AbortController();
+    const localController = currentAbortController;
+    const resultContainerForBtn = contentDiv.querySelector('.tabbit-result');
+    let abortBtn = null;
+    if (resultContainerForBtn) {
+      const abortBtnWrap = document.createElement('div');
+      abortBtnWrap.style.cssText = 'text-align:center;';
+      abortBtn = insertInlineAbortBtn(abortBtnWrap, function() {
+        abortCurrentTask();
+      });
+      resultContainerForBtn.parentNode.insertBefore(abortBtnWrap, resultContainerForBtn.nextSibling);
+      abortBtn._wrap = abortBtnWrap;
+    }
+
     try {
       if (useImageGen) {
-        // ===== 生图模式：流式文字 + 异步图片 =====
         const resultContainer = contentDiv.querySelector('.tabbit-result');
-        // 先显示文字流式 + 图片占位
         resultContainer.innerHTML =
           '<div class="tabbit-img-wrap tabbit-img-loading" style="text-align:center;margin-bottom:12px;padding:30px 14px;background:linear-gradient(135deg,#f0f4ff 0%,#fff5f8 100%);border:1px dashed #c5d3ff;border-radius:10px;">' +
             '<div class="tabbit-spinner" style="margin:0 auto 10px;"></div>' +
@@ -2552,7 +2783,6 @@
 
         const textWrap = resultContainer.querySelector('.tabbit-text-wrap');
 
-        // 流式回调：用 textContent 渲染（流式期间）
         const onDelta = createThrottledDelta(function(fullText) {
           textWrap.textContent = fullText;
           const cursor = document.createElement('span');
@@ -2561,14 +2791,27 @@
           contentDiv.scrollTop = contentDiv.scrollHeight;
         });
 
-        const textContent = await generateSummaryText(fullPrompt, onDelta);
+        // 🆕 透传 signal 给文字总结
+        const summaryApiUrl = CONFIG.apiUrl;
+        const summaryApiKey = CONFIG.apiKey;
+        const summaryModel = currentModel;
+        const textContent = await callAIStream(
+          [{ role: 'user', content: fullPrompt }],
+          onDelta,
+          { apiUrl: summaryApiUrl, apiKey: summaryApiKey, model: summaryModel, signal: localController.signal }
+        );
+
+        // 🆕 文字总结结束后，先清理"文字总结阶段"的打断按钮
+        if (abortBtn && abortBtn._wrap && abortBtn._wrap.parentNode) {
+          abortBtn._wrap.remove();
+          abortBtn = null;
+        }
 
         conversationHistory = [
           { role: 'user', content: fullPrompt },
           { role: 'assistant', content: textContent }
         ];
 
-        // 流式结束：把骨架完整化（actions + url + 评论按钮）
         contentDiv.innerHTML = `
           <div class="tabbit-video-info">
             <div class="tabbit-video-title">${escapeHtml(videoInfo.title || '未知标题')}</div>
@@ -2597,23 +2840,49 @@
         panel.querySelectorAll('.tabbit-model-chip').forEach(c => c.classList.remove('disabled'));
         panel.querySelectorAll('.tabbit-preset-chip').forEach(c => c.classList.remove('disabled'));
 
-        // 第2阶段：异步生图
-        generateImageFromSummary(textContent)
+        // 🆕 生图阶段也插入打断按钮（覆盖在图片占位符旁边）
+        const imgWrap = contentDiv.querySelector('.tabbit-img-wrap.tabbit-img-loading');
+        let imgAbortBtnWrap = null;
+        let imgAbortController = new AbortController();
+        if (imgWrap) {
+          imgAbortBtnWrap = document.createElement('div');
+          imgAbortBtnWrap.style.cssText = 'text-align:center;margin-top:8px;';
+          insertInlineAbortBtn(imgAbortBtnWrap, function() {
+            try { imgAbortController.abort(); } catch(e) {}
+            console.log('[省流助手-生图] 用户打断生图');
+          });
+          imgWrap.appendChild(imgAbortBtnWrap);
+        }
+
+        // 🆕 把 imgAbortController 暴露成全局打断目标
+        currentAbortController = imgAbortController;
+
+        // 🆕 第二阶段：异步生图（支持打断）
+        generateImageFromSummary(textContent, imgAbortController.signal)
           .then(function(imageDataUrl) {
+            if (imgAbortBtnWrap && imgAbortBtnWrap.parentNode) imgAbortBtnWrap.remove();
             updateImageResult(contentDiv, imageDataUrl, videoInfo);
+            if (currentAbortController === imgAbortController) currentAbortController = null;
           })
           .catch(function(imgErr) {
-            console.warn('[省流助手-生图] 图片生成失败:', imgErr.message);
-            updateImageResult(contentDiv, 'ERROR', videoInfo);
+            if (imgAbortBtnWrap && imgAbortBtnWrap.parentNode) imgAbortBtnWrap.remove();
+            if (isAbortError(imgErr)) {
+              const wrap = contentDiv.querySelector('.tabbit-img-wrap');
+              if (wrap) {
+                wrap.outerHTML = '<div class="tabbit-img-wrap" style="text-align:center;margin-bottom:12px;padding:14px;background:#fff7e6;border:1px solid #ffd591;border-radius:10px;color:#b76d00;font-size:13px;">⏹ 生图已被用户打断</div>';
+              }
+            } else {
+              console.warn('[省流助手-生图] 图片生成失败:', imgErr.message);
+              updateImageResult(contentDiv, 'ERROR', videoInfo);
+            }
+            if (currentAbortController === imgAbortController) currentAbortController = null;
           });
 
         return;
       } else {
-        // ===== 普通文字总结模式（流式） =====
         const resultContainer = contentDiv.querySelector('.tabbit-result');
         const messages = [{ role: 'user', content: fullPrompt }];
 
-        // 流式期间：纯文本 + 光标
         const onDelta = createThrottledDelta(function(fullText) {
           resultContainer.textContent = fullText;
           const cursor = document.createElement('span');
@@ -2622,14 +2891,13 @@
           contentDiv.scrollTop = contentDiv.scrollHeight;
         });
 
-        const reply = await callAIStream(messages, onDelta);
+        const reply = await callAIStream(messages, onDelta, { signal: localController.signal });
 
         conversationHistory = [
           { role: 'user', content: fullPrompt },
           { role: 'assistant', content: reply }
         ];
 
-        // 流式结束：补齐完整骨架（评论按钮 + 对话区 + actions）
         contentDiv.innerHTML = `
           <div class="tabbit-video-info">
             <div class="tabbit-video-title">${escapeHtml(videoInfo.title || '未知标题')}</div>
@@ -2672,19 +2940,35 @@
         </button>
       `;
       bindPresetChips(panel, videoInfo);
-      showError(contentDiv, err.message);
+      // 🆕 区分打断和真实错误
+      if (isAbortError(err)) {
+        const resultContainer = contentDiv.querySelector('.tabbit-result');
+        if (resultContainer) {
+          resultContainer.innerHTML = '<div style="background:#fff7e6;border:1px solid #ffd591;border-radius:8px;padding:14px;color:#b76d00;text-align:center;">⏹ 已被用户打断，未生成内容</div>';
+        }
+      } else {
+        showError(contentDiv, err.message);
+      }
 
       const commentBtn = contentDiv.querySelector('#tabbit-comment-btn');
       if (commentBtn) {
         commentBtn.addEventListener('click', () => runCommentSummary(panel, videoInfo));
       }
+      input.disabled = false;
+      sendBtn.disabled = false;
     } finally {
+      // 🆕 清理打断按钮 + AbortController
+      if (abortBtn && abortBtn._wrap && abortBtn._wrap.parentNode) {
+        abortBtn._wrap.remove();
+      }
+      if (currentAbortController === localController) currentAbortController = null;
       panel.querySelectorAll('.tabbit-model-chip').forEach(c => c.classList.remove('disabled'));
       panel.querySelectorAll('.tabbit-preset-chip').forEach(c => c.classList.remove('disabled'));
     }
   }
 
-  // ==================== 评论区总结主流程（流式） ====================
+
+  // ==================== 评论区总结主流程（流式 + 打断） ====================
   async function runCommentSummary(panel, videoInfo) {
     if (isCommentSummarizing) return;
     isCommentSummarizing = true;
@@ -2715,6 +2999,12 @@
 
     const statusEl = commentSection.querySelector('#tabbit-comment-status');
 
+    // 🆕 准备 AbortController
+    abortCurrentTask();
+    currentAbortController = new AbortController();
+    const localController = currentAbortController;
+    let abortBtn = null;
+
     try {
       const aid = getAid(videoInfo);
       if (!aid) throw new Error('无法获取视频 aid');
@@ -2724,18 +3014,33 @@
       });
       if (comments.length === 0) throw new Error('该视频没有评论');
 
+      // 🆕 检查是否已被打断（评论抓取阶段）
+      if (localController.signal.aborted) {
+        const abortErr = new Error('用户已打断');
+        abortErr.name = 'AbortError';
+        throw abortErr;
+      }
+
       if (statusEl) statusEl.textContent = '已获取 ' + comments.length + ' 条评论，AI 正在流式总结...';
 
       const commentsText = formatCommentsText(comments);
       const activeCommentPrompt = CONFIG.commentPromptText || COMMENT_PROMPT_TEXT;
       const fullPrompt = activeCommentPrompt + '\n\n评论内容如下：\n' + commentsText;
 
-      // 准备流式渲染容器（替换掉 loading）
       commentSection.innerHTML = `
         <div class="tabbit-comment-section-title">💬 评论区总结 <span style="font-size:11px;color:#999;font-weight:400;">（${comments.length}条评论）</span></div>
         <div class="tabbit-comment-result"><span class="tabbit-typing-cursor"></span></div>
       `;
       const resultEl = commentSection.querySelector('.tabbit-comment-result');
+
+      // 🆕 插入打断按钮
+      const abortBtnWrap = document.createElement('div');
+      abortBtnWrap.style.cssText = 'text-align:center;';
+      abortBtn = insertInlineAbortBtn(abortBtnWrap, function() {
+        abortCurrentTask();
+      });
+      commentSection.appendChild(abortBtnWrap);
+      abortBtn._wrap = abortBtnWrap;
 
       const messages = [{ role: 'user', content: fullPrompt }];
 
@@ -2747,14 +3052,13 @@
         contentDiv.scrollTop = contentDiv.scrollHeight;
       });
 
-      const reply = await callAIStream(messages, onDelta);
+      const reply = await callAIStream(messages, onDelta, { signal: localController.signal });
 
       commentConversationHistory = [
         { role: 'user', content: fullPrompt },
         { role: 'assistant', content: reply }
       ];
 
-      // 流式结束：切换到 markdown + 加按钮
       resultEl.innerHTML = parseMarkdown(reply);
 
       const actionsDiv = document.createElement('div');
@@ -2778,21 +3082,34 @@
       contentDiv.scrollTop = contentDiv.scrollHeight;
     } catch (err) {
       console.error('[省流助手-评论区]', err);
-      commentSection.innerHTML = `
-        <div class="tabbit-comment-section-title">💬 评论区总结</div>
-        <div class="tabbit-error">
-          <div class="tabbit-error-title">⚠️ 评论区总结失败</div>
-          <div>${escapeHtml(err.message)}</div>
-        </div>
-      `;
+      // 🆕 区分打断和真实错误
+      if (isAbortError(err)) {
+        commentSection.innerHTML = `
+          <div class="tabbit-comment-section-title">💬 评论区总结</div>
+          <div style="background:#fff7e6;border:1px solid #ffd591;border-radius:8px;padding:14px;color:#b76d00;text-align:center;">⏹ 已被用户打断</div>
+        `;
+      } else {
+        commentSection.innerHTML = `
+          <div class="tabbit-comment-section-title">💬 评论区总结</div>
+          <div class="tabbit-error">
+            <div class="tabbit-error-title">⚠️ 评论区总结失败</div>
+            <div>${escapeHtml(err.message)}</div>
+          </div>
+        `;
+      }
     } finally {
+      // 🆕 清理打断按钮
+      if (abortBtn && abortBtn._wrap && abortBtn._wrap.parentNode) {
+        abortBtn._wrap.remove();
+      }
+      if (currentAbortController === localController) currentAbortController = null;
       isCommentSummarizing = false;
       const btn = contentDiv.querySelector('#tabbit-comment-btn');
       if (btn) btn.disabled = false;
     }
   }
 
-  // ==================== 对话功能（流式） ====================
+  // ==================== 对话功能（流式 + 打断） ====================
   async function handleSend(panel) {
     const input = panel.querySelector('.tabbit-chat-input');
     const sendBtn = panel.querySelector('.tabbit-chat-send');
@@ -2819,9 +3136,7 @@
     input.value = '';
     input.style.height = 'auto';
     input.disabled = true;
-    sendBtn.disabled = true;
 
-    // 🆕 直接创建流式 AI 气泡（带光标）
     const aiWrap = document.createElement('div');
     aiWrap.style.cssText = 'display:flex;flex-direction:column;align-items:flex-start;';
     const aiMsg = document.createElement('div');
@@ -2836,6 +3151,14 @@
 
     const contentDiv = panel.querySelector('.tabbit-panel-content');
     contentDiv.scrollTop = contentDiv.scrollHeight;
+
+    // 🆕 把发送按钮变为打断按钮
+    abortCurrentTask();
+    currentAbortController = new AbortController();
+    const localController = currentAbortController;
+    setSendBtnAsAbort(sendBtn, function() {
+      abortCurrentTask();
+    });
 
     try {
       conversationHistory.push({ role: 'user', content: text });
@@ -2853,21 +3176,29 @@
         contentDiv.scrollTop = contentDiv.scrollHeight;
       });
 
-      const reply = await callAIStream(sentMessages, onDelta);
+      const reply = await callAIStream(sentMessages, onDelta, { signal: localController.signal });
       conversationHistory.push({ role: 'assistant', content: reply });
 
-      // 结束后切换到 markdown 渲染
       aiMsg.innerHTML = parseMarkdown(reply);
       contentDiv.scrollTop = contentDiv.scrollHeight;
     } catch (err) {
       console.error('[省流助手-对话]', err);
       conversationHistory.pop();
-
-      aiMsg.style.background = '#fff3f3';
-      aiMsg.style.color = '#c00';
-      aiMsg.textContent = '⚠️ ' + err.message;
+      // 🆕 区分打断和真实错误
+      if (isAbortError(err)) {
+        aiMsg.style.background = '#fff7e6';
+        aiMsg.style.color = '#b76d00';
+        aiMsg.textContent = '⏹ 已被用户打断';
+      } else {
+        aiMsg.style.background = '#fff3f3';
+        aiMsg.style.color = '#c00';
+        aiMsg.textContent = '⚠️ ' + err.message;
+      }
       contentDiv.scrollTop = contentDiv.scrollHeight;
     } finally {
+      // 🆕 还原发送按钮
+      restoreSendBtn(sendBtn);
+      if (currentAbortController === localController) currentAbortController = null;
       input.disabled = false;
       sendBtn.disabled = false;
       input.focus();
