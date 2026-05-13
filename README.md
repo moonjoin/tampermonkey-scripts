@@ -13,8 +13,8 @@
   - 识别软广/恰饭内容
 - 需自备**兼容OpenAI格式的API Key**与地址，可自定义模型
 - 适用：B站重度用户、学习/省流场景
-- 自动提取B站视频字幕，通过自定义AI API生成极简摘要，支持模型切换、持续对话和评论区总结；配置项（API/模型列表）存储于localStorage，支持设置界面导入导出；支持自动解析开关、悬浮窗/面板可拖动、自动获取模型列表、flomo自动加标签
-- <img width="1602" height="1297" alt="b" src="https://github.com/user-attachments/assets/9242ea93-286d-41d6-a857-781a373acc44" />
+- 自动提取B站视频字幕，通过自定义AI API生成极简摘要或图片，支持模型切换、持续对话和评论区总结；配置项（API/模型列表）存储于localStorage，支持设置界面导入导出；支持自动解析开关、悬浮窗/面板可拖动、自动获取模型列表、flomo自动加标签
+- <img width="640" height="360" alt="image" src="https://github.com/user-attachments/assets/19951f71-9cc9-4018-a449-00a70cc73b62" />
 
 ---
 
