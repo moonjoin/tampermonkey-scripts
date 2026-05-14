@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Folo 网站增强工具
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      13.4.5
-// @description  Folo 增强：Jina Reader + Readability + 启发式三级抓取 + AI 总结 + 自动总结 + 后续对话 + 多配置管理 + 坚果云 WebDAV 同步 + 复制对话 + 保存到 flomo
+// @version      13.6.7
+// @description  Folo 增强：Jina Reader + Readability + 启发式三级抓取 + AI 总结 + 自动总结 + 预加载缓存 + 后续对话 + 多配置管理 + 坚果云 WebDAV 同步 + 复制对话 + 保存到 flomo
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
 // @match        https://app.folo.is/*
@@ -12,6 +12,7 @@
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_registerMenuCommand
+// @grant        unsafeWindow
 // @connect      *
 // @run-at       document-start
 // @license      MIT
@@ -22,7 +23,7 @@
 (function() {
     'use strict';
 
-    console.log("🚀 Folo 增强脚本 v13.4 (flomo集成版) 已启动");
+    console.log("🚀 Folo 增强脚本 (预加载缓存版) 已启动");
 
     // ==================== 0. 内联 Markdown 渲染器（含 GFM 表格） ====================
     const _md = (function() {
@@ -432,6 +433,15 @@
     function getAutoSummarizeEnabled() { return GM_getValue("ai_auto_summarize", false) === true; }
     function setAutoSummarizeEnabled(v) { GM_setValue("ai_auto_summarize", !!v); }
 
+    function getPreloadEnabled() { return GM_getValue("ai_preload_enabled", true) !== false; }
+    function setPreloadEnabled(v) { GM_setValue("ai_preload_enabled", !!v); }
+    function getPreloadLimit() { return Math.max(1, Math.min(20, Number(GM_getValue("ai_preload_limit", 8)) || 8)); }
+    function setPreloadLimit(v) { GM_setValue("ai_preload_limit", Math.max(1, Math.min(20, Number(v) || 8))); }
+    function getPreloadConcurrency() { return Math.max(1, Math.min(3, Number(GM_getValue("ai_preload_concurrency", 2)) || 2)); }
+    function setPreloadConcurrency(v) { GM_setValue("ai_preload_concurrency", Math.max(1, Math.min(3, Number(v) || 2))); }
+    function getPreloadIframeEnabled() { return GM_getValue("ai_preload_iframe_enabled", false) === true; }
+    function setPreloadIframeEnabled(v) { GM_setValue("ai_preload_iframe_enabled", !!v); }
+
     function getExtractStrategies() {
         return GM_getValue("ai_extract_strategies", ['jina', 'readability', 'heuristic']);
     }
@@ -453,6 +463,954 @@
     function saveProfiles(profiles, activeId) {
         GM_setValue("ai_profiles", profiles);
         if (activeId) GM_setValue("ai_current_profile_id", activeId);
+    }
+
+    // ==================== 3.1. 总结缓存 + 列表预加载 ====================
+    const SUMMARY_CACHE_KEY = "ai_summary_cache_v1";
+    const SUMMARY_CACHE_MAX = 0; // 0 表示不按数量裁剪,只按 TTL 清理过期缓存
+    const SUMMARY_CACHE_TTL = 1000 * 60 * 60 * 24 * 14;
+    const PRELOAD_TASK_TIMEOUT_MS = 90000;
+    const PRELOAD_DETAIL_LOAD_TIMEOUT_MS = 22000;
+    const PRELOAD_ARTICLES = new Map();
+    const PRELOAD_QUEUE = [];
+    const PRELOAD_RUNNING = new Set();
+    const PRELOAD_FAILED_UNTIL = new Map();
+    const PRELOAD_TASKS = new Map();
+    const PRELOAD_STATS = {
+        detected: 0,
+        queued: 0,
+        running: 0,
+        success: 0,
+        failed: 0,
+        lastMessage: "等待扫描列表",
+        logs: []
+    };
+    let preloadPumpTimer = null;
+    let preloadScanTimer = null;
+    let preloadPanelTimer = null;
+    let preloadPanelExpandedLayout = null;
+    let preloadClearToken = 0;
+
+    function setPreloadStatus(message, level) {
+        PRELOAD_STATS.lastMessage = message || "";
+        PRELOAD_STATS.logs.unshift({
+            time: new Date().toLocaleTimeString(),
+            text: message || "",
+            level: level || "info"
+        });
+        PRELOAD_STATS.logs = PRELOAD_STATS.logs.slice(0, 8);
+        updatePreloadPanel();
+    }
+
+    function getCacheCount() {
+        return Object.keys(readSummaryCache()).length;
+    }
+
+    function stripHtmlToText(html) {
+        const s = String(html || "");
+        if (!/[<>]/.test(s)) return s.replace(/\s+/g, " ").trim();
+        const doc = new DOMParser().parseFromString(s, "text/html");
+        return (doc.body ? doc.body.innerText : s).replace(/\s+/g, " ").trim();
+    }
+
+    function getVisibleRowText(el) {
+        const row = el && (el.closest('[role="article"], [data-radix-collection-item], [data-testid*="entry"], article, li, a[href*="/timeline/articles/"]') || el.closest('div'));
+        const text = row ? (row.innerText || row.textContent || "") : "";
+        return text.replace(/\s+/g, " ").trim().slice(0, 2000);
+    }
+
+    function getTitleFromRow(el) {
+        const rowText = getVisibleRowText(el);
+        const ownText = (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
+        const title = ownText || rowText;
+        return title
+            .replace(/\b\d+\s*(分钟|小时|天)前\b/g, "")
+            .replace(/\s+/g, " ")
+            .trim()
+            .slice(0, 180);
+    }
+
+    function getTimelineRouteInfo(urlLike) {
+        let u;
+        try { u = new URL(urlLike || location.href, location.origin); } catch(e) { u = new URL(location.href); }
+        const parts = u.pathname.split('/').filter(Boolean);
+        if (parts[0] !== 'timeline' || parts.length < 3) {
+            return { isTimeline: false, scopePath: "", entryId: "", isList: false, pathname: u.pathname };
+        }
+        const last = parts[parts.length - 1] || "";
+        const isEntry = /^\d{8,}$/.test(last);
+        const isList = last === "pending" || last === "read" || last === "all" || !isEntry;
+        const scopeParts = isEntry || last === "pending" || last === "read" ? parts.slice(0, -1) : parts;
+        return {
+            isTimeline: true,
+            scopePath: "/" + scopeParts.join("/"),
+            entryId: isEntry ? last : "",
+            isList,
+            pathname: u.pathname
+        };
+    }
+
+    function sameTimelineScope(href, scopePath) {
+        if (!scopePath) return false;
+        const info = getTimelineRouteInfo(href);
+        return info.isTimeline && info.scopePath === scopePath && !!info.entryId;
+    }
+
+    function getCacheIdentity(parts) {
+        parts = parts || {};
+        const entryId = String(parts.entryId || "").trim();
+        const appUrl = String(parts.appUrl || "").trim();
+        const route = appUrl ? getTimelineRouteInfo(appUrl) : null;
+        if (entryId) return "entry:" + entryId;
+        if (route && route.entryId) return "entry:" + route.entryId;
+        if (parts.url) return "url:" + String(parts.url).trim();
+        if (parts.title) return "title:" + normalizeTitleKey(parts.title);
+        return "loc:" + location.href;
+    }
+
+    function quickHash(str) {
+        str = String(str || "");
+        let h = 2166136261;
+        for (let i = 0; i < str.length; i++) {
+            h ^= str.charCodeAt(i);
+            h += (h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24);
+        }
+        return (h >>> 0).toString(36);
+    }
+
+    function normalizeTitleKey(title) {
+        return String(title || "").replace(/\s+/g, " ").trim().toLowerCase().slice(0, 120);
+    }
+
+    function summaryVersionKey() {
+        const cfg = getActiveConfig();
+        return quickHash([cfg.apiUrl, cfg.model, cfg.prompt, getMaxChars(), getFetchFulltextEnabled(), getExtractStrategies().join(",")].join("|"));
+    }
+
+    function makeSummaryKey(url, title, entryId, appUrl) {
+        const id = getCacheIdentity({ url, title, entryId, appUrl });
+        return summaryVersionKey() + "::" + quickHash(id);
+    }
+
+    function getPendingSummaryTask(url, title, entryId, appUrl) {
+        return PRELOAD_TASKS.get(makeSummaryKey(url, title, entryId, appUrl));
+    }
+
+    function removeQueuedPreloadTask(url, title, entryId, appUrl) {
+        const key = makeSummaryKey(url, title, entryId, appUrl);
+        const idx = PRELOAD_QUEUE.findIndex(q => q.key === key);
+        if (idx === -1) return false;
+        PRELOAD_QUEUE.splice(idx, 1);
+        PRELOAD_STATS.queued = PRELOAD_QUEUE.length;
+        updatePreloadPanel();
+        return true;
+    }
+
+    function withTimeout(promise, ms, label) {
+        let timer = null;
+        const timeout = new Promise((_, reject) => {
+            timer = setTimeout(() => reject(new Error(`超时 ${Math.round(ms / 1000)} 秒：${label || "预加载任务"}`)), ms);
+        });
+        return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+    }
+
+    function resetPreloadState(clearCache) {
+        preloadClearToken++;
+        PRELOAD_ARTICLES.clear();
+        PRELOAD_QUEUE.length = 0;
+        PRELOAD_RUNNING.clear();
+        PRELOAD_FAILED_UNTIL.clear();
+        PRELOAD_TASKS.clear();
+        PRELOAD_STATS.detected = 0;
+        PRELOAD_STATS.queued = 0;
+        PRELOAD_STATS.running = 0;
+        PRELOAD_STATS.success = 0;
+        PRELOAD_STATS.failed = 0;
+        PRELOAD_STATS.logs = [];
+        if (clearCache) GM_setValue(SUMMARY_CACHE_KEY, {});
+        setPreloadStatus(clearCache ? "已清空缓存和预加载队列" : "已清空预加载队列", "ok");
+        updatePreloadPanel();
+    }
+
+    function preloadDetailFromFolo(appUrl) {
+        if (!appUrl) return Promise.resolve(null);
+        return new Promise((resolve, reject) => {
+            const iframe = document.createElement("iframe");
+            let done = false;
+            let timer = null;
+            iframe.style.cssText = "position:fixed;left:-9999px;top:-9999px;width:960px;height:720px;opacity:0;pointer-events:none;";
+            iframe.src = appUrl;
+            const cleanup = () => {
+                done = true;
+                clearInterval(timer);
+                try { iframe.remove(); } catch(e) {}
+            };
+            const tryRead = () => {
+                if (done) return;
+                let doc;
+                try { doc = iframe.contentDocument || iframe.contentWindow.document; } catch(e) { return; }
+                if (!doc || !doc.body) return;
+                const article = doc.getElementById('follow-entry-render') || doc.querySelector('article[data-testid="entry-render"]');
+                if (!article) return;
+                const text = getCleanArticleText(article);
+                const originalUrl = getOriginalUrl(article) ||
+                    (doc.querySelector('a[target="_blank"][href^="http"]:not([href*="app.folo.is"])') || {}).href || "";
+                const title = getArticleTitle(article);
+                if ((originalUrl && /^https?:\/\//.test(originalUrl)) || (text && text.length >= 80)) {
+                    cleanup();
+                    resolve({ title, originalUrl, text });
+                }
+            };
+            iframe.onload = () => setTimeout(tryRead, 1200);
+            document.body.appendChild(iframe);
+            timer = setInterval(tryRead, 800);
+            setTimeout(() => {
+                if (!done) {
+                    cleanup();
+                    reject(new Error("详情页加载超时"));
+                }
+            }, PRELOAD_DETAIL_LOAD_TIMEOUT_MS);
+        });
+    }
+
+    function readSummaryCache() {
+        const cache = GM_getValue(SUMMARY_CACHE_KEY, {});
+        return cache && typeof cache === "object" ? cache : {};
+    }
+
+    function writeSummaryCache(cache) {
+        const now = Date.now();
+        const entries = Object.entries(cache)
+            .filter(([, v]) => v && (!v.createdAt || now - v.createdAt < SUMMARY_CACHE_TTL))
+            .sort((a, b) => (b[1].lastAccess || b[1].createdAt || 0) - (a[1].lastAccess || a[1].createdAt || 0));
+        const kept = SUMMARY_CACHE_MAX > 0 ? entries.slice(0, SUMMARY_CACHE_MAX) : entries;
+        GM_setValue(SUMMARY_CACHE_KEY, Object.fromEntries(kept));
+    }
+
+    function findSummaryCache(url, title, entryId, appUrl) {
+        const cache = readSummaryCache();
+        const exactKey = makeSummaryKey(url, title, entryId, appUrl);
+        const exact = cache[exactKey];
+        if (exact) {
+            exact.lastAccess = Date.now();
+            cache[exactKey] = exact;
+            writeSummaryCache(cache);
+            return exact;
+        }
+        const routeEntryId = entryId || (appUrl ? getTimelineRouteInfo(appUrl).entryId : "") || getTimelineRouteInfo(location.href).entryId;
+        const titleKey = normalizeTitleKey(title);
+        const nowVersion = summaryVersionKey();
+        const foundKey = Object.keys(cache).find(k => {
+            const item = cache[k];
+            if (!item || item.version !== nowVersion) return false;
+            if (routeEntryId && String(item.entryId || "") === String(routeEntryId)) return true;
+            if (url && item.url === url) return true;
+            if (appUrl && item.appUrl === appUrl) return true;
+            return titleKey && normalizeTitleKey(item.title) === titleKey;
+        });
+        if (!foundKey) return null;
+        cache[foundKey].lastAccess = Date.now();
+        writeSummaryCache(cache);
+        return cache[foundKey];
+    }
+
+    function saveSummaryCache(payload) {
+        if (!payload || !payload.summary || (!payload.url && !payload.title && !payload.entryId && !payload.appUrl)) return;
+        const cache = readSummaryCache();
+        const now = Date.now();
+        const route = payload.appUrl ? getTimelineRouteInfo(payload.appUrl) : getTimelineRouteInfo(location.href);
+        const entryId = payload.entryId || route.entryId || "";
+        const key = makeSummaryKey(payload.url, payload.title, entryId, payload.appUrl);
+        cache[key] = Object.assign({}, payload, {
+            entryId,
+            version: summaryVersionKey(),
+            createdAt: payload.createdAt || now,
+            lastAccess: now
+        });
+        writeSummaryCache(cache);
+    }
+
+    function applyCachedSummary(item, btn, resultDiv, statusDiv, wrapper) {
+        if (!item || !item.summary) return false;
+        if (btn) { btn.disabled = false; btn.innerText = "重新生成"; }
+        if (resultDiv) {
+            resultDiv.style.display = "block";
+            const raw = item.url ? `${item.summary}\n\n---\n🔗 **原文链接**：[${item.url}](${item.url})` : item.summary;
+            resultDiv.innerHTML = _md(raw);
+        }
+        if (statusDiv) {
+            statusDiv.innerText = `✅ 已从本地缓存读取 · ${item.sourceLabel || "AI 总结"} · ${new Date(item.createdAt || Date.now()).toLocaleString()}`;
+        }
+        if (wrapper) {
+            const workText = item.text || "";
+            wrapper.__articleContext = {
+                title: item.title,
+                text: workText,
+                url: item.url,
+                truncated: !!item.truncated
+            };
+            wrapper.__summaryContent = item.summary;
+            wrapper.__chatHistory = [
+                { role: "system", content:
+                    "你是一个有用的文章助手。下面是用户正在阅读的文章。请基于这篇文章的内容回答用户的后续提问。所有信息已包含在下方文本中,你无法访问网络。\n\n" +
+                    `==== 文章标题 ====\n${item.title || "文章"}\n` +
+                    (item.url ? `==== 原文链接 ====\n${item.url}\n` : "") +
+                    `\n==== 文章正文 ====\n${workText}\n\n` +
+                    `==== 之前的 AI 总结 ====\n${item.summary}`
+                }
+            ];
+            const chatArea = wrapper.querySelector('.my-ai-chat-area');
+            if (chatArea) {
+                chatArea.style.display = 'block';
+                const histDiv = chatArea.querySelector('.my-ai-chat-history');
+                if (histDiv) histDiv.innerHTML = '';
+            }
+        }
+        return true;
+    }
+
+    function rememberPreloadArticle(article) {
+        if (!article || (!article.url && !article.title && !article.appUrl && !article.entryId)) return;
+        const title = String(article.title || "").trim();
+        const url = String(article.url || "").trim();
+        const appUrl = String(article.appUrl || "").trim();
+        const route = appUrl ? getTimelineRouteInfo(appUrl) : null;
+        const entryId = String(article.entryId || (route && route.entryId) || "").trim();
+        const text = stripHtmlToText(article.text || "");
+        if (!title && !url && !appUrl && !entryId) return;
+        const key = quickHash(url || appUrl || entryId || title);
+        const old = PRELOAD_ARTICLES.get(key) || {};
+        PRELOAD_ARTICLES.set(key, Object.assign({}, old, { title, url, appUrl, entryId, text: text || old.text || "", seenAt: Date.now() }));
+        PRELOAD_STATS.detected = PRELOAD_ARTICLES.size;
+    }
+
+    function extractArticleHintsFromObject(obj, depth) {
+        if (!obj || depth > 8) return;
+        if (Array.isArray(obj)) {
+            obj.slice(0, 80).forEach(v => extractArticleHintsFromObject(v, depth + 1));
+            return;
+        }
+        if (typeof obj !== "object") return;
+
+        const title = obj.title || obj.name || obj.entryTitle || obj.feedTitle || obj.articleTitle;
+        const url = obj.url || obj.originalUrl || obj.original_url || obj.externalUrl || obj.external_url || obj.targetUrl || obj.target_url || obj.link || obj.href || obj.sourceUrl || obj.source_url;
+        const text = obj.content || obj.description || obj.summary || obj.text || obj.plainText || obj.plain_text || obj.contentHTML || obj.contentHtml || obj.contentText || obj.readabilityContent;
+        const entryId = obj.id || obj.entryId || obj.entry_id || obj.entryID || obj.entry_id_str;
+        if (typeof title === "string" && title.trim().length > 3 && (typeof url === "string" || typeof text === "string" || entryId != null)) {
+            rememberPreloadArticle({
+                title,
+                url: typeof url === "string" && /^https?:\/\//.test(url) && !url.includes("app.folo.is") ? url : "",
+                appUrl: typeof url === "string" && url.includes("app.folo.is") ? url : "",
+                entryId,
+                text
+            });
+        }
+        Object.keys(obj).slice(0, 80).forEach(k => extractArticleHintsFromObject(obj[k], depth + 1));
+    }
+
+    function installNetworkArticleCapture() {
+        if (window.__foloAiNetworkCaptureInstalled) return;
+        window.__foloAiNetworkCaptureInstalled = true;
+        window.addEventListener("message", (event) => {
+            if (event.source !== window) return;
+            const data = event.data;
+            if (!data || data.type !== "FOLO_AI_PRELOAD_HINTS" || !Array.isArray(data.items)) return;
+            data.items.forEach(rememberPreloadArticle);
+            if (data.items.length) {
+                setPreloadStatus(`接口捕获到 ${data.items.length} 条文章线索`, "ok");
+                enqueuePreloadArticles();
+            }
+        });
+
+        try {
+            const script = document.createElement("script");
+            script.textContent = `(() => {
+                if (window.__foloAiPageCaptureInstalled) return;
+                window.__foloAiPageCaptureInstalled = true;
+                const strip = (v) => String(v || "").replace(/<[^>]+>/g, " ").replace(/\\s+/g, " ").trim();
+                const pick = (obj, names) => {
+                    for (const n of names) {
+                        if (obj && typeof obj[n] === "string" && obj[n].trim()) return obj[n];
+                    }
+                    return "";
+                };
+                const walk = (obj, depth, out) => {
+                    if (!obj || depth > 7 || out.length > 60) return;
+                    if (Array.isArray(obj)) { obj.slice(0, 80).forEach(v => walk(v, depth + 1, out)); return; }
+                    if (typeof obj !== "object") return;
+                    const title = pick(obj, ["title", "name", "entryTitle", "feedTitle", "articleTitle"]);
+                    const url = pick(obj, ["url", "originalUrl", "original_url", "externalUrl", "external_url", "targetUrl", "target_url", "link", "href", "sourceUrl", "source_url"]);
+                    const text = pick(obj, ["content", "description", "summary", "text", "plainText", "plain_text", "contentHTML", "contentHtml", "contentText", "readabilityContent"]);
+                    const entryId = obj.id || obj.entryId || obj.entry_id || obj.entryID || "";
+                    if (title && (url || text || entryId)) {
+                        out.push({
+                            title: strip(title).slice(0, 180),
+                            url: /^https?:\\/\\//.test(url) && !url.includes("app.folo.is") ? url : "",
+                            appUrl: url && url.includes("app.folo.is") ? url : "",
+                            entryId: String(entryId || ""),
+                            text: strip(text).slice(0, 30000)
+                        });
+                    }
+                    Object.keys(obj).slice(0, 80).forEach(k => walk(obj[k], depth + 1, out));
+                };
+                const emit = (json) => {
+                    try {
+                        const items = [];
+                        walk(json, 0, items);
+                        if (items.length) window.postMessage({ type: "FOLO_AI_PRELOAD_HINTS", items }, "*");
+                    } catch(e) {}
+                };
+                const oldFetch = window.fetch;
+                if (typeof oldFetch === "function") {
+                    window.fetch = function(...args) {
+                        return oldFetch.apply(this, args).then(resp => {
+                            try {
+                                const ctype = resp.headers && resp.headers.get && resp.headers.get("content-type");
+                                if (ctype && ctype.includes("json")) resp.clone().json().then(emit).catch(() => {});
+                            } catch(e) {}
+                            return resp;
+                        });
+                    };
+                }
+                const oldOpen = XMLHttpRequest.prototype.open;
+                const oldSend = XMLHttpRequest.prototype.send;
+                XMLHttpRequest.prototype.open = function(method, url) {
+                    this.__foloAiUrl = url;
+                    return oldOpen.apply(this, arguments);
+                };
+                XMLHttpRequest.prototype.send = function() {
+                    this.addEventListener("load", function() {
+                        try {
+                            const ctype = this.getResponseHeader && this.getResponseHeader("content-type");
+                            if (ctype && ctype.includes("json") && typeof this.responseText === "string") emit(JSON.parse(this.responseText));
+                        } catch(e) {}
+                    });
+                    return oldSend.apply(this, arguments);
+                };
+            })();`;
+            (document.documentElement || document.head || document.body).appendChild(script);
+            script.remove();
+            setPreloadStatus("已安装页面级接口监听", "ok");
+        } catch(e) {
+            setPreloadStatus("页面级接口监听安装失败,改用 DOM 扫描", "warn");
+        }
+
+        const originalFetch = window.fetch;
+        if (typeof originalFetch === "function") {
+            window.fetch = function(...args) {
+                return originalFetch.apply(this, args).then(resp => {
+                    try {
+                        const ctype = resp.headers && resp.headers.get && resp.headers.get("content-type");
+                        if (ctype && ctype.includes("json")) {
+                            resp.clone().json().then(data => extractArticleHintsFromObject(data, 0)).catch(() => {});
+                        }
+                    } catch(e) {}
+                    return resp;
+                });
+            };
+        }
+
+        const originalOpen = XMLHttpRequest.prototype.open;
+        const originalSend = XMLHttpRequest.prototype.send;
+        XMLHttpRequest.prototype.open = function(method, url) {
+            this.__foloAiUrl = url;
+            return originalOpen.apply(this, arguments);
+        };
+        XMLHttpRequest.prototype.send = function() {
+            this.addEventListener("load", function() {
+                try {
+                    const ctype = this.getResponseHeader && this.getResponseHeader("content-type");
+                    if (ctype && ctype.includes("json") && typeof this.responseText === "string") {
+                        extractArticleHintsFromObject(JSON.parse(this.responseText), 0);
+                    }
+                } catch(e) {}
+            });
+            return originalSend.apply(this, arguments);
+        };
+    }
+
+    function scanListDomForPreloadArticles() {
+        if (!getPreloadEnabled()) return;
+        const route = getTimelineRouteInfo(location.href);
+        if (!route.isTimeline || !route.scopePath) {
+            setPreloadStatus("当前不是 Folo timeline 页面,跳过扫描", "warn");
+            return;
+        }
+        let found = 0;
+        const anchors = Array.from(document.querySelectorAll('a[href]'))
+            .filter(a => a.offsetParent)
+            .filter(a => sameTimelineScope(a.href, route.scopePath))
+            .slice(0, 120);
+        anchors.forEach(a => {
+            const href = a.href || "";
+            const title = getTitleFromRow(a);
+            const rowText = getVisibleRowText(a);
+            const itemRoute = getTimelineRouteInfo(href);
+            rememberPreloadArticle({ title, appUrl: href, entryId: itemRoute.entryId, text: rowText });
+            found++;
+        });
+        if (found) setPreloadStatus(`当前列表扫描到 ${found} 篇 · ${route.scopePath}`, "ok");
+        else setPreloadStatus(`当前列表未扫到文章链接 · ${route.scopePath}`, "warn");
+    }
+
+    function enqueuePreloadArticles() {
+        if (!getPreloadEnabled()) return;
+        const limit = getPreloadLimit();
+        const candidates = Array.from(PRELOAD_ARTICLES.values())
+            .filter(item => {
+                const route = getTimelineRouteInfo(location.href);
+                if (!route.scopePath) return true;
+                if (!item.appUrl) return false;
+                return getTimelineRouteInfo(item.appUrl).scopePath === route.scopePath;
+            })
+            .sort((a, b) => (b.seenAt || 0) - (a.seenAt || 0))
+            .slice(0, limit);
+        candidates.forEach(item => {
+            const key = makeSummaryKey(item.url, item.title, item.entryId, item.appUrl);
+            if (findSummaryCache(item.url, item.title, item.entryId, item.appUrl)) return;
+            if ((PRELOAD_FAILED_UNTIL.get(key) || 0) > Date.now()) return;
+            if (PRELOAD_RUNNING.has(key) || PRELOAD_QUEUE.some(q => q.key === key)) return;
+            PRELOAD_QUEUE.push({ key, item });
+        });
+        PRELOAD_STATS.queued = PRELOAD_QUEUE.length;
+        PRELOAD_STATS.running = PRELOAD_RUNNING.size;
+        updatePreloadPanel();
+        pumpPreloadQueue();
+    }
+
+    function pumpPreloadQueue() {
+        if (!getPreloadEnabled()) return;
+        const maxConcurrency = getPreloadConcurrency();
+        while (PRELOAD_RUNNING.size < maxConcurrency && PRELOAD_QUEUE.length) {
+            const next = PRELOAD_QUEUE.shift();
+            if (!next || PRELOAD_RUNNING.has(next.key) || PRELOAD_TASKS.has(next.key)) continue;
+            PRELOAD_RUNNING.add(next.key);
+            PRELOAD_STATS.queued = PRELOAD_QUEUE.length;
+            PRELOAD_STATS.running = PRELOAD_RUNNING.size;
+            const taskTitle = next.item.title || next.item.url || next.item.entryId || "文章";
+            const taskToken = preloadClearToken;
+            setPreloadStatus(`开始：${taskTitle}`, "info");
+
+            const task = withTimeout(preloadOneArticle(next.item, taskToken), PRELOAD_TASK_TIMEOUT_MS, taskTitle);
+            PRELOAD_TASKS.set(next.key, task);
+            task
+                .then(payload => {
+                    if (taskToken !== preloadClearToken) return payload;
+                    if (payload && payload.summary) {
+                        PRELOAD_STATS.success += 1;
+                        setPreloadStatus(`完成：${payload.title || taskTitle}`, "ok");
+                    }
+                    return payload;
+                })
+                .catch(err => {
+                    if (taskToken !== preloadClearToken) return;
+                    PRELOAD_FAILED_UNTIL.set(next.key, Date.now() + 1000 * 60 * 30);
+                    PRELOAD_STATS.failed += 1;
+                    const msg = err && err.message ? err.message : String(err);
+                    setPreloadStatus(`${/^超时/.test(msg) ? "超时" : "失败"}：${taskTitle} · ${msg}`, "err");
+                    console.warn("[Folo增强] 预加载失败：", err);
+                })
+                .finally(() => {
+                    PRELOAD_RUNNING.delete(next.key);
+                    PRELOAD_TASKS.delete(next.key);
+                    PRELOAD_STATS.queued = PRELOAD_QUEUE.length;
+                    PRELOAD_STATS.running = PRELOAD_RUNNING.size;
+                    updatePreloadPanel();
+                    clearTimeout(preloadPumpTimer);
+                    preloadPumpTimer = setTimeout(pumpPreloadQueue, 1200);
+                });
+        }
+    }
+
+    async function preloadOneArticle(item, taskToken) {
+        let title = item.title || "文章";
+        let originalUrl = item.url || "";
+        const appUrl = item.appUrl || "";
+        const route = getTimelineRouteInfo(appUrl);
+        const entryId = item.entryId || route.entryId || "";
+        if (findSummaryCache(originalUrl, title, entryId, appUrl)) return;
+
+        let sourceLabel = "Folo 列表预览";
+        let text = item.text || "";
+        if (getPreloadIframeEnabled() && (!originalUrl || text.length < 120) && appUrl) {
+            try {
+                const detail = await preloadDetailFromFolo(appUrl);
+                if (taskToken !== preloadClearToken) throw new Error("任务已清理");
+                if (detail) {
+                    title = detail.title || title;
+                    originalUrl = detail.originalUrl || originalUrl;
+                    if (detail.text && detail.text.length > text.length) text = detail.text;
+                    sourceLabel = "Folo 详情页预取";
+                }
+            } catch(e) {
+                if (!originalUrl && (!text || text.length < 80)) throw e;
+            }
+        }
+        if (taskToken !== preloadClearToken) throw new Error("任务已清理");
+        if (getFetchFulltextEnabled() && originalUrl) {
+            try {
+                const result = await smartFetchArticle(originalUrl, getExtractStrategies());
+                if (taskToken !== preloadClearToken) throw new Error("任务已清理");
+                if (result && result.text && result.text.length >= Math.max(200, text.length * 0.8)) {
+                    text = result.text;
+                    sourceLabel = `${result.method}（预加载）`;
+                }
+            } catch(e) {
+                if (!text || text.length < 80) throw e;
+            }
+        }
+        if (!text || text.length < 80) {
+            throw new Error(`正文过短：${text ? text.length : 0} 字`);
+        }
+        const payload = await summarizeForCache({
+            title,
+            text,
+            url: originalUrl,
+            appUrl,
+            entryId,
+            sourceLabel
+        });
+        if (taskToken !== preloadClearToken) throw new Error("任务已清理");
+        saveSummaryCache(payload);
+        console.log("[Folo增强] 已预加载总结：", title);
+        return payload;
+    }
+
+    function startPreloadScheduler() {
+        if (preloadScanTimer) return;
+        installNetworkArticleCapture();
+        preloadScanTimer = setInterval(() => {
+            ensurePreloadPanel();
+            scanListDomForPreloadArticles();
+            enqueuePreloadArticles();
+        }, 4000);
+        setTimeout(() => {
+            ensurePreloadPanel();
+            scanListDomForPreloadArticles();
+            enqueuePreloadArticles();
+        }, 1500);
+    }
+
+    function ensurePreloadPanel() {
+        if (!/^\/timeline/.test(location.pathname)) return;
+        if (!document.body) return;
+        let panel = document.getElementById("my-ai-preload-panel");
+        if (!panel) {
+            panel = document.createElement("div");
+            panel.id = "my-ai-preload-panel";
+            panel.innerHTML = `
+                <div class="preload-head">
+                    <span>⚡ AI 预加载</span>
+                    <span class="preload-mini"></span>
+                    <button class="preload-toggle" title="收起/展开">收起</button>
+                </div>
+                <div class="preload-body">
+                    <div class="preload-grid">
+                        <span>发现 <b data-k="detected">0</b></span>
+                        <span>排队 <b data-k="queued">0</b></span>
+                        <span>运行 <b data-k="running">0</b></span>
+                        <span>成功 <b data-k="success">0</b></span>
+                        <span>失败 <b data-k="failed">0</b></span>
+                        <span>缓存 <b data-k="cache">0</b></span>
+                        <span>并发 <b data-k="concurrency">0</b></span>
+                    </div>
+                    <div class="preload-scope"></div>
+                    <div class="preload-actions">
+                        <button data-act="scan">扫描</button>
+                        <button data-act="overview">总览</button>
+                        <button data-act="toggle"></button>
+                        <button data-act="clear-cache">清理</button>
+                        <button data-act="settings">设置</button>
+                    </div>
+                    <div class="preload-section-title">运行日志</div>
+                    <div class="preload-log"></div>
+                </div>
+                <div class="preload-resize-handle" title="从左下角锚定拉伸"></div>`;
+            document.body.appendChild(panel);
+            applyPreloadPanelLayout(panel);
+            enablePreloadPanelDragResize(panel);
+            panel.querySelector('.preload-toggle').onclick = () => {
+                const willMinimize = !panel.classList.contains('is-minimized');
+                if (willMinimize) {
+                    const rect = panel.getBoundingClientRect();
+                    preloadPanelExpandedLayout = {
+                        left: Math.round(rect.left),
+                        bottom: Math.round((window.innerHeight || document.documentElement.clientHeight) - rect.bottom),
+                        width: Math.round(rect.width),
+                        height: Math.round(rect.height)
+                    };
+                    savePreloadPanelLayout(panel);
+                    panel.classList.add('is-minimized');
+                    panel.style.width = "360px";
+                    panel.style.height = "92px";
+                    panel.querySelector('.preload-toggle').innerText = '展开';
+                } else {
+                    panel.classList.remove('is-minimized');
+                    panel.querySelector('.preload-toggle').innerText = '收起';
+                    applyPreloadPanelLayout(panel, preloadPanelExpandedLayout);
+                }
+            };
+            panel.querySelector('[data-act="scan"]').onclick = () => {
+                if (!getPreloadEnabled()) setPreloadEnabled(true);
+                setPreloadStatus("手动扫描中", "info");
+                scanListDomForPreloadArticles();
+                enqueuePreloadArticles();
+                updatePreloadPanel();
+            };
+            panel.querySelector('[data-act="overview"]').onclick = runCurrentListOverview;
+            panel.querySelector('[data-act="toggle"]').onclick = () => {
+                setPreloadEnabled(!getPreloadEnabled());
+                setPreloadStatus(getPreloadEnabled() ? "后台预总结已开启" : "后台预总结已关闭", "info");
+                updatePreloadPanel();
+            };
+            panel.querySelector('[data-act="clear-cache"]').onclick = () => {
+                if (!confirm("确定清空缓存、发现列表、排队列表和运行状态？正在请求中的网络调用无法强制中断，但返回后不会再写入缓存。")) return;
+                resetPreloadState(true);
+            };
+            panel.querySelector('[data-act="settings"]').onclick = showSettingsModal;
+        }
+        updatePreloadPanel();
+    }
+
+    function applyPreloadPanelLayout(panel, overrideLayout) {
+        const layout = overrideLayout || GM_getValue("ai_preload_panel_layout", null);
+        if (!layout || typeof layout !== "object") return;
+        const vw = window.innerWidth || document.documentElement.clientWidth || 1200;
+        const vh = window.innerHeight || document.documentElement.clientHeight || 800;
+        if (layout.width) panel.style.width = Math.max(300, Math.min(Number(layout.width), vw - 20)) + "px";
+        if (layout.height) panel.style.height = Math.max(260, Math.min(Number(layout.height), vh - 20)) + "px";
+        if (layout.left != null && layout.bottom != null) {
+            panel.style.left = Math.max(8, Math.min(Number(layout.left), vw - 80)) + "px";
+            panel.style.bottom = Math.max(8, Math.min(Number(layout.bottom), vh - 48)) + "px";
+            panel.style.top = "auto";
+        } else if (layout.left != null && layout.top != null) {
+            const h = Number(layout.height) || panel.getBoundingClientRect().height || 360;
+            const bottom = Math.max(8, vh - Number(layout.top) - h);
+            panel.style.left = Math.max(8, Math.min(Number(layout.left), vw - 80)) + "px";
+            panel.style.bottom = Math.min(bottom, vh - 48) + "px";
+            panel.style.top = "auto";
+        }
+    }
+
+    function savePreloadPanelLayout(panel) {
+        if (panel.classList.contains("is-minimized")) return;
+        const rect = panel.getBoundingClientRect();
+        const vh = window.innerHeight || document.documentElement.clientHeight || 800;
+        GM_setValue("ai_preload_panel_layout", {
+            left: Math.round(rect.left),
+            bottom: Math.round(vh - rect.bottom),
+            width: Math.round(rect.width),
+            height: Math.round(rect.height)
+        });
+    }
+
+    function enablePreloadPanelDragResize(panel) {
+        if (panel.dataset.dragResizeReady === "true") return;
+        panel.dataset.dragResizeReady = "true";
+        const head = panel.querySelector(".preload-head");
+        const resizeHandle = panel.querySelector(".preload-resize-handle");
+        let dragging = false;
+        let resizing = false;
+        let startX = 0, startY = 0, startLeft = 0, startBottom = 0, startWidth = 0, startHeight = 0;
+        head.addEventListener("mousedown", (e) => {
+            if (e.button !== 0 || e.target.closest('button, input, textarea, select, a')) return;
+            if (panel.classList.contains("is-minimized") && e.detail > 1) return;
+            dragging = true;
+            const rect = panel.getBoundingClientRect();
+            const vh = window.innerHeight || document.documentElement.clientHeight;
+            startX = e.clientX;
+            startY = e.clientY;
+            startLeft = rect.left;
+            startBottom = vh - rect.bottom;
+            panel.style.left = rect.left + "px";
+            panel.style.bottom = startBottom + "px";
+            panel.style.top = "auto";
+            document.body.style.userSelect = "none";
+            e.preventDefault();
+        });
+        if (resizeHandle) {
+            resizeHandle.addEventListener("mousedown", (e) => {
+                if (e.button !== 0 || panel.classList.contains("is-minimized")) return;
+                resizing = true;
+                const rect = panel.getBoundingClientRect();
+                const vh = window.innerHeight || document.documentElement.clientHeight;
+                startX = e.clientX;
+                startY = e.clientY;
+                startWidth = rect.width;
+                startHeight = rect.height;
+                startBottom = vh - rect.bottom;
+                panel.style.left = rect.left + "px";
+                panel.style.bottom = startBottom + "px";
+                panel.style.top = "auto";
+                document.body.style.userSelect = "none";
+                e.preventDefault();
+                e.stopPropagation();
+            });
+        }
+        window.addEventListener("mousemove", (e) => {
+            const vw = window.innerWidth || document.documentElement.clientWidth;
+            const vh = window.innerHeight || document.documentElement.clientHeight;
+            if (dragging) {
+                const rect = panel.getBoundingClientRect();
+                const left = Math.max(8, Math.min(startLeft + e.clientX - startX, vw - rect.width - 8));
+                const bottom = Math.max(8, Math.min(startBottom - (e.clientY - startY), vh - 48));
+                panel.style.left = left + "px";
+                panel.style.bottom = bottom + "px";
+                panel.style.top = "auto";
+            }
+            if (resizing) {
+                const maxWidth = vw - (parseFloat(panel.style.left) || panel.getBoundingClientRect().left) - 8;
+                const maxHeight = vh - startBottom - 8;
+                const width = Math.max(300, Math.min(startWidth + (e.clientX - startX), maxWidth));
+                const height = Math.max(220, Math.min(startHeight - (e.clientY - startY), maxHeight));
+                panel.style.width = width + "px";
+                panel.style.height = height + "px";
+            }
+        });
+        window.addEventListener("mouseup", () => {
+            if (!dragging && !resizing) return;
+            dragging = false;
+            resizing = false;
+            document.body.style.userSelect = "";
+            savePreloadPanelLayout(panel);
+        });
+    }
+
+    function updatePreloadPanel() {
+        clearTimeout(preloadPanelTimer);
+        preloadPanelTimer = setTimeout(() => {
+            const panel = document.getElementById("my-ai-preload-panel");
+            if (!panel) return;
+            PRELOAD_STATS.detected = PRELOAD_ARTICLES.size;
+            PRELOAD_STATS.queued = PRELOAD_QUEUE.length;
+            PRELOAD_STATS.running = PRELOAD_RUNNING.size;
+            panel.querySelector('[data-k="detected"]').innerText = PRELOAD_STATS.detected;
+            panel.querySelector('[data-k="queued"]').innerText = PRELOAD_STATS.queued;
+            panel.querySelector('[data-k="running"]').innerText = PRELOAD_STATS.running;
+            panel.querySelector('[data-k="success"]').innerText = PRELOAD_STATS.success;
+            panel.querySelector('[data-k="failed"]').innerText = PRELOAD_STATS.failed;
+            panel.querySelector('[data-k="cache"]').innerText = getCacheCount();
+            panel.querySelector('[data-k="concurrency"]').innerText = getPreloadConcurrency();
+            const mini = panel.querySelector('.preload-mini');
+            if (mini) {
+                mini.innerText = `运行 ${PRELOAD_STATS.running} · 排队 ${PRELOAD_STATS.queued} · 成功 ${PRELOAD_STATS.success} · 缓存 ${getCacheCount()}`;
+            }
+            const route = getTimelineRouteInfo(location.href);
+            const scopeEl = panel.querySelector('.preload-scope');
+            if (scopeEl) scopeEl.innerText = route.scopePath ? `当前列表：${route.scopePath}` : "当前列表：未识别";
+            panel.querySelector('[data-act="toggle"]').innerText = getPreloadEnabled() ? "暂停" : "开启";
+            panel.querySelector('.preload-log').innerHTML = PRELOAD_STATS.logs.map(log =>
+                `<div class="preload-log-row ${log.level || "info"}"><span>${log.time}</span>${String(log.text || "").replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]))}</div>`
+            ).join("");
+        }, 50);
+    }
+
+    function getCurrentListEntriesFromDom() {
+        const route = getTimelineRouteInfo(location.href);
+        if (!route.isTimeline || !route.scopePath) return [];
+        const seen = new Set();
+        return Array.from(document.querySelectorAll('a[href]'))
+            .filter(a => a.offsetParent)
+            .filter(a => sameTimelineScope(a.href, route.scopePath))
+            .map(a => {
+                const itemRoute = getTimelineRouteInfo(a.href);
+                return {
+                    title: getTitleFromRow(a),
+                    appUrl: a.href,
+                    entryId: itemRoute.entryId
+                };
+            })
+            .filter(item => {
+                if (!item.entryId || seen.has(item.entryId)) return false;
+                seen.add(item.entryId);
+                return true;
+            });
+    }
+
+    function collectCachedListSummaries() {
+        const entries = getCurrentListEntriesFromDom();
+        const cached = [];
+        entries.forEach(item => {
+            const cache = findSummaryCache("", item.title, item.entryId, item.appUrl);
+            if (cache && cache.summary) cached.push(Object.assign({}, cache, item));
+        });
+        return { entries, cached };
+    }
+
+    function showListOverviewResult(markdown, meta) {
+        const panel = document.getElementById("my-ai-preload-panel");
+        if (!panel) return;
+        let box = panel.querySelector(".preload-overview");
+        if (!box) {
+            box = document.createElement("div");
+            box.className = "preload-overview";
+            panel.querySelector(".preload-body").appendChild(box);
+        }
+        box.innerHTML = `
+            <div class="preload-overview-head">
+                <span>列表总览 ${meta ? `(${meta.cached}/${meta.total})` : ""}</span>
+                <button data-act="copy-overview">复制</button>
+            </div>
+            <div class="preload-overview-content">${_md(markdown)}</div>`;
+        box.querySelector('[data-act="copy-overview"]').onclick = () => {
+            GM_setClipboard(markdown);
+            setPreloadStatus("已复制列表总览", "ok");
+        };
+    }
+
+    function runCurrentListOverview() {
+        const config = getActiveConfig();
+        if (!config.apiKey) {
+            alert("请先配置 API Key");
+            showSettingsModal();
+            return;
+        }
+        scanListDomForPreloadArticles();
+        const { entries, cached } = collectCachedListSummaries();
+        if (!entries.length) {
+            setPreloadStatus("当前列表没有扫描到文章", "warn");
+            return;
+        }
+        if (!cached.length) {
+            setPreloadStatus(`当前列表 ${entries.length} 篇,暂无可用缓存摘要`, "warn");
+            return;
+        }
+        const maxItems = 30;
+        const useItems = cached.slice(0, maxItems);
+        const joined = useItems.map((item, idx) => {
+            const link = item.url || item.appUrl || "";
+            return `#${idx + 1}\n标题: ${item.title || "无标题"}\n文章ID: ${item.entryId || ""}\n链接: ${link}\n摘要:\n${String(item.summary || "").slice(0, 2500)}`;
+        }).join("\n\n---\n\n");
+        const prompt =
+            `请基于下面这些“已缓存的单篇原文摘要”,生成当前 RSS 列表总览。` +
+            `\n要求用中文,直接给结论,不要解释流程。` +
+            `\n输出结构：` +
+            `\n1. 核心结论` +
+            `\n2. 值得优先看的文章 Top 5（说明原因）` +
+            `\n3. 主题分组` +
+            `\n4. 关键信号/风险/机会` +
+            `\n5. 一句话速览列表` +
+            `\n\n当前列表共 ${entries.length} 篇,已缓存 ${cached.length} 篇,本次使用 ${useItems.length} 篇。\n\n${joined}`;
+
+        const panel = document.getElementById("my-ai-preload-panel");
+        const btn = panel && panel.querySelector('[data-act="overview"]');
+        if (btn) { btn.disabled = true; btn.innerText = "生成中..."; }
+        setPreloadStatus(`正在生成列表总览：使用 ${useItems.length}/${entries.length} 篇缓存`, "info");
+        callAIChat(
+            [
+                { role: "system", content: "你是 RSS 信息分析助手,擅长把多篇文章摘要合并成高密度列表总览。" },
+                { role: "user", content: prompt }
+            ],
+            (content) => {
+                if (btn) { btn.disabled = false; btn.innerText = "总览"; }
+                showListOverviewResult(content, { cached: cached.length, total: entries.length });
+                setPreloadStatus("列表总览生成完成", "ok");
+            },
+            (err) => {
+                if (btn) { btn.disabled = false; btn.innerText = "总览"; }
+                setPreloadStatus(`列表总览失败：${err.message || err}`, "err");
+            }
+        );
     }
 
     // ==================== 3.5. 坚果云 WebDAV 同步 ====================
@@ -482,6 +1440,10 @@
             currentProfileId: getCurrentProfileId(),
             extractStrategies: getExtractStrategies(),
             autoSummarize: getAutoSummarizeEnabled(),
+            preloadEnabled: getPreloadEnabled(),
+            preloadLimit: getPreloadLimit(),
+            preloadConcurrency: getPreloadConcurrency(),
+            preloadIframeEnabled: getPreloadIframeEnabled(),
             fetchFulltext: getFetchFulltextEnabled(),
             maxChars: getMaxChars(),
             flomoApiUrl: getFlomoApiUrl()
@@ -495,6 +1457,10 @@
         }
         if (Array.isArray(remote.extractStrategies)) setExtractStrategies(remote.extractStrategies);
         if (typeof remote.autoSummarize === 'boolean') setAutoSummarizeEnabled(remote.autoSummarize);
+        if (typeof remote.preloadEnabled === 'boolean') setPreloadEnabled(remote.preloadEnabled);
+        if (typeof remote.preloadLimit === 'number') setPreloadLimit(remote.preloadLimit);
+        if (typeof remote.preloadConcurrency === 'number') setPreloadConcurrency(remote.preloadConcurrency);
+        if (typeof remote.preloadIframeEnabled === 'boolean') setPreloadIframeEnabled(remote.preloadIframeEnabled);
         if (typeof remote.fetchFulltext === 'boolean') setFetchFulltextEnabled(remote.fetchFulltext);
         if (typeof remote.maxChars === 'number') setMaxChars(remote.maxChars);
         if (typeof remote.flomoApiUrl === 'string') setFlomoApiUrl(remote.flomoApiUrl);
@@ -588,6 +1554,10 @@
                 currentProfileId: local.currentProfileId || remote.currentProfileId,
                 extractStrategies: local.extractStrategies || remote.extractStrategies,
                 autoSummarize: typeof local.autoSummarize === 'boolean' ? local.autoSummarize : remote.autoSummarize,
+                preloadEnabled: typeof local.preloadEnabled === 'boolean' ? local.preloadEnabled : remote.preloadEnabled,
+                preloadLimit: typeof local.preloadLimit === 'number' ? local.preloadLimit : remote.preloadLimit,
+                preloadConcurrency: typeof local.preloadConcurrency === 'number' ? local.preloadConcurrency : remote.preloadConcurrency,
+                preloadIframeEnabled: typeof local.preloadIframeEnabled === 'boolean' ? local.preloadIframeEnabled : remote.preloadIframeEnabled,
                 fetchFulltext: typeof local.fetchFulltext === 'boolean' ? local.fetchFulltext : remote.fetchFulltext,
                 maxChars: typeof local.maxChars === 'number' ? local.maxChars : remote.maxChars,
                 flomoApiUrl: local.flomoApiUrl || remote.flomoApiUrl || ""
@@ -608,6 +1578,10 @@
             currentProfileId: remote.currentProfileId || local.currentProfileId,
             extractStrategies: remote.extractStrategies || local.extractStrategies,
             autoSummarize: typeof remote.autoSummarize === 'boolean' ? remote.autoSummarize : local.autoSummarize,
+            preloadEnabled: typeof remote.preloadEnabled === 'boolean' ? remote.preloadEnabled : local.preloadEnabled,
+            preloadLimit: typeof remote.preloadLimit === 'number' ? remote.preloadLimit : local.preloadLimit,
+            preloadConcurrency: typeof remote.preloadConcurrency === 'number' ? remote.preloadConcurrency : local.preloadConcurrency,
+            preloadIframeEnabled: typeof remote.preloadIframeEnabled === 'boolean' ? remote.preloadIframeEnabled : local.preloadIframeEnabled,
             fetchFulltext: typeof remote.fetchFulltext === 'boolean' ? remote.fetchFulltext : local.fetchFulltext,
             maxChars: typeof remote.maxChars === 'number' ? remote.maxChars : local.maxChars,
             flomoApiUrl: remote.flomoApiUrl || local.flomoApiUrl || ""
@@ -632,6 +1606,16 @@
         setAutoSummarizeEnabled(!getAutoSummarizeEnabled());
         alert("已切换。当前：" + (getAutoSummarizeEnabled() ? "开启自动总结" : "关闭自动总结"));
     });
+    GM_registerMenuCommand("⚡ 切换『后台预总结』(当前: " + (getPreloadEnabled() ? "开" : "关") + ")", () => {
+        setPreloadEnabled(!getPreloadEnabled());
+        alert("已切换。当前：" + (getPreloadEnabled() ? "开启后台预总结" : "关闭后台预总结"));
+    });
+    GM_registerMenuCommand("🧹 清空 AI 总结缓存", () => {
+        if (confirm("确定清空本地 AI 总结缓存？")) {
+            GM_setValue(SUMMARY_CACHE_KEY, {});
+            alert("已清空缓存");
+        }
+    });
 
     // ==================== 4. 样式 ====================
     GM_addStyle(`
@@ -653,6 +1637,258 @@
         .my-ai-setting-icon { cursor: pointer; color: #7c3aed; font-size: 1.1rem; opacity: 0.7; margin-left: 6px; }
         .my-ai-content { font-size: 0.95rem; line-height: 1.7; padding-top: 0.8rem; border-top: 1px dashed rgba(139, 92, 246, 0.3); margin-top: 8px; }
         .my-ai-status { font-size: 0.8rem; color: #888; margin-top: 4px; }
+
+        #my-ai-preload-panel {
+            position: fixed;
+            left: 18px;
+            bottom: 18px;
+            z-index: 99998;
+            width: 380px;
+            min-width: 300px;
+            min-height: 220px;
+            max-width: calc(100vw - 36px);
+            max-height: calc(100vh - 36px);
+            border: 1px solid rgba(139, 92, 246, 0.35);
+            border-radius: 14px;
+            background: rgba(255, 255, 255, 0.94);
+            box-shadow: 0 10px 30px rgba(15, 23, 42, 0.16);
+            color: #1f2937;
+            overflow: auto;
+            resize: none;
+            backdrop-filter: blur(10px);
+            font-size: 12px;
+        }
+        #my-ai-preload-panel .preload-resize-handle {
+            position: absolute;
+            top: 0;
+            right: 0;
+            width: 18px;
+            height: 18px;
+            cursor: nesw-resize;
+            z-index: 2;
+        }
+        #my-ai-preload-panel .preload-resize-handle::after {
+            content: "";
+            position: absolute;
+            top: 5px;
+            right: 5px;
+            width: 7px;
+            height: 7px;
+            border-top: 2px solid rgba(124, 58, 237, 0.55);
+            border-right: 2px solid rgba(124, 58, 237, 0.55);
+            border-radius: 1px;
+        }
+        .dark #my-ai-preload-panel {
+            background: rgba(17, 24, 39, 0.94);
+            color: #e5e7eb;
+            border-color: rgba(139, 92, 246, 0.5);
+        }
+        .dark #my-ai-preload-panel .preload-grid b { color: #f3f4f6; }
+        .dark #my-ai-preload-panel .preload-log {
+            background: rgba(15, 23, 42, 0.72);
+            border-color: rgba(139, 92, 246, 0.22);
+        }
+        .dark #my-ai-preload-panel .preload-overview {
+            background: rgba(15, 23, 42, 0.62);
+            border-color: rgba(139, 92, 246, 0.26);
+        }
+        #my-ai-preload-panel .preload-head {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px 12px;
+            font-weight: 700;
+            background: linear-gradient(90deg, rgba(124,58,237,0.11), rgba(37,99,235,0.07));
+            gap: 8px;
+            border-bottom: 1px solid rgba(139, 92, 246, 0.14);
+            cursor: move;
+            user-select: none;
+        }
+        #my-ai-preload-panel .preload-mini {
+            flex: 1;
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            text-align: right;
+            font-size: 11px;
+            font-weight: 500;
+            color: #64748b;
+        }
+        #my-ai-preload-panel .preload-toggle {
+            border: 1px solid rgba(139, 92, 246, 0.25);
+            background: rgba(139, 92, 246, 0.10);
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: 700;
+            color: inherit;
+            min-width: 54px;
+            height: 28px;
+            border-radius: 999px;
+            padding: 0 10px;
+            line-height: 26px;
+            text-align: center;
+            flex: 0 0 auto;
+        }
+        #my-ai-preload-panel .preload-toggle:hover {
+            background: rgba(139, 92, 246, 0.18);
+            border-color: rgba(139, 92, 246, 0.4);
+        }
+        #my-ai-preload-panel.is-minimized {
+            min-height: 92px;
+            resize: none;
+        }
+        #my-ai-preload-panel.is-minimized .preload-resize-handle {
+            display: none;
+        }
+        #my-ai-preload-panel.is-minimized .preload-body {
+            padding: 8px 10px 10px;
+            max-height: none;
+            overflow: hidden;
+        }
+        #my-ai-preload-panel.is-minimized .preload-grid,
+        #my-ai-preload-panel.is-minimized .preload-scope,
+        #my-ai-preload-panel.is-minimized .preload-actions,
+        #my-ai-preload-panel.is-minimized .preload-overview {
+            display: none;
+        }
+        #my-ai-preload-panel.is-minimized .preload-section-title {
+            display: none;
+        }
+        #my-ai-preload-panel.is-minimized .preload-log {
+            max-height: 34px;
+            padding: 5px 8px;
+            border-radius: 9px;
+            overflow: hidden;
+        }
+        #my-ai-preload-panel.is-minimized .preload-log-row {
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            padding: 0;
+        }
+        #my-ai-preload-panel .preload-body {
+            padding: 12px;
+            max-height: min(720px, calc(100vh - 120px));
+            overflow-y: auto;
+        }
+        #my-ai-preload-panel .preload-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 6px;
+            margin-bottom: 10px;
+        }
+        #my-ai-preload-panel .preload-grid span {
+            background: rgba(139, 92, 246, 0.08);
+            border: 1px solid rgba(139, 92, 246, 0.12);
+            border-radius: 8px;
+            padding: 6px 7px;
+            white-space: nowrap;
+            color: #64748b;
+            font-size: 11px;
+        }
+        #my-ai-preload-panel .preload-grid b {
+            display: block;
+            margin-top: 2px;
+            color: #111827;
+            font-size: 14px;
+            line-height: 1.1;
+        }
+        #my-ai-preload-panel .preload-scope {
+            margin: 0 0 10px;
+            color: #64748b;
+            font-size: 11px;
+            word-break: break-all;
+        }
+        #my-ai-preload-panel .preload-actions {
+            display: grid;
+            grid-template-columns: repeat(5, minmax(0, 1fr));
+            gap: 6px;
+            margin-bottom: 10px;
+        }
+        #my-ai-preload-panel .preload-actions button {
+            border: 1px solid rgba(139, 92, 246, 0.25);
+            background: rgba(139, 92, 246, 0.08);
+            color: inherit;
+            border-radius: 8px;
+            padding: 7px 4px;
+            cursor: pointer;
+            font-size: 12px;
+            white-space: nowrap;
+        }
+        #my-ai-preload-panel .preload-section-title {
+            font-size: 11px;
+            font-weight: 700;
+            color: #64748b;
+            margin: 2px 0 6px;
+        }
+        #my-ai-preload-panel .preload-log {
+            max-height: 96px;
+            overflow-y: auto;
+            border: 1px solid rgba(139, 92, 246, 0.12);
+            border-radius: 10px;
+            padding: 6px 8px;
+            background: rgba(248, 250, 252, 0.78);
+        }
+        #my-ai-preload-panel .preload-log-row {
+            line-height: 1.35;
+            padding: 3px 0;
+            word-break: break-word;
+            color: #64748b;
+        }
+        #my-ai-preload-panel .preload-log-row span {
+            opacity: 0.65;
+            margin-right: 5px;
+        }
+        #my-ai-preload-panel .preload-log-row.ok { color: #059669; }
+        #my-ai-preload-panel .preload-log-row.warn { color: #b45309; }
+        #my-ai-preload-panel .preload-log-row.err { color: #dc2626; }
+        #my-ai-preload-panel .preload-overview {
+            margin-top: 10px;
+            border: 1px solid rgba(139, 92, 246, 0.14);
+            border-radius: 12px;
+            padding: 9px 10px;
+            background: rgba(255, 255, 255, 0.66);
+        }
+        #my-ai-preload-panel .preload-overview-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            margin-bottom: 6px;
+            font-weight: 700;
+            color: #4c1d95;
+        }
+        .dark #my-ai-preload-panel .preload-overview-head { color: #c4b5fd; }
+        #my-ai-preload-panel .preload-overview-head button {
+            border: 1px solid rgba(139, 92, 246, 0.25);
+            background: rgba(139, 92, 246, 0.08);
+            color: inherit;
+            border-radius: 7px;
+            padding: 3px 8px;
+            cursor: pointer;
+            font-size: 11px;
+        }
+        #my-ai-preload-panel .preload-overview-content {
+            max-height: 360px;
+            overflow-y: auto;
+            line-height: 1.55;
+            font-size: 12px;
+            color: #334155;
+            padding-right: 4px;
+        }
+        .dark #my-ai-preload-panel .preload-overview-content { color: #d1d5db; }
+        #my-ai-preload-panel .preload-overview-content h1,
+        #my-ai-preload-panel .preload-overview-content h2,
+        #my-ai-preload-panel .preload-overview-content h3 {
+            font-size: 13px;
+            margin: 8px 0 4px;
+        }
+        #my-ai-preload-panel .preload-overview-content p,
+        #my-ai-preload-panel .preload-overview-content ul,
+        #my-ai-preload-panel .preload-overview-content ol {
+            margin: 5px 0;
+        }
 
         .my-ai-chat-area { margin-top: 12px; padding-top: 10px; border-top: 1px dashed rgba(139,92,246,0.3); display: none; }
         .my-ai-chat-history { max-height: 400px; overflow-y: auto; margin-bottom: 8px; }
@@ -886,6 +2122,19 @@
                     </div>
 
                     <div class="my-input-group">
+                        <label class="my-input-label">⚡ 预加载缓存</label>
+                        <div class="auto-summary-row">
+                            <label><input type="checkbox" id="cfg-preload-enabled"> 开启后台预总结</label>
+                            <div class="desc">开启后,脚本会提前总结当前列表里识别到的前几篇文章；点击文章时优先秒读本地缓存</div>
+                            <label style="margin-top:6px;">预加载篇数 <input id="cfg-preload-limit" class="my-input" type="number" min="1" max="20" style="width:90px;padding:4px 8px;"></label>
+                            <label style="margin-top:6px;">同时总结 <input id="cfg-preload-concurrency" class="my-input" type="number" min="1" max="3" style="width:90px;padding:4px 8px;"> 篇</label>
+                            <div class="desc">建议 2。设置太高会增加 API 并发费用，也更容易触发原站抓取限制</div>
+                            <label style="margin-top:6px;"><input type="checkbox" id="cfg-preload-iframe"> 启用隐藏详情页预取</label>
+                            <div class="desc">默认关闭。开启后可提高预加载命中率，但更耗资源，也可能触发 Folo 已读</div>
+                        </div>
+                    </div>
+
+                    <div class="my-input-group">
                         <label class="my-input-label">📡 原文抓取策略（按勾选顺序依次尝试）</label>
                         <div class="strategy-row">
                             <label><input type="checkbox" id="strat-jina"> 🌟 Jina Reader（推荐,能跑 JS、绕反爬）</label>
@@ -949,6 +2198,10 @@
         loadFormData(getActiveConfig());
         loadStrategiesUI();
         document.getElementById('cfg-auto-summarize').checked = getAutoSummarizeEnabled();
+        document.getElementById('cfg-preload-enabled').checked = getPreloadEnabled();
+        document.getElementById('cfg-preload-limit').value = getPreloadLimit();
+        document.getElementById('cfg-preload-concurrency').value = getPreloadConcurrency();
+        document.getElementById('cfg-preload-iframe').checked = getPreloadIframeEnabled();
         document.getElementById('cfg-flomo-url').value = getFlomoApiUrl();
         document.getElementById('webdav-user').value = getWebDAVUser();
         document.getElementById('webdav-pass').value = getWebDAVPass();
@@ -1196,6 +2449,10 @@
             saveFormToProfile(modal.__lastProfileId);
             saveStrategiesFromUI();
             setAutoSummarizeEnabled(document.getElementById('cfg-auto-summarize').checked);
+            setPreloadEnabled(document.getElementById('cfg-preload-enabled').checked);
+            setPreloadLimit(document.getElementById('cfg-preload-limit').value);
+            setPreloadConcurrency(document.getElementById('cfg-preload-concurrency').value);
+            setPreloadIframeEnabled(document.getElementById('cfg-preload-iframe').checked);
             setFlomoApiUrl(document.getElementById('cfg-flomo-url').value);
             persistWebDAVCredsFromForm();
             modal.style.display = 'none';
@@ -1434,34 +2691,15 @@
         });
     }
 
-    function callAIWithText(opts) {
-        const { title, text, url, btn, resultDiv, statusDiv, sourceLabel, wrapper } = opts;
+    function buildSummaryRequest(title, text, url) {
         const config = getActiveConfig();
-        if (!config.apiKey) {
-            resultDiv.style.display = 'block';
-            resultDiv.innerHTML = "⚠️ 请先配置 API Key";
-            showSettingsModal();
-            return;
-        }
-        if (!text || text.length < 10) {
-            resultDiv.style.display = 'block';
-            resultDiv.innerHTML = `<span style="color:red">⚠️ 正文内容过少（${text ? text.length : 0} 字）,无法总结。</span>`;
-            return;
-        }
-
         const maxChars = getMaxChars();
-        let workText = text;
+        let workText = text || "";
         let truncatedNote = "";
         if (workText.length > maxChars) {
             workText = workText.substring(0, maxChars);
             truncatedNote = `（已截断到 ${maxChars} 字符）`;
         }
-
-        btn.disabled = true; btn.innerText = "AI 生成中...";
-        resultDiv.style.display = 'block';
-        resultDiv.innerHTML = `🤖 正在调用 AI 模型... <span style="font-size:0.8em;color:#888">(${config.model})</span>`;
-        if (statusDiv) statusDiv.innerText = `📄 正文来源：${sourceLabel} · 长度：${text.length} 字 ${truncatedNote}`;
-
         const urlBlock = url ? `原文链接: ${url}\n` : "（无原文链接）\n";
         const fullContent =
             `以下是从 RSS 阅读器中提取的文章信息,请基于这些信息进行总结。\n\n` +
@@ -1479,7 +2717,63 @@
             "you do NOT have web access and do NOT need to fetch anything. " +
             "Just summarize what's given. If a URL is provided, reference it in your answer when appropriate.";
 
-        const userMessage = config.prompt + "\n\n" + fullContent;
+        return {
+            workText,
+            truncatedNote,
+            messages: [
+                { role: "system", content: systemPrompt },
+                { role: "user", content: config.prompt + "\n\n" + fullContent }
+            ]
+        };
+    }
+
+    function summarizeForCache(opts) {
+        const { title, text, url, appUrl, entryId, sourceLabel } = opts;
+        const config = getActiveConfig();
+        if (!config.apiKey) return Promise.reject(new Error("请先配置 API Key"));
+        if (!text || text.length < 10) return Promise.reject(new Error("正文内容过少"));
+        const req = buildSummaryRequest(title, text, url);
+        return new Promise((resolve, reject) => {
+            callAIChat(
+                req.messages,
+                (content) => resolve({
+                    title,
+                    text: req.workText,
+                    url,
+                    appUrl,
+                    entryId,
+                    summary: content,
+                    sourceLabel,
+                    truncated: !!req.truncatedNote
+                }),
+                reject
+            );
+        });
+    }
+
+    function callAIWithText(opts) {
+        const { title, text, url, appUrl, entryId, btn, resultDiv, statusDiv, sourceLabel, wrapper } = opts;
+        const config = getActiveConfig();
+        if (!config.apiKey) {
+            resultDiv.style.display = 'block';
+            resultDiv.innerHTML = "⚠️ 请先配置 API Key";
+            showSettingsModal();
+            return;
+        }
+        if (!text || text.length < 10) {
+            resultDiv.style.display = 'block';
+            resultDiv.innerHTML = `<span style="color:red">⚠️ 正文内容过少（${text ? text.length : 0} 字）,无法总结。</span>`;
+            return;
+        }
+
+        const req = buildSummaryRequest(title, text, url);
+        const workText = req.workText;
+        const truncatedNote = req.truncatedNote;
+
+        btn.disabled = true; btn.innerText = "AI 生成中...";
+        resultDiv.style.display = 'block';
+        resultDiv.innerHTML = `🤖 正在调用 AI 模型... <span style="font-size:0.8em;color:#888">(${config.model})</span>`;
+        if (statusDiv) statusDiv.innerText = `📄 正文来源：${sourceLabel} · 长度：${text.length} 字 ${truncatedNote}`;
 
         // 流式渲染状态
         let streamStarted = false;
@@ -1494,15 +2788,22 @@
         };
 
         callAIChat(
-            [
-                { role: "system", content: systemPrompt },
-                { role: "user", content: userMessage }
-            ],
+            req.messages,
             (content) => {
                 btn.disabled = false; btn.innerText = "重新生成";
                 let raw = content;
                 if (url) raw += `\n\n---\n🔗 **原文链接**：[${url}](${url})`;
                 resultDiv.innerHTML = _md(raw);
+                saveSummaryCache({
+                    title,
+                    text: workText,
+                    url,
+                    appUrl,
+                    entryId,
+                    summary: content,
+                    sourceLabel,
+                    truncated: !!truncatedNote
+                });
 
                 if (wrapper) {
                     wrapper.__articleContext = {
@@ -1541,11 +2842,40 @@
         const title = getArticleTitle(articleNode);
         const previewText = getCleanArticleText(articleNode);
         const originalUrl = getOriginalUrl(articleNode);
+        const route = getTimelineRouteInfo(location.href);
+        const appUrl = route.entryId ? location.href : "";
+        const entryId = route.entryId || "";
+        const cached = findSummaryCache(originalUrl, title, entryId, appUrl);
+        if (cached && applyCachedSummary(cached, btn, resultDiv, statusDiv, wrapper)) {
+            return;
+        }
+
+        const pendingTask = getPendingSummaryTask(originalUrl, title, entryId, appUrl);
+        if (pendingTask) {
+            btn.disabled = true;
+            btn.innerText = "等待后台总结...";
+            resultDiv.style.display = 'block';
+            resultDiv.innerHTML = `⏳ 这篇文章正在后台预加载总结中，完成后会自动显示。`;
+            if (statusDiv) statusDiv.innerText = `⚡ 正在复用后台队列任务，避免重复调用 AI`;
+            try {
+                const payload = await pendingTask;
+                const ready = findSummaryCache(originalUrl, title, entryId, appUrl) || payload;
+                if (ready && applyCachedSummary(ready, btn, resultDiv, statusDiv, wrapper)) return;
+            } catch (err) {
+                console.warn("[Folo增强] 等待后台预加载失败,改走前台总结：", err);
+                if (statusDiv) statusDiv.innerText = `⚠️ 后台预加载失败，改为当前页面总结：${err.message || err}`;
+            } finally {
+                btn.disabled = false;
+            }
+        }
+        if (removeQueuedPreloadTask(originalUrl, title, entryId, appUrl)) {
+            setPreloadStatus(`已从后台队列移除当前文章，交给详情页总结：${title}`, "info");
+        }
 
         if (!fetchFulltext || !originalUrl) {
             const reason = !originalUrl ? "未找到原文链接" : "已禁用全文抓取";
             callAIWithText({
-                title, text: previewText, url: originalUrl,
+                title, text: previewText, url: originalUrl, appUrl, entryId,
                 btn, resultDiv, statusDiv, wrapper,
                 sourceLabel: `Folo 预览（${reason}）`
             });
@@ -1571,13 +2901,15 @@
                     title: result.title || title,
                     text: result.text,
                     url: originalUrl,
+                    appUrl,
+                    entryId,
                     btn, resultDiv, statusDiv, wrapper,
                     sourceLabel: `${result.method}（${new URL(originalUrl).hostname}）`
                 });
             } else {
                 console.warn("[Folo增强] 全文比预览短,使用预览。");
                 callAIWithText({
-                    title, text: previewText, url: originalUrl,
+                    title, text: previewText, url: originalUrl, appUrl, entryId,
                     btn, resultDiv, statusDiv, wrapper,
                     sourceLabel: `Folo 预览（${result.method}抓到 ${result.length} 字 < 预览）`
                 });
@@ -1585,7 +2917,7 @@
         } catch (err) {
             console.warn("[Folo增强] 所有抓取策略失败：", err);
             callAIWithText({
-                title, text: previewText, url: originalUrl,
+                title, text: previewText, url: originalUrl, appUrl, entryId,
                 btn, resultDiv, statusDiv, wrapper,
                 sourceLabel: `Folo 预览（抓取失败：${err.message}）`
             });
@@ -1787,12 +3119,28 @@
             wrapper.dataset.url = currentUrl;
             wrapper.dataset.autoTriggered = '';
 
-            if (getAutoSummarizeEnabled()) {
+            if (tryRenderCachedForCurrentArticle(wrapper)) {
+                wrapper.dataset.autoTriggered = 'true';
+            } else if (getAutoSummarizeEnabled()) {
                 tryAutoSummarize(wrapper);
             }
         } else if (!savedUrl) {
             wrapper.dataset.url = currentUrl;
         }
+    }
+
+    function tryRenderCachedForCurrentArticle(wrapper) {
+        const article = document.getElementById('follow-entry-render') || document.querySelector('article[data-testid="entry-render"]');
+        if (!article || !wrapper) return false;
+        const title = getArticleTitle(article);
+        const originalUrl = getOriginalUrl(article);
+        const route = getTimelineRouteInfo(location.href);
+        const cached = findSummaryCache(originalUrl, title, route.entryId, route.entryId ? location.href : "");
+        if (!cached) return false;
+        const btn = wrapper.querySelector('.my-ai-btn');
+        const content = wrapper.querySelector('.my-ai-content');
+        const statusDiv = wrapper.querySelector('.my-ai-status');
+        return applyCachedSummary(cached, btn, content, statusDiv, wrapper);
     }
 
     function tryAutoSummarize(wrapper) {
@@ -1815,6 +3163,7 @@
     }
 
     function checkAndInject() {
+        ensurePreloadPanel();
         document.querySelectorAll('button[title="Open AI Chat"]').forEach(b => b.style.display = 'none');
 
         let article = document.getElementById('follow-entry-render') || document.querySelector('article[data-testid="entry-render"]');
@@ -1939,7 +3288,9 @@
             if (copyBtn)  copyBtn.onclick  = () => handleCopyConversation(wrapper);
             if (flomoBtn) flomoBtn.onclick = () => handleSendToFlomo(wrapper);
 
-            if (getAutoSummarizeEnabled()) {
+            if (tryRenderCachedForCurrentArticle(wrapper)) {
+                wrapper.dataset.autoTriggered = 'true';
+            } else if (getAutoSummarizeEnabled()) {
                 tryAutoSummarize(wrapper);
             }
         }
@@ -1950,6 +3301,7 @@
         observer.observe(document.body, { childList: true, subtree: true });
         setInterval(checkAndInject, 500);
     }
+    startPreloadScheduler();
     if (document.body) startObserver();
     else document.addEventListener('DOMContentLoaded', startObserver);
 
