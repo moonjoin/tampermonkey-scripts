@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站省流助手 - 字幕AI摘要 Pro
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      3.7.1
+// @version      3.8.0
 // @description  自动提取B站视频字幕，通过自定义AI API生成极简摘要，支持模型切换、持续对话和评论区总结；支持自动解析开关、自动获取模型列表、flomo自动加标签，新增总结生图功能；v3.7.1 增加打断总结功能，在"无字幕"状态下，新增"手动上传字幕"按钮
 // @author       次元饺子
 // @match        https://www.bilibili.com/video/*
@@ -26,6 +26,9 @@
   // ==================== localStorage 配置存储层 ====================
   const STORAGE_KEY = 'bili_summary_pro_config';
   const POSITION_KEY = 'bili_summary_pro_positions';
+  const SUMMARY_CACHE_KEY = 'bili_summary_pro_summary_cache_v1';
+  const SUMMARY_CACHE_MAX_ENTRIES = 20;
+  const SUMMARY_CACHE_MAX_CHARS = 250000;
 
   const DEFAULT_PRESETS = [
     {
@@ -77,6 +80,7 @@
     imageGenApiKey: '',
     imageGenModel: 'gemini-3.1-flash-image-preview',
     imageGenSize: '1024x1024',
+    enableImageAutoDownload: true,
     imageGenPromptText: IMAGE_GEN_PROMPT_TEXT
   };
 
@@ -112,6 +116,108 @@
     try {
       localStorage.setItem(POSITION_KEY, JSON.stringify(pos));
     } catch(e) {}
+  }
+
+  function hashString(str) {
+    let h = 2166136261;
+    const text = String(str || '');
+    for (let i = 0; i < text.length; i++) {
+      h ^= text.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return (h >>> 0).toString(36);
+  }
+
+  function loadSummaryCache() {
+    try {
+      const raw = localStorage.getItem(SUMMARY_CACHE_KEY);
+      if (raw) {
+        const cache = JSON.parse(raw);
+        if (cache && cache.entries && Array.isArray(cache.order)) return cache;
+      }
+    } catch(e) {
+      console.warn('[省流助手] 读取摘要缓存失败:', e.message);
+    }
+    return { version: 1, entries: {}, order: [] };
+  }
+
+  function saveSummaryCache(cache) {
+    try {
+      localStorage.setItem(SUMMARY_CACHE_KEY, JSON.stringify(cache));
+    } catch(e) {
+      console.warn('[省流助手] 保存摘要缓存失败，尝试清理旧缓存:', e.message);
+      try {
+        cache.order = cache.order.slice(-Math.ceil(SUMMARY_CACHE_MAX_ENTRIES / 2));
+        const keep = new Set(cache.order);
+        Object.keys(cache.entries).forEach(k => { if (!keep.has(k)) delete cache.entries[k]; });
+        localStorage.setItem(SUMMARY_CACHE_KEY, JSON.stringify(cache));
+      } catch(e2) {
+        console.warn('[省流助手] 二次保存摘要缓存失败:', e2.message);
+      }
+    }
+  }
+
+  function pruneSummaryCache(cache) {
+    let totalChars = cache.order.reduce((sum, key) => sum + ((cache.entries[key]?.summary || '').length), 0);
+    while (cache.order.length > SUMMARY_CACHE_MAX_ENTRIES || totalChars > SUMMARY_CACHE_MAX_CHARS) {
+      const oldKey = cache.order.shift();
+      if (!oldKey) break;
+      totalChars -= (cache.entries[oldKey]?.summary || '').length;
+      delete cache.entries[oldKey];
+    }
+    return cache;
+  }
+
+  function buildSummaryCacheKey(videoInfo, model, presetId, promptText, transcript) {
+    const bvid = videoInfo?.bvid || location.pathname;
+    return [
+      'v1',
+      bvid,
+      model || '',
+      presetId || '',
+      hashString(promptText || ''),
+      hashString(transcript || '')
+    ].join('::');
+  }
+
+  function getCachedSummary(cacheKey) {
+    const cache = loadSummaryCache();
+    const item = cache.entries[cacheKey];
+    if (!item || !item.summary) return null;
+    cache.order = cache.order.filter(k => k !== cacheKey);
+    cache.order.push(cacheKey);
+    item.lastUsedAt = Date.now();
+    saveSummaryCache(pruneSummaryCache(cache));
+    return item.summary;
+  }
+
+  function setCachedSummary(cacheKey, payload) {
+    if (!cacheKey || !payload || !payload.summary) return;
+    const cache = loadSummaryCache();
+    cache.entries[cacheKey] = {
+      summary: payload.summary,
+      model: payload.model || '',
+      presetId: payload.presetId || '',
+      title: payload.title || '',
+      createdAt: Date.now(),
+      lastUsedAt: Date.now()
+    };
+    cache.order = cache.order.filter(k => k !== cacheKey);
+    cache.order.push(cacheKey);
+    saveSummaryCache(pruneSummaryCache(cache));
+  }
+
+  function clearSummaryCache() {
+    try {
+      localStorage.removeItem(SUMMARY_CACHE_KEY);
+    } catch(e) {}
+  }
+
+  function getSummaryCacheStats() {
+    const cache = loadSummaryCache();
+    const count = cache.order.length;
+    const chars = cache.order.reduce((sum, key) => sum + ((cache.entries[key]?.summary || '').length), 0);
+    return { count, chars };
   }
 
   let CONFIG = loadConfig();
@@ -155,12 +261,53 @@
   let commentConversationHistory = [];
   let isCommentSummarizing = false;
   let hasParsed = false;
+  let lastRouteKey = '';
+  let routeRestartTimer = null;
+  let routeGeneration = 0;
   // 🆕 当前正在进行的 AI 任务的 AbortController（用于打断流式输出）
   let currentAbortController = null;
 
   // ==================== 视频信息获取 ====================
+  function cleanVideoDescription(text) {
+    return String(text || '')
+      .replace(/\r/g, '\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+  }
+
+  function limitText(text, maxLen) {
+    const clean = cleanVideoDescription(text);
+    if (!clean || clean.length <= maxLen) return clean;
+    return clean.slice(0, maxLen) + '\n...（简介过长，已截断）';
+  }
+
+  function normalizeImageSizeInput(raw) {
+    const value = String(raw || '').trim().replace(/[×＊*]/g, 'x').toLowerCase();
+    if (!value) return '1024x1024';
+    if (value === 'auto') return value;
+    if (!/^\d{2,5}x\d{2,5}$/.test(value)) return '';
+    return value;
+  }
+
+  function pickDescriptionFromDom() {
+    const selectors = [
+      '.desc-info-text',
+      '.basic-desc-info',
+      '.video-desc-container .desc-info-text',
+      '.video-desc .desc-info-text',
+      '.video-desc .desc',
+      '#v_desc .info'
+    ];
+    for (const selector of selectors) {
+      const el = document.querySelector(selector);
+      const text = cleanVideoDescription(el?.textContent || '');
+      if (text) return text;
+    }
+    return '';
+  }
+
   function getVideoInfo() {
-    let cid = null, bvid = null, aid = null, title = '', upName = '', duration = 0;
+    let cid = null, bvid = null, aid = null, title = '', upName = '', desc = '', duration = 0;
     try {
       const state = window.__INITIAL_STATE__;
       if (state?.videoData) {
@@ -169,6 +316,12 @@
         cid = state.videoData.cid || state.videoData.pages?.[0]?.cid;
         title = state.videoData.title || '';
         upName = state.videoData.owner?.name || '';
+        desc = cleanVideoDescription(state.videoData.desc || '');
+        if (!desc && Array.isArray(state.videoData.desc_v2)) {
+          desc = cleanVideoDescription(state.videoData.desc_v2.map(function(item) {
+            return item && item.raw_text ? item.raw_text : '';
+          }).filter(Boolean).join('\n'));
+        }
         duration = state.videoData.duration || 0;
       }
     } catch(e) {
@@ -202,7 +355,10 @@
         upName = upElement.getAttribute('title') || upElement.textContent?.trim() || '';
       }
     }
-    return { bvid, cid, aid, title, upName, duration };
+    if (!desc) {
+      desc = pickDescriptionFromDom();
+    }
+    return { bvid, cid, aid, title, upName, desc, duration };
   }
 
   // ==================== 字幕获取部分 ====================
@@ -272,6 +428,20 @@
     const filename = safeUpName + '__' + safeTitle + '__' + safeBvid + '.txt';
     triggerDownload(text, filename, 'text/plain;charset=utf-8');
     console.log('[省流助手] 已下载字幕: ' + filename);
+  }
+
+  function downloadGeneratedImage(imageDataUrl, videoInfo, suffix) {
+    if (!imageDataUrl || imageDataUrl === 'ERROR') return false;
+    const safeTitle = sanitizeFilename((videoInfo && videoInfo.title) || '视频总结') || '视频总结';
+    const filename = safeTitle + (suffix || '_总结') + '.png';
+    const a = document.createElement('a');
+    a.href = imageDataUrl;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    console.log('[省流助手-生图] 已触发图片下载: ' + filename);
+    return true;
   }
 
   // ==================== 评论区防Ban工具函数 ====================
@@ -408,52 +578,145 @@
     return plain.trim();
   }
 
-  function parseMarkdown(text) {
-    let html = text;
-    html = html.replace(/&/g, '&amp;');
-    html = html.replace(/</g, '&lt;');
-    html = html.replace(/>/g, '&gt;');
-    html = html.replace(/^### (.+)$/gm, '<h3 class="md-h3">$1</h3>');
-    html = html.replace(/^## (.+)$/gm, '<h2 class="md-h2">$1</h2>');
-    html = html.replace(/^# (.+)$/gm, '<h1 class="md-h1">$1</h1>');
+  function parseMarkdownInline(raw) {
+    const codeParts = [];
+    const linkParts = [];
+    let source = String(raw || '').replace(/`([^`]+)`/g, function(match, code) {
+      const token = '\u0000CODE' + codeParts.length + '\u0000';
+      codeParts.push('<code class="md-code">' + escapeHtml(code) + '</code>');
+      return token;
+    });
+    source = source.replace(/\[([^\]]+)\]\(([^)]+)\)/g, function(match, label, href) {
+      const token = '\u0000LINK' + linkParts.length + '\u0000';
+      linkParts.push('<a class="md-link" href="' + safeHref(href) + '" target="_blank" rel="noopener">' + escapeHtml(label) + '</a>');
+      return token;
+    });
+    let html = escapeHtml(source);
     html = html.replace(/\*\*(.+?)\*\*/g, '<strong class="md-bold">$1</strong>');
-    html = html.replace(/\*(.+?)\*/g, '<em class="md-em">$1</em>');
-    html = html.replace(/_(.+?)_/g, '<em class="md-em">$1</em>');
-    html = html.replace(/`([^`]+)`/g, '<code class="md-code">$1</code>');
-    html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a class="md-link" href="$2" target="_blank" rel="noopener">$1</a>');
-    html = html.replace(/^&gt; (.+)$/gm, '<blockquote class="md-quote">$1</blockquote>');
-    html = html.replace(/^[-*] (.+)$/gm, '<li class="md-li">$1</li>');
-    html = html.replace(/(<li class="md-li">.+<\/li>\n?)+/g, function(match) {
-      return '<ul class="md-ul">' + match + '</ul>';
+    html = html.replace(/(^|[^\*])\*([^\*\n]+)\*/g, '$1<em class="md-em">$2</em>');
+    html = html.replace(/\u0000CODE(\d+)\u0000/g, function(match, idx) {
+      return codeParts[Number(idx)] || '';
     });
-    html = html.replace(/^\d+\. (.+)$/gm, '<li class="md-li-ol">$1</li>');
-    html = html.replace(/(<li class="md-li-ol">.+<\/li>\n?)+/g, function(match) {
-      return '<ol class="md-ol">' + match + '</ol>';
+    html = html.replace(/\u0000LINK(\d+)\u0000/g, function(match, idx) {
+      return linkParts[Number(idx)] || '';
     });
-    html = html.replace(/^---$/gm, '<hr class="md-hr">');
+    return html;
+  }
 
-    const lines = html.split('\n');
-    const processedLines = [];
-    let paragraphContent = [];
+  function parseMarkdown(text) {
+    const lines = String(text || '').replace(/\r/g, '').split('\n');
+    const out = [];
+    let paragraph = [];
+    let listType = '';
+    let inCode = false;
+    let codeLines = [];
+
+    function flushParagraph() {
+      if (!paragraph.length) return;
+      out.push('<p class="md-p">' + paragraph.map(parseMarkdownInline).join('<br>') + '</p>');
+      paragraph = [];
+    }
+    function closeList() {
+      if (!listType) return;
+      out.push(listType === 'ol' ? '</ol>' : '</ul>');
+      listType = '';
+    }
+    function startList(type) {
+      if (listType === type) return;
+      closeList();
+      out.push(type === 'ol' ? '<ol class="md-ol">' : '<ul class="md-ul">');
+      listType = type;
+    }
+
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
-      const isSpecial = /^<(h[1-6]|ul|ol|li|blockquote|hr)/.test(line) || line.trim() === '';
-      if (isSpecial) {
-        if (paragraphContent.length > 0) {
-          processedLines.push('<p class="md-p">' + paragraphContent.join(' ') + '</p>');
-          paragraphContent = [];
+      const trimmed = line.trim();
+
+      if (/^```/.test(trimmed)) {
+        if (inCode) {
+          out.push('<pre class="md-pre"><code>' + escapeHtml(codeLines.join('\n')) + '</code></pre>');
+          codeLines = [];
+          inCode = false;
+        } else {
+          flushParagraph();
+          closeList();
+          inCode = true;
         }
-        processedLines.push(line);
-      } else {
-        paragraphContent.push(line);
+        continue;
       }
+      if (inCode) {
+        codeLines.push(line);
+        continue;
+      }
+      if (!trimmed) {
+        flushParagraph();
+        closeList();
+        continue;
+      }
+
+      if (trimmed.includes('|') && lines[i + 1] && /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/.test(lines[i + 1])) {
+        flushParagraph();
+        closeList();
+        const headerCells = trimmed.replace(/^\||\|$/g, '').split('|').map(c => c.trim());
+        i += 2;
+        const rows = [];
+        while (i < lines.length && lines[i].trim().includes('|')) {
+          rows.push(lines[i].trim().replace(/^\||\|$/g, '').split('|').map(c => c.trim()));
+          i++;
+        }
+        i--;
+        let table = '<table class="md-table"><thead><tr>' + headerCells.map(c => '<th>' + parseMarkdownInline(c) + '</th>').join('') + '</tr></thead><tbody>';
+        rows.forEach(row => {
+          table += '<tr>' + row.map(c => '<td>' + parseMarkdownInline(c) + '</td>').join('') + '</tr>';
+        });
+        table += '</tbody></table>';
+        out.push(table);
+        continue;
+      }
+
+      const heading = trimmed.match(/^(#{1,3})\s+(.+)$/);
+      if (heading) {
+        flushParagraph();
+        closeList();
+        const level = heading[1].length;
+        out.push('<h' + level + ' class="md-h' + level + '">' + parseMarkdownInline(heading[2]) + '</h' + level + '>');
+        continue;
+      }
+      if (/^---+$/.test(trimmed)) {
+        flushParagraph();
+        closeList();
+        out.push('<hr class="md-hr">');
+        continue;
+      }
+      if (/^>\s+/.test(trimmed)) {
+        flushParagraph();
+        closeList();
+        out.push('<blockquote class="md-quote">' + parseMarkdownInline(trimmed.replace(/^>\s+/, '')) + '</blockquote>');
+        continue;
+      }
+
+      const ul = trimmed.match(/^[-*]\s+(.+)$/);
+      if (ul) {
+        flushParagraph();
+        startList('ul');
+        out.push('<li class="md-li">' + parseMarkdownInline(ul[1]) + '</li>');
+        continue;
+      }
+      const ol = trimmed.match(/^\d+\.\s+(.+)$/);
+      if (ol) {
+        flushParagraph();
+        startList('ol');
+        out.push('<li class="md-li-ol">' + parseMarkdownInline(ol[1]) + '</li>');
+        continue;
+      }
+
+      closeList();
+      paragraph.push(line);
     }
-    if (paragraphContent.length > 0) {
-      processedLines.push('<p class="md-p">' + paragraphContent.join(' ') + '</p>');
-    }
-    html = processedLines.join('\n');
-    html = html.replace(/<p class="md-p">\s*<\/p>/g, '');
-    return html;
+    if (inCode) out.push('<pre class="md-pre"><code>' + escapeHtml(codeLines.join('\n')) + '</code></pre>');
+    flushParagraph();
+    closeList();
+    return out.join('\n');
   }
 
   // ==================== UI 样式 ====================
@@ -498,16 +761,44 @@
         top: 20px;
         right: 20px;
         width: 480px;
-        max-height: 90vh;
+        height: min(720px, 90vh);
+        min-width: 360px;
+        min-height: 360px;
+        max-width: calc(100vw - 24px);
+        max-height: calc(100vh - 24px);
+        box-sizing: border-box;
         background: white;
         border-radius: 16px;
         box-shadow: 0 8px 32px rgba(0,0,0,0.15);
         z-index: 9999999;
         font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
         overflow: hidden;
-        animation: slideInRight 0.3s ease;
         display: flex;
         flex-direction: column;
+      }
+      #tabbit-ai-summary-panel.dragging,
+      #tabbit-ai-summary-panel.resizing {
+        animation: none !important;
+        transition: none !important;
+      }
+      .tabbit-panel-resizer {
+        position: absolute;
+        right: 0;
+        bottom: 0;
+        width: 18px;
+        height: 18px;
+        cursor: nwse-resize;
+        z-index: 2;
+      }
+      .tabbit-panel-resizer::after {
+        content: '';
+        position: absolute;
+        right: 4px;
+        bottom: 4px;
+        width: 9px;
+        height: 9px;
+        border-right: 2px solid rgba(102,126,234,0.55);
+        border-bottom: 2px solid rgba(102,126,234,0.55);
       }
       .tabbit-panel-header {
         display: flex;
@@ -619,11 +910,32 @@
         color: #333;
         margin-bottom: 4px;
       }
+      .tabbit-video-info-bottom {
+        margin: 12px 0 0;
+        padding: 8px 10px 10px;
+        background: #f6fbfd;
+        border: 1px solid #ddebf2;
+      }
+      .tabbit-video-meta-body {
+        padding-top: 8px;
+        border-top: 1px solid #ddebf2;
+      }
+      .tabbit-video-url-inline {
+        margin-top: 6px;
+        font-size: 12px;
+        word-break: break-all;
+      }
       .tabbit-result {
         background: #f8f9fa;
         border-radius: 12px;
         padding: 14px 16px;
         word-break: break-word;
+      }
+      .tabbit-image-slot:empty {
+        display: none;
+      }
+      .tabbit-image-slot {
+        margin-bottom: 12px;
       }
       .tabbit-result-actions {
         display: flex;
@@ -655,16 +967,6 @@
         color: #2e7d32;
         border-color: #4caf50;
       }
-      .tabbit-url {
-        margin-top: 10px;
-        padding: 10px;
-        background: #e8f4f8;
-        border-radius: 8px;
-        font-size: 12px;
-        word-break: break-all;
-      }
-      .tabbit-url a { color: #667eea; text-decoration: none; }
-      .tabbit-url a:hover { text-decoration: underline; }
       .tabbit-error {
         background: #fff3f3;
         border: 1px solid #ffcccc;
@@ -938,6 +1240,7 @@
       .md-bold { font-weight: 600; color: #1a1a2e; }
       .md-em { font-style: italic; color: #555; }
       .md-code { background: #e8e8f0; color: #c7254e; padding: 2px 6px; border-radius: 4px; font-size: 12.5px; font-family: Consolas, Monaco, monospace; }
+      .md-pre { background: #23272f; color: #f3f4f6; padding: 12px 14px; border-radius: 8px; overflow:auto; font-size: 12.5px; line-height: 1.55; }
       .md-link { color: #667eea; text-decoration: none; border-bottom: 1px solid transparent; transition: border-color 0.2s; }
       .md-link:hover { border-bottom-color: #667eea; }
       .md-quote { background: linear-gradient(to right, #667eea 0, #667eea 4px, #f0f4ff 4px); padding: 10px 14px; margin: 10px 0; border-radius: 0 8px 8px 0; color: #555; font-style: italic; }
@@ -948,6 +1251,9 @@
       .md-ol { list-style-type: decimal; }
       .md-li-ol { margin: 5px 0; color: #333; }
       .md-hr { border: none; height: 1px; background: linear-gradient(to right, transparent, #667eea, transparent); margin: 14px 0; }
+      .md-table { width: 100%; border-collapse: collapse; margin: 10px 0; font-size: 12.5px; }
+      .md-table th, .md-table td { border: 1px solid #e0e3ee; padding: 6px 8px; text-align: left; vertical-align: top; }
+      .md-table th { background: #f0f4ff; font-weight: 600; color: #333; }
 
       /* ==================== 设置面板样式 ==================== */
       #tabbit-settings-overlay {
@@ -1402,6 +1708,87 @@
     });
   }
 
+  function clampPanelGeometry(panel, geom) {
+    const minW = 360;
+    const minH = 360;
+    const maxW = Math.max(minW, window.innerWidth - 24);
+    const maxH = Math.max(minH, window.innerHeight - 24);
+    const width = Math.max(minW, Math.min(Number(geom.width) || 480, maxW));
+    const height = Math.max(minH, Math.min(Number(geom.height) || Math.min(720, maxH), maxH));
+    let left = Number.isFinite(Number(geom.left)) ? Number(geom.left) : null;
+    let top = Number.isFinite(Number(geom.top)) ? Number(geom.top) : 20;
+
+    panel.style.width = width + 'px';
+    panel.style.height = height + 'px';
+
+    if (left !== null) {
+      left = Math.max(0, Math.min(left, window.innerWidth - width));
+      top = Math.max(0, Math.min(top, window.innerHeight - height));
+      panel.style.left = left + 'px';
+      panel.style.top = top + 'px';
+      panel.style.right = 'auto';
+      panel.style.bottom = 'auto';
+      panel.style.transform = 'none';
+    } else {
+      top = Math.max(0, Math.min(top, window.innerHeight - height));
+      panel.style.top = top + 'px';
+    }
+  }
+
+  function readPanelGeometry(panel) {
+    const rect = panel.getBoundingClientRect();
+    return {
+      left: Math.round(rect.left),
+      top: Math.round(rect.top),
+      width: Math.round(rect.width),
+      height: Math.round(rect.height)
+    };
+  }
+
+  function makeResizable(panel, handle, onEnd) {
+    let isResizing = false;
+    let startX = 0, startY = 0, startW = 0, startH = 0, startLeft = 0, startTop = 0;
+
+    handle.addEventListener('mousedown', function(e) {
+      if (e.button !== 0) return;
+      const rect = panel.getBoundingClientRect();
+      isResizing = true;
+      startX = e.clientX;
+      startY = e.clientY;
+      startW = rect.width;
+      startH = rect.height;
+      startLeft = rect.left;
+      startTop = rect.top;
+      panel.style.left = startLeft + 'px';
+      panel.style.top = startTop + 'px';
+      panel.style.right = 'auto';
+      panel.style.bottom = 'auto';
+      panel.classList.add('resizing');
+      document.body.style.userSelect = 'none';
+      e.preventDefault();
+      e.stopPropagation();
+    });
+
+    document.addEventListener('mousemove', function(e) {
+      if (!isResizing) return;
+      const maxW = window.innerWidth - startLeft;
+      const maxH = window.innerHeight - startTop;
+      const newW = Math.max(360, Math.min(startW + e.clientX - startX, maxW));
+      const newH = Math.max(360, Math.min(startH + e.clientY - startY, maxH));
+      panel.style.width = newW + 'px';
+      panel.style.height = newH + 'px';
+      e.preventDefault();
+    });
+
+    document.addEventListener('mouseup', function() {
+      if (!isResizing) return;
+      isResizing = false;
+      panel.classList.remove('resizing');
+      document.body.style.userSelect = '';
+      if (onEnd) onEnd(readPanelGeometry(panel));
+    });
+  }
+
   // ==================== 面板创建 ====================
   function bindModelChips(panel) {
     panel.querySelectorAll('.tabbit-model-chip').forEach(chip => {
@@ -1426,11 +1813,7 @@
   }
 
   function applyPanelPosition(panel) {
-    if (POSITIONS.panel) {
-      panel.style.left = POSITIONS.panel.left + 'px';
-      panel.style.top = POSITIONS.panel.top + 'px';
-      panel.style.right = 'auto';
-    }
+    clampPanelGeometry(panel, POSITIONS.panel || {});
   }
 
   function createPanel(videoInfo) {
@@ -1457,29 +1840,46 @@
         <div class="tabbit-model-list">${modelChips}</div>
       </div>
       <div class="tabbit-panel-content">
-        <div class="tabbit-video-info">
-          <div class="tabbit-video-title">${escapeHtml(videoInfo.title || '未知标题')}</div>
-          <div>UP主: ${escapeHtml(videoInfo.upName || '未知UP主')}</div>
+        ${renderPresetBarHtml()}
+        <div class="tabbit-image-slot"></div>
+        <div class="tabbit-result">
+          <div class="tabbit-loading">
+            <div class="tabbit-spinner"></div>
+            <span>准备中...</span>
+          </div>
         </div>
-        <div class="tabbit-loading">
-          <div class="tabbit-spinner"></div>
-          <span>准备中...</span>
-        </div>
+        <div class="tabbit-result-actions"></div>
+        <button class="tabbit-comment-summary-btn" id="tabbit-comment-btn" disabled>
+          <span class="tabbit-btn-icon">💬</span>
+          <span>总结评论区</span>
+        </button>
+        ${renderVideoMetaBottomHtml(videoInfo, window.location.href)}
+        <div class="tabbit-chat-messages"></div>
       </div>
       <div class="tabbit-chat-input-bar">
         <textarea class="tabbit-chat-input" placeholder="基于视频内容继续提问..." rows="1" disabled></textarea>
         <button class="tabbit-chat-send" disabled title="发送 (Enter)">➤</button>
       </div>
+      <div class="tabbit-panel-resizer" title="拖拽调整窗口大小"></div>
     `;
-    document.body.appendChild(panel);
 
     applyPanelPosition(panel);
+    document.body.appendChild(panel);
 
     const header = panel.querySelector('.tabbit-panel-header');
     makeDraggable(panel, header, function(left, top) {
-      POSITIONS.panel = { left, top };
+      const geom = readPanelGeometry(panel);
+      POSITIONS.panel = { left, top, width: geom.width, height: geom.height };
       savePositions(POSITIONS);
     });
+
+    const resizer = panel.querySelector('.tabbit-panel-resizer');
+    if (resizer) {
+      makeResizable(panel, resizer, function(geom) {
+        POSITIONS.panel = geom;
+        savePositions(POSITIONS);
+      });
+    }
 
     panel.querySelector('.tabbit-close-btn').addEventListener('click', () => {
       panel.style.animation = 'slideOutRight 0.3s ease forwards';
@@ -1515,6 +1915,34 @@
 
   function escapeHtml(s) {
     return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  function escapeAttr(s) {
+    return escapeHtml(s).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  function safeHref(raw) {
+    const href = String(raw || '').trim();
+    if (!href) return '#';
+    const normalized = href.replace(/[\u0000-\u001F\u007F\s]+/g, '').toLowerCase();
+    if (/^(javascript|data|vbscript):/.test(normalized)) return '#';
+    return escapeAttr(href);
+  }
+
+  function renderVideoMetaBottomHtml(videoInfo, url) {
+    const safeInfo = videoInfo || {};
+    const pageUrl = url || window.location.href;
+    return `
+      <div class="tabbit-video-info tabbit-video-info-bottom">
+        <div style="font-size:12px;color:#666;font-weight:600;margin-bottom:6px;">📌 视频信息 / 原链接</div>
+        <div class="tabbit-video-meta-body">
+          <div class="tabbit-video-title">${escapeHtml(safeInfo.title || '未知标题')}</div>
+          <div>UP主: ${escapeHtml(safeInfo.upName || '未知')}</div>
+          ${safeInfo.desc ? '<div style="margin-top:6px;white-space:pre-wrap;">简介: ' + escapeHtml(limitText(safeInfo.desc, 500)) + '</div>' : ''}
+          <div class="tabbit-video-url-inline">🔗 <a href="${safeHref(pageUrl)}" target="_blank" rel="noopener">${escapeHtml(pageUrl)}</a></div>
+        </div>
+      </div>
+    `;
   }
 
   // 🆕 ==================== 中断控制 ====================
@@ -1795,18 +2223,17 @@
         saveBtn.className = 'tabbit-copy-btn';
         saveBtn.textContent = '💾 保存图片';
         saveBtn.addEventListener('click', function() {
-          const a = document.createElement('a');
-          a.href = imageDataUrl;
-          a.download = sanitizeFilename(videoInfo.title || '视频总结') + '_配图.png';
-          document.body.appendChild(a);
-          a.click();
-          document.body.removeChild(a);
+          downloadGeneratedImage(imageDataUrl, videoInfo, '_配图');
         });
         saveRow.appendChild(saveBtn);
         imgDiv.appendChild(saveRow);
 
         resultContainer.appendChild(imgDiv);
         contentDiv.scrollTop = contentDiv.scrollHeight;
+      }
+
+      if (CONFIG.enableImageAutoDownload !== false) {
+        downloadGeneratedImage(imageDataUrl, videoInfo, '_配图');
       }
 
       btn.textContent = '✅ 已生成';
@@ -1821,7 +2248,7 @@
   }
 
   // 🆕 流式总结的最终装配（流式结束时调用，挂上完整的按钮区）
-  function finalizeSummaryUI(contentDiv, result, url, videoInfo) {
+  function finalizeSummaryUI(contentDiv, result, _url, videoInfo) {
     rawMarkdownResult = result;
     const resultContainer = contentDiv.querySelector('.tabbit-result');
     if (resultContainer) {
@@ -1859,14 +2286,6 @@
       actionsDiv.appendChild(downloadBtn);
       actionsDiv.appendChild(modelTag);
     }
-    const urlDiv = contentDiv.querySelector('.tabbit-url');
-    if (urlDiv) {
-      const link = urlDiv.querySelector('a');
-      if (link) {
-        link.href = url;
-        link.textContent = url;
-      }
-    }
   }
 
   // ==================== 无字幕状态展示 ====================
@@ -1885,10 +2304,6 @@
       : '该视频暂无可用字幕，无法生成视频摘要。可尝试手动获取，或使用下方按钮总结评论区！';
 
     contentDiv.innerHTML = `
-      <div class="tabbit-video-info">
-        <div class="tabbit-video-title">${escapeHtml(videoInfo.title || '未知标题')}</div>
-        <div>UP主: ${escapeHtml(videoInfo.upName || '未知')}</div>
-      </div>
       <div class="tabbit-no-subtitle">
         <div class="tabbit-no-subtitle-icon">${noSubIcon}</div>
         <div class="tabbit-no-subtitle-text">${noSubTitle}</div>
@@ -1906,6 +2321,7 @@
         <span class="tabbit-btn-icon">💬</span>
         <span>总结评论区</span>
       </button>
+      ${renderVideoMetaBottomHtml(videoInfo, window.location.href)}
     `;
 
     const manualFetchBtn = contentDiv.querySelector('#tabbit-manual-fetch-btn');
@@ -2228,7 +2644,7 @@
     }
 
     const ct = (res.headers.get('content-type') || '').toLowerCase();
-    if (!ct.includes('text/event-stream') && !res.body) {
+    if (!ct.includes('text/event-stream')) {
       console.warn('[省流助手-流式] API 不支持 stream，降级为一次性返回');
       const data = await res.json();
       const fullText = data.choices?.[0]?.message?.content || '';
@@ -2465,7 +2881,7 @@
           }
         }
       } catch (e) {
-        if (isAbortError(imgErr)) throw e; // 🆕 打断直接抛出
+        if (isAbortError(e)) throw e; // 🆕 打断直接抛出
         console.warn('[省流助手-生图] 第二次生图尝试也失败:', e.message);
       }
     }
@@ -2481,24 +2897,29 @@
     return CONFIG.enableImageGen === true;
   }
 
-  function showImageResult(contentDiv, textContent, imageDataUrl, url, videoInfo) {
+  function showImageResult(contentDiv, textContent, imageDataUrl, _url, videoInfo) {
     rawMarkdownResult = textContent || '（生图模式 - 图片总结）';
     const resultContainer = contentDiv.querySelector('.tabbit-result');
+    const imageSlot = contentDiv.querySelector('.tabbit-image-slot') || resultContainer;
+    if (imageSlot) {
+      let imageHtml = '';
+      if (imageDataUrl && imageDataUrl !== 'ERROR') {
+        imageHtml += '<div class="tabbit-img-wrap" style="text-align:center;margin-bottom:12px;">';
+        imageHtml += '<img src="' + escapeAttr(imageDataUrl) + '" style="max-width:100%;border-radius:10px;box-shadow:0 4px 16px rgba(0,0,0,0.12);cursor:pointer;" title="点击查看大图" />';
+        imageHtml += '</div>';
+      } else if (imageDataUrl === 'ERROR') {
+        imageHtml += '<div class="tabbit-img-wrap" style="text-align:center;margin-bottom:12px;padding:14px;background:#fff3f3;border:1px solid #ffcccc;border-radius:10px;color:#c00;font-size:13px;">⚠️ 配图生成失败，仅显示文字总结</div>';
+      } else {
+        imageHtml += '<div class="tabbit-img-wrap tabbit-img-loading" style="text-align:center;margin-bottom:12px;padding:30px 14px;background:linear-gradient(135deg,#f0f4ff 0%,#fff5f8 100%);border:1px dashed #c5d3ff;border-radius:10px;">';
+        imageHtml += '<div class="tabbit-spinner" style="margin:0 auto 10px;"></div>';
+        imageHtml += '<div style="font-size:13px;color:#667eea;font-weight:600;">🖼️ 配图生成中，请稍候...</div>';
+        imageHtml += '<div style="font-size:11px;color:#999;margin-top:4px;">文字总结已就绪，可先阅读</div>';
+        imageHtml += '</div>';
+      }
+      imageSlot.innerHTML = imageHtml;
+    }
     if (resultContainer) {
       let html = '';
-      if (imageDataUrl && imageDataUrl !== 'ERROR') {
-        html += '<div class="tabbit-img-wrap" style="text-align:center;margin-bottom:12px;">';
-        html += '<img src="' + imageDataUrl + '" style="max-width:100%;border-radius:10px;box-shadow:0 4px 16px rgba(0,0,0,0.12);cursor:pointer;" title="点击查看大图" />';
-        html += '</div>';
-      } else if (imageDataUrl === 'ERROR') {
-        html += '<div class="tabbit-img-wrap" style="text-align:center;margin-bottom:12px;padding:14px;background:#fff3f3;border:1px solid #ffcccc;border-radius:10px;color:#c00;font-size:13px;">⚠️ 配图生成失败，仅显示文字总结</div>';
-      } else {
-        html += '<div class="tabbit-img-wrap tabbit-img-loading" style="text-align:center;margin-bottom:12px;padding:30px 14px;background:linear-gradient(135deg,#f0f4ff 0%,#fff5f8 100%);border:1px dashed #c5d3ff;border-radius:10px;">';
-        html += '<div class="tabbit-spinner" style="margin:0 auto 10px;"></div>';
-        html += '<div style="font-size:13px;color:#667eea;font-weight:600;">🖼️ 配图生成中，请稍候...</div>';
-        html += '<div style="font-size:11px;color:#999;margin-top:4px;">文字总结已就绪，可先阅读</div>';
-        html += '</div>';
-      }
       if (textContent && textContent.trim()) {
         html += '<div class="tabbit-text-wrap">' + parseMarkdown(textContent) + '</div>';
       }
@@ -2507,7 +2928,7 @@
       }
       resultContainer.innerHTML = html;
 
-      const img = resultContainer.querySelector('img');
+      const img = imageSlot ? imageSlot.querySelector('img') : null;
       if (img && imageDataUrl && imageDataUrl !== 'ERROR') {
         img.addEventListener('click', function() {
           const overlay = document.createElement('div');
@@ -2530,13 +2951,7 @@
         saveImgBtn.className = 'tabbit-copy-btn';
         saveImgBtn.textContent = '💾 保存图片';
         saveImgBtn.addEventListener('click', function() {
-          const a = document.createElement('a');
-          a.href = imageDataUrl;
-          const safeTitle = sanitizeFilename(videoInfo.title || '视频总结') || '视频总结';
-          a.download = safeTitle + '_总结.png';
-          document.body.appendChild(a);
-          a.click();
-          document.body.removeChild(a);
+          downloadGeneratedImage(imageDataUrl, videoInfo, '_总结');
         });
         actionsDiv.appendChild(saveImgBtn);
       }
@@ -2569,21 +2984,12 @@
       actionsDiv.appendChild(downloadBtn);
       actionsDiv.appendChild(modelTag);
     }
-
-    const urlDiv = contentDiv.querySelector('.tabbit-url');
-    if (urlDiv) {
-      const link = urlDiv.querySelector('a');
-      if (link) {
-        link.href = url;
-        link.textContent = url;
-      }
-    }
   }
 
   function updateImageResult(contentDiv, imageDataUrl, videoInfo) {
-    const resultContainer = contentDiv.querySelector('.tabbit-result');
-    if (!resultContainer) return;
-    const wrap = resultContainer.querySelector('.tabbit-img-wrap');
+    const imageSlot = contentDiv.querySelector('.tabbit-image-slot') || contentDiv.querySelector('.tabbit-result');
+    if (!imageSlot) return;
+    const wrap = imageSlot.querySelector('.tabbit-img-wrap');
     if (!wrap) return;
 
     if (!imageDataUrl || imageDataUrl === 'ERROR') {
@@ -2594,7 +3000,7 @@
     wrap.classList.remove('tabbit-img-loading');
     wrap.removeAttribute('style');
     wrap.style.cssText = 'text-align:center;margin-bottom:12px;animation:fadeIn 0.4s ease;';
-    wrap.innerHTML = '<img src="' + imageDataUrl + '" style="max-width:100%;border-radius:10px;box-shadow:0 4px 16px rgba(0,0,0,0.12);cursor:pointer;" title="点击查看大图" />';
+    wrap.innerHTML = '<img src="' + escapeAttr(imageDataUrl) + '" style="max-width:100%;border-radius:10px;box-shadow:0 4px 16px rgba(0,0,0,0.12);cursor:pointer;" title="点击查看大图" />';
 
     const img = wrap.querySelector('img');
     if (img) {
@@ -2616,20 +3022,15 @@
       saveImgBtn.className = 'tabbit-copy-btn tabbit-save-img-btn';
       saveImgBtn.textContent = '💾 保存图片';
       saveImgBtn.addEventListener('click', function() {
-        const a = document.createElement('a');
-        a.href = imageDataUrl;
-        const safeTitle = sanitizeFilename(videoInfo.title || '视频总结') || '视频总结';
-        a.download = safeTitle + '_总结.png';
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
+        downloadGeneratedImage(imageDataUrl, videoInfo, '_总结');
       });
       actionsDiv.insertBefore(saveImgBtn, actionsDiv.firstChild);
 
-      // 🆕 图片就绪后自动触发下载（异步 + 容错，避免影响主流程）
-      setTimeout(function() {
-        try { saveImgBtn.click(); } catch(e) { console.warn('[省流助手] 自动下载失败', e); }
-      }, 0);
+      if (CONFIG.enableImageAutoDownload !== false) {
+        setTimeout(function() {
+          try { downloadGeneratedImage(imageDataUrl, videoInfo, '_总结'); } catch(e) { console.warn('[省流助手] 自动下载失败', e); }
+        }, 0);
+      }
     }
   }
 
@@ -2708,13 +3109,141 @@
         const newId = chip.dataset.presetId;
         const preset = (CONFIG.promptPresets || []).find(p => p.id === newId);
         if (!preset) return;
+        if (newId === CONFIG.activePresetId) return;
+        CONFIG.activePresetId = newId;
+        saveConfig(CONFIG);
         panel.querySelectorAll('.tabbit-preset-chip').forEach(c => c.classList.remove('active'));
         chip.classList.add('active');
+        conversationHistory = [];
+        commentConversationHistory = [];
         if (rawTranscript) {
-          await appendPresetSummary(panel, preset, videoInfo || currentVideoInfo);
+          await runSummary(panel, rawTranscript, videoInfo || currentVideoInfo);
+        } else if (videoInfo || currentVideoInfo) {
+          showNoSubtitleState(panel, videoInfo || currentVideoInfo);
         }
       });
     });
+  }
+
+  function bindCommentButton(contentDiv, panel, videoInfo, enabled) {
+    const oldBtn = contentDiv.querySelector('#tabbit-comment-btn');
+    if (!oldBtn) return null;
+    const btn = oldBtn.cloneNode(true);
+    oldBtn.parentNode.replaceChild(btn, oldBtn);
+    btn.disabled = !enabled;
+    btn.addEventListener('click', () => runCommentSummary(panel, videoInfo));
+    return btn;
+  }
+
+  function renderSummaryShell(panel, contentDiv, presetBarHtml, videoInfo, pageUrl) {
+    const hasShell = contentDiv.querySelector('.tabbit-result')
+      && contentDiv.querySelector('.tabbit-result-actions')
+      && contentDiv.querySelector('#tabbit-comment-btn')
+      && contentDiv.querySelector('.tabbit-chat-messages');
+
+    if (hasShell) {
+      const oldPresetBar = contentDiv.querySelector('.tabbit-preset-bar');
+      if (oldPresetBar) {
+        const wrapper = document.createElement('div');
+        wrapper.innerHTML = presetBarHtml;
+        const newPresetBar = wrapper.firstElementChild;
+        if (newPresetBar) oldPresetBar.replaceWith(newPresetBar);
+      } else {
+        contentDiv.insertAdjacentHTML('afterbegin', presetBarHtml);
+      }
+
+      const resultContainer = contentDiv.querySelector('.tabbit-result');
+      resultContainer.innerHTML = '<span class="tabbit-typing-cursor"></span>';
+      let imageSlot = contentDiv.querySelector('.tabbit-image-slot');
+      if (!imageSlot) {
+        resultContainer.insertAdjacentHTML('beforebegin', '<div class="tabbit-image-slot"></div>');
+        imageSlot = contentDiv.querySelector('.tabbit-image-slot');
+      }
+      imageSlot.innerHTML = '';
+      contentDiv.querySelector('.tabbit-result-actions').innerHTML = '';
+      contentDiv.querySelector('.tabbit-chat-messages').innerHTML = '';
+
+      const oldMeta = contentDiv.querySelector('.tabbit-video-info-bottom');
+      const metaHtml = renderVideoMetaBottomHtml(videoInfo, pageUrl);
+      if (oldMeta) {
+        const wrapper = document.createElement('div');
+        wrapper.innerHTML = metaHtml;
+        const newMeta = wrapper.firstElementChild;
+        if (newMeta) oldMeta.replaceWith(newMeta);
+      } else {
+        const chatMessages = contentDiv.querySelector('.tabbit-chat-messages');
+        if (chatMessages) chatMessages.insertAdjacentHTML('beforebegin', metaHtml);
+      }
+
+      const commentBtn = contentDiv.querySelector('#tabbit-comment-btn');
+      commentBtn.disabled = true;
+    } else {
+      contentDiv.innerHTML = `
+      ${presetBarHtml}
+      <div class="tabbit-image-slot"></div>
+      <div class="tabbit-result"><span class="tabbit-typing-cursor"></span></div>
+        <div class="tabbit-result-actions"></div>
+        <button class="tabbit-comment-summary-btn" id="tabbit-comment-btn" disabled>
+          <span class="tabbit-btn-icon">💬</span>
+          <span>总结评论区</span>
+        </button>
+        ${renderVideoMetaBottomHtml(videoInfo, pageUrl)}
+        <div class="tabbit-chat-messages"></div>
+      `;
+    }
+
+    bindPresetChips(panel, videoInfo);
+    bindCommentButton(contentDiv, panel, videoInfo, false);
+  }
+
+  function setSummaryReady(panel, contentDiv, videoInfo) {
+    const input = panel.querySelector('.tabbit-chat-input');
+    const sendBtn = panel.querySelector('.tabbit-chat-send');
+    if (input) {
+      input.disabled = false;
+      input.placeholder = '基于视频内容继续提问...';
+    }
+    if (sendBtn) sendBtn.disabled = false;
+    bindCommentButton(contentDiv, panel, videoInfo, true);
+    panel.querySelectorAll('.tabbit-model-chip').forEach(c => c.classList.remove('disabled'));
+    panel.querySelectorAll('.tabbit-preset-chip').forEach(c => c.classList.remove('disabled'));
+  }
+
+  function startAsyncImageGeneration(contentDiv, textContent, videoInfo) {
+    const imgWrap = contentDiv.querySelector('.tabbit-image-slot .tabbit-img-wrap.tabbit-img-loading') || contentDiv.querySelector('.tabbit-img-wrap.tabbit-img-loading');
+    let imgAbortBtnWrap = null;
+    let imgAbortController = new AbortController();
+    if (imgWrap) {
+      imgAbortBtnWrap = document.createElement('div');
+      imgAbortBtnWrap.style.cssText = 'text-align:center;margin-top:8px;';
+      insertInlineAbortBtn(imgAbortBtnWrap, function() {
+        try { imgAbortController.abort(); } catch(e) {}
+        console.log('[省流助手-生图] 用户打断生图');
+      });
+      imgWrap.appendChild(imgAbortBtnWrap);
+    }
+
+    currentAbortController = imgAbortController;
+
+    generateImageFromSummary(textContent, imgAbortController.signal)
+      .then(function(imageDataUrl) {
+        if (imgAbortBtnWrap && imgAbortBtnWrap.parentNode) imgAbortBtnWrap.remove();
+        updateImageResult(contentDiv, imageDataUrl, videoInfo);
+        if (currentAbortController === imgAbortController) currentAbortController = null;
+      })
+      .catch(function(imgErr) {
+        if (imgAbortBtnWrap && imgAbortBtnWrap.parentNode) imgAbortBtnWrap.remove();
+        if (isAbortError(imgErr)) {
+          const wrap = contentDiv.querySelector('.tabbit-image-slot .tabbit-img-wrap') || contentDiv.querySelector('.tabbit-img-wrap');
+          if (wrap) {
+            wrap.outerHTML = '<div class="tabbit-img-wrap" style="text-align:center;margin-bottom:12px;padding:14px;background:#fff7e6;border:1px solid #ffd591;border-radius:10px;color:#b76d00;font-size:13px;">⏹ 生图已被用户打断</div>';
+          }
+        } else {
+          console.warn('[省流助手-生图] 图片生成失败:', imgErr.message);
+          updateImageResult(contentDiv, 'ERROR', videoInfo);
+        }
+        if (currentAbortController === imgAbortController) currentAbortController = null;
+      });
   }
 
   /**
@@ -2733,26 +3262,37 @@
     const pageUrl = window.location.href;
     const activePreset = (CONFIG.promptPresets || []).find(p => p.id === CONFIG.activePresetId);
     const activePrompt = (activePreset && activePreset.prompt) || CONFIG.promptText || PROMPT_TEXT;
-    const fullPrompt = activePrompt + '\n\n视频URL: ' + pageUrl + '\n视频标题: ' + (videoInfo.title || '') + '\nUP主: ' + (videoInfo.upName || '') + '\n\n字幕内容:\n' + transcript;
+    const videoDesc = limitText(videoInfo.desc || '', 1500);
+    const fullPrompt = activePrompt
+      + '\n\n视频URL: ' + pageUrl
+      + '\n视频标题: ' + (videoInfo.title || '')
+      + '\nUP主: ' + (videoInfo.upName || '')
+      + (videoDesc ? '\n视频简介: ' + videoDesc : '')
+      + '\n\n字幕内容:\n' + transcript;
 
     const presetBarHtml = renderPresetBarHtml();
     const useImageGen = isImageGenEnabled();
+    const cacheKey = buildSummaryCacheKey(videoInfo, currentModel, CONFIG.activePresetId, activePrompt, transcript);
 
-    contentDiv.innerHTML = `
-      <div class="tabbit-video-info">
-        <div class="tabbit-video-title">${escapeHtml(videoInfo.title || '未知标题')}</div>
-        <div>UP主: ${escapeHtml(videoInfo.upName || '未知')}</div>
-      </div>
-      ${presetBarHtml}
-      ${useImageGen ? `
-        <div class="tabbit-result"></div>
-      ` : `
-        <div class="tabbit-result"><span class="tabbit-typing-cursor"></span></div>
-        <div class="tabbit-result-actions"></div>
-        <div class="tabbit-url">🔗 <a href="" target="_blank"></a></div>
-      `}
-    `;
-    bindPresetChips(panel, videoInfo);
+    renderSummaryShell(panel, contentDiv, presetBarHtml, videoInfo, pageUrl);
+
+    const cachedSummary = getCachedSummary(cacheKey);
+    if (cachedSummary) {
+      console.log('[省流助手] 命中摘要缓存，跳过文字总结请求');
+      conversationHistory = [
+        { role: 'user', content: fullPrompt },
+        { role: 'assistant', content: cachedSummary }
+      ];
+      if (useImageGen) {
+        showImageResult(contentDiv, cachedSummary, '', pageUrl, videoInfo);
+        setSummaryReady(panel, contentDiv, videoInfo);
+        startAsyncImageGeneration(contentDiv, cachedSummary, videoInfo);
+      } else {
+        finalizeSummaryUI(contentDiv, cachedSummary, pageUrl, videoInfo);
+        setSummaryReady(panel, contentDiv, videoInfo);
+      }
+      return;
+    }
 
     // 🆕 创建 AbortController + 在 result 区域插入打断按钮
     abortCurrentTask();
@@ -2773,13 +3313,16 @@
     try {
       if (useImageGen) {
         const resultContainer = contentDiv.querySelector('.tabbit-result');
-        resultContainer.innerHTML =
+        const imageSlot = contentDiv.querySelector('.tabbit-image-slot');
+        if (imageSlot) {
+          imageSlot.innerHTML =
           '<div class="tabbit-img-wrap tabbit-img-loading" style="text-align:center;margin-bottom:12px;padding:30px 14px;background:linear-gradient(135deg,#f0f4ff 0%,#fff5f8 100%);border:1px dashed #c5d3ff;border-radius:10px;">' +
             '<div class="tabbit-spinner" style="margin:0 auto 10px;"></div>' +
             '<div style="font-size:13px;color:#667eea;font-weight:600;">🖼️ 配图生成中，请稍候...</div>' +
             '<div style="font-size:11px;color:#999;margin-top:4px;">文字总结正在流式输出</div>' +
-          '</div>' +
-          '<div class="tabbit-text-wrap"><span class="tabbit-typing-cursor"></span></div>';
+          '</div>';
+        }
+        resultContainer.innerHTML = '<div class="tabbit-text-wrap"><span class="tabbit-typing-cursor"></span></div>';
 
         const textWrap = resultContainer.querySelector('.tabbit-text-wrap');
 
@@ -2811,72 +3354,17 @@
           { role: 'user', content: fullPrompt },
           { role: 'assistant', content: textContent }
         ];
+        setCachedSummary(cacheKey, {
+          summary: textContent,
+          model: currentModel,
+          presetId: CONFIG.activePresetId,
+          title: videoInfo.title
+        });
 
-        contentDiv.innerHTML = `
-          <div class="tabbit-video-info">
-            <div class="tabbit-video-title">${escapeHtml(videoInfo.title || '未知标题')}</div>
-            <div>UP主: ${escapeHtml(videoInfo.upName || '未知')}</div>
-          </div>
-          ${presetBarHtml}
-          <div class="tabbit-result"></div>
-          <div class="tabbit-result-actions"></div>
-          <div class="tabbit-url">🔗 <a href="" target="_blank"></a></div>
-          <button class="tabbit-comment-summary-btn" id="tabbit-comment-btn">
-            <span class="tabbit-btn-icon">💬</span>
-            <span>总结评论区</span>
-          </button>
-          <div class="tabbit-chat-messages"></div>
-        `;
-        bindPresetChips(panel, videoInfo);
         showImageResult(contentDiv, textContent, '', pageUrl, videoInfo);
+        setSummaryReady(panel, contentDiv, videoInfo);
 
-        const commentBtn = contentDiv.querySelector('#tabbit-comment-btn');
-        if (commentBtn) {
-          commentBtn.addEventListener('click', () => runCommentSummary(panel, videoInfo));
-        }
-        input.disabled = false;
-        sendBtn.disabled = false;
-        input.placeholder = '基于视频内容继续提问...';
-        panel.querySelectorAll('.tabbit-model-chip').forEach(c => c.classList.remove('disabled'));
-        panel.querySelectorAll('.tabbit-preset-chip').forEach(c => c.classList.remove('disabled'));
-
-        // 🆕 生图阶段也插入打断按钮（覆盖在图片占位符旁边）
-        const imgWrap = contentDiv.querySelector('.tabbit-img-wrap.tabbit-img-loading');
-        let imgAbortBtnWrap = null;
-        let imgAbortController = new AbortController();
-        if (imgWrap) {
-          imgAbortBtnWrap = document.createElement('div');
-          imgAbortBtnWrap.style.cssText = 'text-align:center;margin-top:8px;';
-          insertInlineAbortBtn(imgAbortBtnWrap, function() {
-            try { imgAbortController.abort(); } catch(e) {}
-            console.log('[省流助手-生图] 用户打断生图');
-          });
-          imgWrap.appendChild(imgAbortBtnWrap);
-        }
-
-        // 🆕 把 imgAbortController 暴露成全局打断目标
-        currentAbortController = imgAbortController;
-
-        // 🆕 第二阶段：异步生图（支持打断）
-        generateImageFromSummary(textContent, imgAbortController.signal)
-          .then(function(imageDataUrl) {
-            if (imgAbortBtnWrap && imgAbortBtnWrap.parentNode) imgAbortBtnWrap.remove();
-            updateImageResult(contentDiv, imageDataUrl, videoInfo);
-            if (currentAbortController === imgAbortController) currentAbortController = null;
-          })
-          .catch(function(imgErr) {
-            if (imgAbortBtnWrap && imgAbortBtnWrap.parentNode) imgAbortBtnWrap.remove();
-            if (isAbortError(imgErr)) {
-              const wrap = contentDiv.querySelector('.tabbit-img-wrap');
-              if (wrap) {
-                wrap.outerHTML = '<div class="tabbit-img-wrap" style="text-align:center;margin-bottom:12px;padding:14px;background:#fff7e6;border:1px solid #ffd591;border-radius:10px;color:#b76d00;font-size:13px;">⏹ 生图已被用户打断</div>';
-              }
-            } else {
-              console.warn('[省流助手-生图] 图片生成失败:', imgErr.message);
-              updateImageResult(contentDiv, 'ERROR', videoInfo);
-            }
-            if (currentAbortController === imgAbortController) currentAbortController = null;
-          });
+        startAsyncImageGeneration(contentDiv, textContent, videoInfo);
 
         return;
       } else {
@@ -2897,49 +3385,19 @@
           { role: 'user', content: fullPrompt },
           { role: 'assistant', content: reply }
         ];
+        setCachedSummary(cacheKey, {
+          summary: reply,
+          model: currentModel,
+          presetId: CONFIG.activePresetId,
+          title: videoInfo.title
+        });
 
-        contentDiv.innerHTML = `
-          <div class="tabbit-video-info">
-            <div class="tabbit-video-title">${escapeHtml(videoInfo.title || '未知标题')}</div>
-            <div>UP主: ${escapeHtml(videoInfo.upName || '未知')}</div>
-          </div>
-          ${presetBarHtml}
-          <div class="tabbit-result"></div>
-          <div class="tabbit-result-actions"></div>
-          <div class="tabbit-url">🔗 <a href="" target="_blank"></a></div>
-          <button class="tabbit-comment-summary-btn" id="tabbit-comment-btn">
-            <span class="tabbit-btn-icon">💬</span>
-            <span>总结评论区</span>
-          </button>
-          <div class="tabbit-chat-messages"></div>
-        `;
-        bindPresetChips(panel, videoInfo);
         finalizeSummaryUI(contentDiv, reply, pageUrl, videoInfo);
+        setSummaryReady(panel, contentDiv, videoInfo);
       }
 
-      const commentBtn = contentDiv.querySelector('#tabbit-comment-btn');
-      if (commentBtn) {
-        commentBtn.addEventListener('click', () => runCommentSummary(panel, videoInfo));
-      }
-
-      input.disabled = false;
-      sendBtn.disabled = false;
-      input.placeholder = '基于视频内容继续提问...';
     } catch (err) {
       console.error('[省流助手]', err);
-      contentDiv.innerHTML = `
-        <div class="tabbit-video-info">
-          <div class="tabbit-video-title">${escapeHtml(videoInfo.title || '未知标题')}</div>
-          <div>UP主: ${escapeHtml(videoInfo.upName || '未知')}</div>
-        </div>
-        ${presetBarHtml}
-        <div class="tabbit-result"></div>
-        <button class="tabbit-comment-summary-btn" id="tabbit-comment-btn">
-          <span class="tabbit-btn-icon">💬</span>
-          <span>总结评论区</span>
-        </button>
-      `;
-      bindPresetChips(panel, videoInfo);
       // 🆕 区分打断和真实错误
       if (isAbortError(err)) {
         const resultContainer = contentDiv.querySelector('.tabbit-result');
@@ -2950,12 +3408,9 @@
         showError(contentDiv, err.message);
       }
 
-      const commentBtn = contentDiv.querySelector('#tabbit-comment-btn');
-      if (commentBtn) {
-        commentBtn.addEventListener('click', () => runCommentSummary(panel, videoInfo));
-      }
       input.disabled = false;
       sendBtn.disabled = false;
+      bindCommentButton(contentDiv, panel, videoInfo, true);
     } finally {
       // 🆕 清理打断按钮 + AbortController
       if (abortBtn && abortBtn._wrap && abortBtn._wrap.parentNode) {
@@ -3213,6 +3668,7 @@
     overlay.id = 'tabbit-settings-overlay';
 
     const currentModelList = (CONFIG.modelList || DEFAULT_CONFIG.modelList).join('\n');
+    const cacheStats = getSummaryCacheStats();
 
     overlay.innerHTML = `
       <div id="tabbit-settings-panel">
@@ -3304,14 +3760,28 @@
               </div>
               <div>
                 <div class="tabbit-settings-label">生图尺寸</div>
-                <select class="tabbit-settings-input" id="ts-imageGenSize" style="cursor:pointer;">
-                  <option value="1024x1024" ${(CONFIG.imageGenSize || '1024x1024') === '1024x1024' ? 'selected' : ''}>1024×1024（1:1 正方形）</option>
-                  <option value="1792x1024" ${CONFIG.imageGenSize === '1792x1024' ? 'selected' : ''}>1792×1024（16:9 横版）</option>
-                  <option value="1024x1792" ${CONFIG.imageGenSize === '1024x1792' ? 'selected' : ''}>1024×1792（9:16 竖版）</option>
-                  <option value="1536x1024" ${CONFIG.imageGenSize === '1536x1024' ? 'selected' : ''}>1536×1024（3:2 横版）</option>
-                  <option value="1024x1536" ${CONFIG.imageGenSize === '1024x1536' ? 'selected' : ''}>1024×1536（2:3 竖版）</option>
-                </select>
-                <div class="tabbit-settings-hint">生成图片的尺寸比例，同时应用于自动生图和手动生图</div>
+                <input class="tabbit-settings-input" id="ts-imageGenSize" type="text" list="ts-imageGenSizePresets" value="${escapeHtml(CONFIG.imageGenSize || '1024x1024')}" placeholder="1024x1024 / 1280x720 / auto" />
+                <datalist id="ts-imageGenSizePresets">
+                  <option value="1024x1024">1:1 正方形</option>
+                  <option value="1792x1024">16:9 横版</option>
+                  <option value="1024x1792">9:16 竖版</option>
+                  <option value="1536x1024">3:2 横版</option>
+                  <option value="1024x1536">2:3 竖版</option>
+                  <option value="1280x720">自定义横版</option>
+                  <option value="720x1280">自定义竖版</option>
+                  <option value="auto">接口自动决定</option>
+                </datalist>
+                <div class="tabbit-settings-hint">可选预设，也可手填「宽x高」。最终是否支持由你的生图 API 决定。</div>
+              </div>
+              <div class="tabbit-switch-row" style="margin-top:10px;padding:10px 12px;background:white;border:1px solid #e2e6f2;border-radius:8px;">
+                <div>
+                  <div class="tabbit-settings-label">生成后自动下载图片</div>
+                  <div class="tabbit-settings-hint" style="margin-top:2px;">开启后，自动生图和手动生成配图成功时都会下载到本地。</div>
+                </div>
+                <label class="tabbit-switch">
+                  <input type="checkbox" id="ts-enableImageAutoDownload" ${CONFIG.enableImageAutoDownload !== false ? 'checked' : ''} />
+                  <span class="tabbit-slider"></span>
+                </label>
               </div>
               <div style="margin-top:10px;">
                 <div class="tabbit-settings-label">🎨 生图提示词（自动+手动生图共用）</div>
@@ -3335,8 +3805,14 @@
           </div>
 
           <div class="tabbit-settings-group">
-            <div class="tabbit-settings-label">📍 位置</div>
-            <button class="tabbit-settings-btn tabbit-settings-btn-secondary" id="ts-reset-pos">重置面板/悬浮窗位置</button>
+            <div class="tabbit-settings-label">📍 位置和尺寸</div>
+            <button class="tabbit-settings-btn tabbit-settings-btn-secondary" id="ts-reset-pos">重置面板/悬浮窗位置和尺寸</button>
+          </div>
+
+          <div class="tabbit-settings-group">
+            <div class="tabbit-settings-label">🧠 摘要缓存</div>
+            <div class="tabbit-settings-hint" id="ts-cache-info">当前缓存 ${cacheStats.count} 条，约 ${Math.ceil(cacheStats.chars / 1000)}K 字符。最多保留 ${SUMMARY_CACHE_MAX_ENTRIES} 条，超出自动清理旧缓存。</div>
+            <button class="tabbit-settings-btn tabbit-settings-btn-secondary" id="ts-clear-summary-cache" style="margin-top:8px;">清理摘要缓存</button>
           </div>
 
         </div>
@@ -3480,6 +3956,8 @@
         mainPanel.style.right = '';
         mainPanel.style.bottom = '';
         mainPanel.style.transform = '';
+        mainPanel.style.width = '';
+        mainPanel.style.height = '';
       }
       const floatBtn = document.querySelector('#tabbit-float-btn');
       if (floatBtn) {
@@ -3488,7 +3966,17 @@
         floatBtn.style.right = '';
         floatBtn.style.transform = '';
       }
-      alert('位置已重置');
+      alert('位置和尺寸已重置');
+    });
+
+    overlay.querySelector('#ts-clear-summary-cache').addEventListener('click', function() {
+      if (!confirm('确定要清理所有摘要缓存吗？清理后同一视频会重新请求 API。')) return;
+      clearSummaryCache();
+      const info = overlay.querySelector('#ts-cache-info');
+      if (info) {
+        info.textContent = '当前缓存 0 条，约 0K 字符。最多保留 ' + SUMMARY_CACHE_MAX_ENTRIES + ' 条，超出自动清理旧缓存。';
+      }
+      alert('摘要缓存已清理');
     });
 
     overlay.querySelector('#ts-save').addEventListener('click', function() {
@@ -3542,7 +4030,15 @@
       CONFIG.imageGenApiUrl = (overlay.querySelector('#ts-imageGenApiUrl').value || '').trim();
       CONFIG.imageGenApiKey = (overlay.querySelector('#ts-imageGenApiKey').value || '').trim();
       CONFIG.imageGenModel = (overlay.querySelector('#ts-imageGenModel').value || '').trim() || DEFAULT_CONFIG.imageGenModel;
-      CONFIG.imageGenSize = overlay.querySelector('#ts-imageGenSize') ? overlay.querySelector('#ts-imageGenSize').value : '1024x1024';
+      const normalizedImageSize = normalizeImageSizeInput(overlay.querySelector('#ts-imageGenSize') ? overlay.querySelector('#ts-imageGenSize').value : '');
+      if (!normalizedImageSize) {
+        alert('生图尺寸格式不正确，请填写类似 1024x1024、1280x720，或 auto');
+        return;
+      }
+      CONFIG.imageGenSize = normalizedImageSize;
+      CONFIG.enableImageAutoDownload = overlay.querySelector('#ts-enableImageAutoDownload')
+        ? overlay.querySelector('#ts-enableImageAutoDownload').checked
+        : true;
       const newImageGenPromptText = (overlay.querySelector('#ts-imageGenPromptText').value || '').trim();
       CONFIG.imageGenPromptText = newImageGenPromptText || IMAGE_GEN_PROMPT_TEXT;
       currentModel = CONFIG.model;
@@ -3606,6 +4102,10 @@
             if (imported.imageGenApiKey !== undefined) overlay.querySelector('#ts-imageGenApiKey').value = imported.imageGenApiKey;
             if (imported.imageGenModel) overlay.querySelector('#ts-imageGenModel').value = imported.imageGenModel;
             if (imported.imageGenSize) { var igSizeEl = overlay.querySelector('#ts-imageGenSize'); if (igSizeEl) igSizeEl.value = imported.imageGenSize; }
+            if (imported.enableImageAutoDownload !== undefined) {
+              var igAutoDownloadEl = overlay.querySelector('#ts-enableImageAutoDownload');
+              if (igAutoDownloadEl) igAutoDownloadEl.checked = !!imported.enableImageAutoDownload;
+            }
             if (imported.imageGenPromptText !== undefined) overlay.querySelector('#ts-imageGenPromptText').value = imported.imageGenPromptText;
             var igFields = overlay.querySelector('#ts-imageGen-fields');
             if (igFields) igFields.style.display = overlay.querySelector('#ts-enableImageGen').checked ? '' : 'none';
@@ -3651,6 +4151,7 @@
       overlay.querySelector('#ts-imageGenApiKey').value = '';
       overlay.querySelector('#ts-imageGenModel').value = DEFAULT_CONFIG.imageGenModel;
       var igSizeReset = overlay.querySelector('#ts-imageGenSize'); if (igSizeReset) igSizeReset.value = '1024x1024';
+      var igAutoDownloadReset = overlay.querySelector('#ts-enableImageAutoDownload'); if (igAutoDownloadReset) igAutoDownloadReset.checked = DEFAULT_CONFIG.enableImageAutoDownload;
       overlay.querySelector('#ts-imageGenPromptText').value = IMAGE_GEN_PROMPT_TEXT;
       var igFieldsReset = overlay.querySelector('#ts-imageGen-fields');
       if (igFieldsReset) igFieldsReset.style.display = 'none';
@@ -3689,10 +4190,67 @@
     });
   }
 
+  function getRouteKey() {
+    return window.location.href;
+  }
+
+  function resetRuntimeForRouteChange() {
+    abortCurrentTask();
+    rawMarkdownResult = '';
+    rawTranscript = '';
+    currentVideoInfo = null;
+    conversationHistory = [];
+    commentConversationHistory = [];
+    isCommentSummarizing = false;
+    hasParsed = false;
+    const panel = document.querySelector('#tabbit-ai-summary-panel');
+    if (panel) panel.remove();
+    hideFloatBtn();
+  }
+
+  function isStaleRoute(generation) {
+    return generation !== routeGeneration || getRouteKey() !== lastRouteKey;
+  }
+
+  function scheduleRouteRestart() {
+    const routeKey = getRouteKey();
+    if (routeKey === lastRouteKey) return;
+    lastRouteKey = routeKey;
+    routeGeneration += 1;
+    if (routeRestartTimer) clearTimeout(routeRestartTimer);
+    routeRestartTimer = setTimeout(function() {
+      resetRuntimeForRouteChange();
+      if (CONFIG.autoParse) {
+        startParsing();
+      } else {
+        showFloatOnlyMode();
+      }
+    }, 800);
+  }
+
+  function installRouteWatcher() {
+    if (window.__BILI_SUBTITLE_SUMMARY_ROUTE_WATCHER__) return;
+    window.__BILI_SUBTITLE_SUMMARY_ROUTE_WATCHER__ = true;
+    const fire = function() {
+      setTimeout(scheduleRouteRestart, 120);
+    };
+    ['pushState', 'replaceState'].forEach(function(method) {
+      const original = history[method];
+      history[method] = function() {
+        const ret = original.apply(this, arguments);
+        fire();
+        return ret;
+      };
+    });
+    window.addEventListener('popstate', fire);
+  }
+
   // ==================== 自动启动主流程 ====================
   async function startParsing() {
     if (hasParsed) return;
     hasParsed = true;
+    const parsingGeneration = routeGeneration;
+    lastRouteKey = getRouteKey();
 
     console.log('[省流助手] 开始解析...');
     const videoInfo = getVideoInfo();
@@ -3719,6 +4277,7 @@
     if (loadingSpan) loadingSpan.textContent = '正在检测字幕可用性...';
 
     const hasSubtitleButton = await waitForSubtitleButton(1000, 500);
+    if (isStaleRoute(parsingGeneration)) return;
     if (!hasSubtitleButton) {
       showNoSubtitleState(panel, videoInfo);
       return;
@@ -3727,6 +4286,7 @@
     if (loadingSpan) loadingSpan.textContent = '正在获取字幕并生成摘要...';
 
     const subtitles = await fetchSubtitles(videoInfo.cid, videoInfo.bvid);
+    if (isStaleRoute(parsingGeneration)) return;
     if (subtitles.length === 0) {
       showNoSubtitleState(panel, videoInfo);
       return;
@@ -3734,6 +4294,7 @@
 
     const targetSubtitle = subtitles.find(s => s.lan === 'zh-CN' || s.lan === 'ai-zh') || subtitles[0];
     const content = await fetchSubtitleContent(targetSubtitle.subtitle_url);
+    if (isStaleRoute(parsingGeneration)) return;
     if (content.length === 0) {
       showNoSubtitleState(panel, videoInfo);
       return;
@@ -3747,6 +4308,7 @@
 
     rawTranscript = transcript;
     console.log('[省流助手] 字幕获取完成，共 ' + content.length + ' 条');
+    if (isStaleRoute(parsingGeneration)) return;
     await runSummary(panel, transcript, videoInfo);
   }
 
@@ -3757,6 +4319,8 @@
   }
 
   function init() {
+    lastRouteKey = getRouteKey();
+    installRouteWatcher();
     setTimeout(() => {
       if (CONFIG.autoParse) {
         startParsing();
