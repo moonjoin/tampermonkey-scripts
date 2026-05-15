@@ -2229,7 +2229,6 @@
         imgDiv.appendChild(saveRow);
 
         resultContainer.appendChild(imgDiv);
-        contentDiv.scrollTop = contentDiv.scrollHeight;
       }
 
       if (CONFIG.enableImageAutoDownload !== false) {
@@ -3331,7 +3330,6 @@
           const cursor = document.createElement('span');
           cursor.className = 'tabbit-typing-cursor';
           textWrap.appendChild(cursor);
-          contentDiv.scrollTop = contentDiv.scrollHeight;
         });
 
         // 🆕 透传 signal 给文字总结
@@ -3376,7 +3374,6 @@
           const cursor = document.createElement('span');
           cursor.className = 'tabbit-typing-cursor';
           resultContainer.appendChild(cursor);
-          contentDiv.scrollTop = contentDiv.scrollHeight;
         });
 
         const reply = await callAIStream(messages, onDelta, { signal: localController.signal });
@@ -3504,7 +3501,6 @@
         const cursor = document.createElement('span');
         cursor.className = 'tabbit-typing-cursor';
         resultEl.appendChild(cursor);
-        contentDiv.scrollTop = contentDiv.scrollHeight;
       });
 
       const reply = await callAIStream(messages, onDelta, { signal: localController.signal });
@@ -3534,7 +3530,6 @@
         flomoCommentBtn.addEventListener('click', function() { sendToFlomo(reply, this); });
       }
 
-      contentDiv.scrollTop = contentDiv.scrollHeight;
     } catch (err) {
       console.error('[省流助手-评论区]', err);
       // 🆕 区分打断和真实错误
@@ -3605,8 +3600,6 @@
     messagesContainer.appendChild(aiWrap);
 
     const contentDiv = panel.querySelector('.tabbit-panel-content');
-    contentDiv.scrollTop = contentDiv.scrollHeight;
-
     // 🆕 把发送按钮变为打断按钮
     abortCurrentTask();
     currentAbortController = new AbortController();
@@ -3628,14 +3621,12 @@
         const cursor = document.createElement('span');
         cursor.className = 'tabbit-typing-cursor';
         aiMsg.appendChild(cursor);
-        contentDiv.scrollTop = contentDiv.scrollHeight;
       });
 
       const reply = await callAIStream(sentMessages, onDelta, { signal: localController.signal });
       conversationHistory.push({ role: 'assistant', content: reply });
 
       aiMsg.innerHTML = parseMarkdown(reply);
-      contentDiv.scrollTop = contentDiv.scrollHeight;
     } catch (err) {
       console.error('[省流助手-对话]', err);
       conversationHistory.pop();
@@ -3649,7 +3640,6 @@
         aiMsg.style.color = '#c00';
         aiMsg.textContent = '⚠️ ' + err.message;
       }
-      contentDiv.scrollTop = contentDiv.scrollHeight;
     } finally {
       // 🆕 还原发送按钮
       restoreSendBtn(sendBtn);
