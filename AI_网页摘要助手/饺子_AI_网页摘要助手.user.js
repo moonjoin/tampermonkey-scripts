@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         饺子 AI 网页摘要助手
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      2.7.0
+// @version      2.7.1
 // @description  指定网站自动弹出 AI 网页摘要，支持连续对话、多预设、多模板、SPA路由，flomo、坚果云双文件云同步。
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
@@ -77,7 +77,8 @@
     floatButton: { side: 'right', y: null, opacity: 0.55 },
     panel: { width: 460, height: null, heightRatio: 0.82, left: null, top: null },
     extractMaxChars: 16000,
-    cloudSync: { account: '', appPassword: '', lastSyncAt: 0, lastSyncDirection: '' }
+    cloudSync: { account: '', appPassword: '', lastSyncAt: 0, lastSyncDirection: '' },
+    autoCopy: { enabled: true, withSource: false }
   };
 
   function clone(obj) { return JSON.parse(JSON.stringify(obj)); }
@@ -391,6 +392,7 @@
       result.defaultPromptTemplateId = result.promptTemplates[0]?.id || 'default';
     }
     result.extractMaxChars = Number(result.extractMaxChars || 16000);
+    result.autoCopy = { ...base.autoCopy, ...(saved.autoCopy || {}) };
     return result;
   }
 
@@ -1551,6 +1553,72 @@
         color: #8b5cf6; font-weight: bold;
       }
       @keyframes tabbitBlink { to { visibility: hidden; } }
+
+      .tabbit-copy-toast {
+        position: fixed;
+        bottom: 90px; right: 16px;
+        background: rgba(0, 0, 0, 0.82);
+        color: #fff;
+        padding: 8px 18px;
+        border-radius: 8px;
+        font-size: 13px;
+        z-index: 2147483647;
+        pointer-events: none;
+        opacity: 0;
+        transform: translateY(8px);
+        transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        backdrop-filter: blur(4px);
+        font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+      }
+      .tabbit-copy-toast.show {
+        opacity: 1;
+        transform: translateY(0);
+      }
+      .tabbit-copy-ctx {
+        position: fixed;
+        z-index: 2147483647;
+        background: rgba(30, 30, 30, 0.95);
+        backdrop-filter: blur(8px);
+        border-radius: 10px;
+        padding: 10px 14px;
+        box-shadow: 0 4px 16px rgba(0,0,0,0.3);
+        font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+        min-width: 160px;
+        animation: tabbitCtxIn 0.15s ease-out;
+      }
+      @keyframes tabbitCtxIn {
+        from { opacity: 0; transform: scale(0.95); }
+        to   { opacity: 1; transform: scale(1); }
+      }
+      .tabbit-copy-ctx-row {
+        display: flex; align-items: center; gap: 8px;
+        color: #eee; font-size: 13px;
+        cursor: pointer; padding: 4px 0;
+        transition: color 0.15s;
+      }
+      .tabbit-copy-ctx-row:hover { color: #fff; }
+      .tabbit-copy-ctx-chk {
+        width: 14px; height: 14px;
+        border: 1.5px solid #888; border-radius: 3px;
+        display: flex; align-items: center; justify-content: center;
+        flex-shrink: 0; transition: all 0.15s ease;
+      }
+      .tabbit-copy-ctx-chk.on {
+        background: #4fc3f7; border-color: #4fc3f7;
+      }
+      .tabbit-copy-ctx-chk.on::after {
+        content: '';
+        display: block;
+        width: 4px; height: 7px;
+        border: solid #fff;
+        border-width: 0 1.5px 1.5px 0;
+        transform: rotate(45deg) translateY(-1px);
+      }
+      .tabbit-copy-ctx-hint {
+        margin-top: 6px; padding-top: 6px;
+        border-top: 1px solid rgba(255,255,255,0.1);
+        color: #888; font-size: 11px;
+      }
     `;
     if (typeof GM_addStyle === 'function') GM_addStyle(css);
     else {
@@ -1617,6 +1685,138 @@
     } else {
       floatBtn.style.bottom = '80px';
       floatBtn.style.top = 'auto';
+    }
+  }
+
+  /******************************************************************
+   * 11.5 📋 自动复制模块
+   ******************************************************************/
+  const AC_MIN_LEN = 2;
+  const AC_COOLDOWN = 2000;
+  let acLastCopyTime = 0;
+  let acCtxEl = null;
+  let acToastEl = null;
+  let acToastTimer = null;
+
+  function acShowToast(text) {
+    if (!acToastEl) {
+      acToastEl = document.createElement('div');
+      acToastEl.className = 'tabbit-copy-toast';
+      document.body.appendChild(acToastEl);
+    }
+    clearTimeout(acToastTimer);
+    acToastEl.textContent = text || '✅ 已复制';
+    acToastEl.classList.add('show');
+    acToastTimer = setTimeout(() => acToastEl.classList.remove('show'), 1500);
+  }
+
+  function acBuildCtxMenu() {
+    if (acCtxEl) acCtxEl.remove();
+    const menu = document.createElement('div');
+    menu.className = 'tabbit-copy-ctx';
+    const enabled = config.autoCopy?.enabled !== false;
+    const withSrc = !!config.autoCopy?.withSource;
+    menu.innerHTML = `
+      <div class="tabbit-copy-ctx-row" data-ac="toggle">
+        <div class="tabbit-copy-ctx-chk ${enabled ? 'on' : ''}"></div>
+        <span>自动复制</span>
+      </div>
+      <div class="tabbit-copy-ctx-row" data-ac="source">
+        <div class="tabbit-copy-ctx-chk ${withSrc ? 'on' : ''}"></div>
+        <span>附带出处信息</span>
+      </div>
+      <div class="tabbit-copy-ctx-hint">快捷键 Alt+X</div>
+    `;
+    if (floatBtn) {
+      const rect = floatBtn.getBoundingClientRect();
+      let left = rect.left - 130;
+      let top = rect.top;
+      if (left < 8) left = rect.right + 8;
+      if (top + 100 > window.innerHeight) top = window.innerHeight - 100;
+      menu.style.left = left + 'px';
+      menu.style.top = top + 'px';
+    }
+    menu.addEventListener('click', e => {
+      e.stopPropagation();
+      const row = e.target.closest('[data-ac]');
+      if (!row) return;
+      if (row.dataset.ac === 'toggle') {
+        config.autoCopy.enabled = config.autoCopy.enabled === false ? true : false;
+        saveConfig();
+        acBuildCtxMenu();
+        acShowToast(config.autoCopy.enabled ? '✅ 自动复制已开启' : '⏸️ 自动复制已关闭');
+      } else if (row.dataset.ac === 'source') {
+        config.autoCopy.withSource = !config.autoCopy.withSource;
+        saveConfig();
+        acBuildCtxMenu();
+        acShowToast(config.autoCopy.withSource ? '📎 出处信息已开启' : '📄 出处信息已关闭');
+      }
+    });
+    document.body.appendChild(menu);
+    acCtxEl = menu;
+  }
+
+  function acCloseCtxMenu() {
+    if (acCtxEl) { acCtxEl.remove(); acCtxEl = null; }
+  }
+
+  function acIsInsideEditable(el) {
+    if (!el) return false;
+    if (el.isContentEditable) return true;
+    const tag = el.tagName;
+    return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
+  }
+
+  function acCopySelectedText() {
+    if (config.autoCopy?.enabled === false) return;
+    if (acIsInsideEditable(document.activeElement)) return;
+    const selection = window.getSelection();
+    const text = selection.toString().trim();
+    if (!text || text.length < AC_MIN_LEN) return;
+    if (Date.now() - acLastCopyTime < AC_COOLDOWN) return;
+    acLastCopyTime = Date.now();
+    let content = text;
+    if (config.autoCopy?.withSource) {
+      content += `\n—————\n${document.title}\n${window.location.href}`;
+    }
+    navigator.clipboard.writeText(content).then(() => {
+      acShowToast('✅ 已复制');
+    }).catch(() => {});
+  }
+
+  function acToggleAutoCopy() {
+    if (!config.autoCopy) config.autoCopy = { enabled: true, withSource: false };
+    config.autoCopy.enabled = config.autoCopy.enabled === false ? true : false;
+    saveConfig();
+    acShowToast(config.autoCopy.enabled ? '✅ 自动复制已开启' : '⏸️ 自动复制已关闭');
+  }
+
+  function acInit() {
+    document.addEventListener('mouseup', acCopySelectedText);
+    let acSelTimer = null;
+    document.addEventListener('selectionchange', () => {
+      clearTimeout(acSelTimer);
+      acSelTimer = setTimeout(() => {
+        const sel = window.getSelection();
+        const t = sel.toString().trim();
+        if (t.length >= AC_MIN_LEN) acCopySelectedText();
+      }, 500);
+    });
+    document.addEventListener('touchend', () => setTimeout(acCopySelectedText, 100));
+    document.addEventListener('keydown', e => {
+      if (e.altKey && e.key.toLowerCase() === 'x') {
+        e.preventDefault();
+        acToggleAutoCopy();
+      }
+    });
+    document.addEventListener('click', acCloseCtxMenu);
+    if (floatBtn) {
+      floatBtn.addEventListener('contextmenu', e => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (acCtxEl) { acCloseCtxMenu(); }
+        else { acBuildCtxMenu(); }
+      });
     }
   }
 
@@ -2329,6 +2529,15 @@
           <input id="tabbit-set-flomo-api" type="text" placeholder="https://flomoapp.com/iwh/...">
         </label>
 
+        <div class="tabbit-section-title">📋 自动复制</div>
+        <small class="tabbit-help">选中文本后自动复制到剪贴板，可选择是否附带页面标题和链接作为出处。也可右键点击浮动按钮快速切换。</small>
+        <label class="tabbit-field">
+          <span><input id="tabbit-set-auto-copy" type="checkbox"> 开启自动复制（选中文本自动复制）</span>
+        </label>
+        <label class="tabbit-field">
+          <span><input id="tabbit-set-auto-copy-source" type="checkbox"> 复制时附带出处信息（页面标题 + 链接）</span>
+        </label>
+
         <div class="tabbit-section-title">☁️ 坚果云 WebDAV 云同步</div>
         <small class="tabbit-help">
           • <code>tabbit-shared/ai-profiles.json</code> — API 预设（多脚本共享）<br>
@@ -2465,6 +2674,8 @@
     settingsEl.querySelector('#tabbit-set-extract-max').value = config.extractMaxChars || 16000;
     settingsEl.querySelector('#tabbit-set-auto-run').checked = !!config.autoRun;
     settingsEl.querySelector('#tabbit-set-flomo-api').value = config.flomoApiUrl || '';
+    settingsEl.querySelector('#tabbit-set-auto-copy').checked = config.autoCopy?.enabled !== false;
+    settingsEl.querySelector('#tabbit-set-auto-copy-source').checked = !!config.autoCopy?.withSource;
     settingsEl.querySelector('#tabbit-set-jgy-account').value = config.cloudSync?.account || '';
     settingsEl.querySelector('#tabbit-set-jgy-password').value = config.cloudSync?.appPassword || '';
 
@@ -2626,6 +2837,10 @@
     config.autoRun = settingsEl.querySelector('#tabbit-set-auto-run').checked;
     config.extractMaxChars = Number(settingsEl.querySelector('#tabbit-set-extract-max').value || 16000);
     config.flomoApiUrl = settingsEl.querySelector('#tabbit-set-flomo-api').value.trim();
+    config.autoCopy = {
+      enabled: settingsEl.querySelector('#tabbit-set-auto-copy').checked,
+      withSource: settingsEl.querySelector('#tabbit-set-auto-copy-source').checked
+    };
     config.cloudSync = {
       ...(config.cloudSync || {}),
       account: settingsEl.querySelector('#tabbit-set-jgy-account').value.trim(),
@@ -2837,6 +3052,7 @@
   function bootstrap() {
     createStyles();
     createFloatButton();
+    acInit();
     registerMenus();
 
     // 📜 规则自动总结：首次加载即匹配
