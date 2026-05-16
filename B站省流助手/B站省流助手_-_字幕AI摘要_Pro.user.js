@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站省流助手 - 字幕AI摘要 Pro
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      3.8.1
+// @version      3.8.2
 // @description  自动提取B站视频字幕，通过自定义AI API生成极简摘要，支持模型切换、持续对话和评论区总结；支持自动解析开关、自动获取模型列表、flomo自动加标签，新增总结生图功能；v3.7.1 增加打断总结功能，在"无字幕"状态下，新增"手动上传字幕"按钮
 // @author       次元饺子
 // @match        https://www.bilibili.com/video/*
@@ -71,6 +71,7 @@
     ],
     promptText: PROMPT_TEXT,
     commentPromptText: COMMENT_PROMPT_TEXT,
+    commentTextPresets: ['省流'],
     skipDuration: 60,
     autoParse: true,
     promptPresets: DEFAULT_PRESETS,
@@ -81,7 +82,11 @@
     imageGenModel: 'gemini-3.1-flash-image-preview',
     imageGenSize: '1024x1024',
     enableImageAutoDownload: true,
-    imageGenPromptText: IMAGE_GEN_PROMPT_TEXT
+    imageGenPromptText: IMAGE_GEN_PROMPT_TEXT,
+    commentMaxPages: 8,
+    commentLimit: 188,
+    commentMinDelay: 1800,
+    commentMaxDelay: 3800
   };
 
   function loadConfig() {
@@ -444,6 +449,306 @@
     return true;
   }
 
+  function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  function isUsableBiliElement(el) {
+    if (!el || el.closest('#tabbit-ai-summary-panel') || el.closest('#tabbit-settings-overlay')) return false;
+    if (el.disabled || el.getAttribute('aria-disabled') === 'true') return false;
+    const style = getComputedStyle(el);
+    return style.display !== 'none' && style.visibility !== 'hidden';
+  }
+
+  function deepQuerySelectorAll(selector, root) {
+    const results = [];
+    const visited = new Set();
+    function walk(node) {
+      if (!node || visited.has(node)) return;
+      visited.add(node);
+      if (node.matches) {
+        try {
+          if (node.matches(selector)) results.push(node);
+        } catch(e) {}
+      }
+      if (node.querySelectorAll) {
+        try {
+          node.querySelectorAll(selector).forEach(el => results.push(el));
+        } catch(e) {}
+      }
+      if (node.shadowRoot) walk(node.shadowRoot);
+      const children = node.querySelectorAll ? Array.from(node.querySelectorAll('*')) : [];
+      children.forEach(el => {
+        if (el.shadowRoot) walk(el.shadowRoot);
+      });
+    }
+    walk(root || document);
+    return results;
+  }
+
+  function getCommentAreaRoot() {
+    return document.querySelector('bili-comment-box')
+      || document.querySelector('#comment')
+      || document.querySelector('.reply-box')
+      || document.querySelector('.comment-container')
+      || document.querySelector('[class*="comment"]');
+  }
+
+  function isBiliCommentEditorCandidate(el) {
+    if (!isUsableBiliElement(el)) return false;
+    const tag = (el.tagName || '').toLowerCase();
+    if (el.id === 'body' || tag === 'bili-comment-box' || tag === 'bili-comment-rich-textarea') return false;
+    if (tag === 'textarea') return true;
+    if (el.classList && el.classList.contains('brt-editor')) return true;
+    if (el.getAttribute('contenteditable') === 'true') {
+      const placeholder = el.getAttribute('placeholder') || el.getAttribute('aria-placeholder') || '';
+      return !!(el.closest('.brt-root') || el.closest('#input') || /评论|回复/.test(placeholder));
+    }
+    return false;
+  }
+
+  function findBiliRichTextEditor(root) {
+    const richTextareas = deepQuerySelectorAll('bili-comment-rich-textarea', root || document);
+    for (const host of richTextareas) {
+      if (!host || !host.shadowRoot) continue;
+      const editor = deepQuerySelectorAll('.brt-editor, [contenteditable="true"], textarea', host.shadowRoot)
+        .find(isBiliCommentEditorCandidate);
+      if (editor) return editor;
+    }
+    return null;
+  }
+
+  async function findBiliCommentEditor() {
+    const root = getCommentAreaRoot();
+    if (root) root.scrollIntoView({ behavior: 'smooth', block: 'center' });
+
+    const selectors = [
+      '.brt-editor',
+      '[contenteditable="true"].brt-editor',
+      'textarea[placeholder*="评论"]',
+      'textarea[placeholder*="回复"]',
+      '#comment textarea',
+      '.reply-box textarea',
+      '.comment-send textarea',
+      '#comment [contenteditable="true"]',
+      '.reply-box [contenteditable="true"]',
+      '.comment-send [contenteditable="true"]',
+      '[contenteditable="true"][placeholder*="评论"]',
+      '[contenteditable="true"][aria-placeholder*="评论"]'
+    ];
+
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const roots = [root, document].filter(Boolean);
+      for (const searchRoot of roots) {
+        const richEditor = findBiliRichTextEditor(searchRoot);
+        if (richEditor) return richEditor;
+      }
+      for (const selector of selectors) {
+        for (const searchRoot of roots) {
+          const item = deepQuerySelectorAll(selector, searchRoot).find(isBiliCommentEditorCandidate);
+          if (item) return item;
+        }
+      }
+      await sleep(250);
+    }
+    return null;
+  }
+
+  function findBiliCommentHost(editor) {
+    let node = editor;
+    const visited = new Set();
+    while (node && !visited.has(node)) {
+      visited.add(node);
+      if (node.tagName && node.tagName.toLowerCase() === 'bili-comment-box') return node;
+      const root = node.getRootNode ? node.getRootNode() : null;
+      if (root && root.host && root.host !== node) {
+        if (root.host.tagName && root.host.tagName.toLowerCase() === 'bili-comment-box') return root.host;
+        node = root.host;
+        continue;
+      }
+      node = node.parentElement || node.parentNode;
+      if (node === document) break;
+    }
+    return document.querySelector('bili-comment-box');
+  }
+
+  function getBiliCommentApi(editor) {
+    const host = findBiliCommentHost(editor);
+    const root = editor && editor.getRootNode ? editor.getRootNode() : null;
+    const richHost = root && root.host && root.host.tagName && root.host.tagName.toLowerCase() === 'bili-comment-rich-textarea'
+      ? root.host
+      : null;
+    const body = editor;
+    return { host, richHost, body };
+  }
+
+  function notifyBiliCommentInput(editor, text) {
+    const { host, richHost, body } = getBiliCommentApi(editor);
+    const events = [
+      new InputEvent('beforeinput', { bubbles: true, composed: true, cancelable: true, inputType: 'insertText', data: text }),
+      new InputEvent('input', { bubbles: true, composed: true, cancelable: true, inputType: 'insertText', data: text }),
+      new Event('change', { bubbles: true, composed: true })
+    ];
+    events.forEach(ev => {
+      try { body.dispatchEvent(ev); } catch(e) {}
+      try { richHost && richHost.dispatchEvent(new Event(ev.type, { bubbles: true, composed: true })); } catch(e) {}
+      try { host && host.dispatchEvent(new Event(ev.type, { bubbles: true, composed: true })); } catch(e) {}
+    });
+  }
+
+  function getCommentTextPresets() {
+    let presets = CONFIG.commentTextPresets;
+    if (typeof presets === 'string') {
+      presets = presets.split('\n');
+    }
+    if (!Array.isArray(presets)) presets = DEFAULT_CONFIG.commentTextPresets;
+    presets = presets
+      .map(function(text) { return String(text || '').trim(); })
+      .filter(Boolean);
+    return presets.length > 0 ? presets : DEFAULT_CONFIG.commentTextPresets;
+  }
+
+  function pickRandomCommentText() {
+    const presets = getCommentTextPresets();
+    return presets[Math.floor(Math.random() * presets.length)] || '省流';
+  }
+
+  function findBiliCommentImageButton(editor) {
+    const host = findBiliCommentHost(editor);
+    const roots = [
+      host && host.shadowRoot,
+      getCommentAreaRoot(),
+      document
+    ].filter(Boolean);
+
+    const specificSelectors = [
+      'button[title*="图片"]',
+      'button[aria-label*="图片"]',
+      'button[class*="image"]',
+      'button[class*="pic"]',
+      'button[class*="picture"]',
+      'button[class*="upload"]',
+      '[role="button"][title*="图片"]',
+      '[role="button"][aria-label*="图片"]',
+      '[role="button"][class*="image"]',
+      '[role="button"][class*="pic"]',
+      '[role="button"][class*="upload"]'
+    ];
+
+    for (const root of roots) {
+      for (const selector of specificSelectors) {
+        const btn = deepQuerySelectorAll(selector, root).find(isUsableBiliElement);
+        if (btn) return btn;
+      }
+    }
+
+    for (const root of roots) {
+      const toolBtns = deepQuerySelectorAll('#footer button.tool-btn, button.tool-btn, #footer [role="button"], [class*="tool-btn"]', root)
+        .filter(isUsableBiliElement);
+      const imageBtn = toolBtns.find(function(btn) {
+        const text = (btn.textContent || '').trim();
+        const title = btn.getAttribute('title') || btn.getAttribute('aria-label') || '';
+        const cls = btn.className && typeof btn.className === 'string' ? btn.className : '';
+        const meta = text + ' ' + title + ' ' + cls;
+        if (/表情|emoji|emote|at|mention|话题|投票|vote/i.test(meta)) return false;
+        return /图片|image|pic|picture|upload|photo|image-upload/i.test(meta);
+      });
+      if (imageBtn) return imageBtn;
+
+      const fallbackBtns = toolBtns.filter(function(btn) {
+        const meta = ((btn.textContent || '') + ' ' + (btn.getAttribute('title') || '') + ' ' + (btn.className || '')).trim();
+        return !/表情|emoji|emote|at|mention|话题|投票|vote/i.test(meta);
+      });
+      if (fallbackBtns.length === 1) return fallbackBtns[0];
+      if (fallbackBtns.length > 1) return fallbackBtns[fallbackBtns.length - 1];
+    }
+
+    for (const root of roots) {
+      const fileInput = deepQuerySelectorAll('input[type="file"]', root).find(function(input) {
+        if (!isUsableBiliElement(input) && input.style.display !== 'none') return false;
+        return /image|\.(png|jpe?g|webp|gif)/i.test(input.accept || '');
+      });
+      if (fileInput) return fileInput;
+    }
+
+    return null;
+  }
+
+  function clickBiliCommentImageButton(editor) {
+    const btn = findBiliCommentImageButton(editor);
+    if (!btn) return false;
+    try {
+      btn.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true, composed: true, cancelable: true }));
+      btn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, composed: true, cancelable: true }));
+      btn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, composed: true, cancelable: true }));
+      btn.dispatchEvent(new MouseEvent('pointerup', { bubbles: true, composed: true, cancelable: true }));
+      btn.click();
+      return true;
+    } catch(e) {
+      console.warn('[省流助手-评论上传按钮] 点击失败:', e);
+      return false;
+    }
+  }
+
+  function setBiliCommentText(editor, text) {
+    if (!isBiliCommentEditorCandidate(editor)) {
+      throw new Error('找到的不是评论输入框，已停止写入，避免破坏评论区');
+    }
+    editor.focus();
+    if ('value' in editor) {
+      editor.value = text;
+      notifyBiliCommentInput(editor, text);
+    } else {
+      try {
+        editor.click();
+        editor.focus();
+        const sel = window.getSelection();
+        const range = document.createRange();
+        range.selectNodeContents(editor);
+        sel.removeAllRanges();
+        sel.addRange(range);
+        document.execCommand('insertText', false, text);
+      } catch(e) {}
+      if ((editor.textContent || '').trim() !== text) {
+        editor.innerHTML = escapeHtml(text);
+      }
+      editor.setAttribute('data-inputed', 'true');
+      notifyBiliCommentInput(editor, text);
+    }
+  }
+
+  async function fillBiliCommentTextOnly(btn) {
+    const originalText = btn ? btn.textContent : '';
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = '⏳ 填写中...';
+    }
+    try {
+      const editor = await findBiliCommentEditor();
+      if (!editor) throw new Error('没找到评论输入框，请先滚到评论区或点一下评论框');
+      const commentText = pickRandomCommentText();
+      setBiliCommentText(editor, commentText);
+      const openedUpload = clickBiliCommentImageButton(editor);
+      if (btn) {
+        btn.textContent = openedUpload ? '✅ 已打开上传' : '✅ 已填入';
+        setTimeout(function() {
+          btn.textContent = originalText || '💬 填字并点上传';
+          btn.disabled = false;
+        }, 1800);
+      }
+      if (!openedUpload) {
+        console.warn('[省流助手-评论上传按钮] 没找到可点击的图片上传按钮，请手动上传');
+      }
+    } catch(err) {
+      console.error('[省流助手-评论填字]', err);
+      alert('填入评论失败：' + err.message);
+      if (btn) {
+        btn.textContent = originalText || '💬 填字并点上传';
+        btn.disabled = false;
+      }
+    }
+  }
+
   // ==================== 评论区防Ban工具函数 ====================
   function randomDelay(min, max) {
     const delay = min + Math.random() * (max - min);
@@ -505,11 +810,15 @@
   async function fetchAllComments(aid, statusCallback) {
     const allComments = [];
     const safeFetch = createSafeFetcher();
+    const maxPages = CONFIG.commentMaxPages || COMMENT_CONFIG.maxPages;
+    const commentLimit = CONFIG.commentLimit || COMMENT_CONFIG.commentLimit;
+    const minDelay = CONFIG.commentMinDelay || COMMENT_CONFIG.minDelay;
+    const maxDelay = CONFIG.commentMaxDelay || COMMENT_CONFIG.maxDelay;
 
-    for (let page = 1; page <= COMMENT_CONFIG.maxPages; page++) {
+    for (let page = 1; page <= maxPages; page++) {
       try {
         if (page > 1) {
-          await randomDelay(COMMENT_CONFIG.minDelay, COMMENT_CONFIG.maxDelay);
+          await randomDelay(minDelay, maxDelay);
         }
 
         const result = await retryWithBackoff(
@@ -522,7 +831,7 @@
         if (!replies || replies.length === 0) break;
 
         for (const reply of replies) {
-          if (allComments.length >= COMMENT_CONFIG.commentLimit) break;
+          if (allComments.length >= commentLimit) break;
           const name = reply.member?.uname || '匿名';
           const text = reply.content?.message || '';
           const like = reply.like || 0;
@@ -530,7 +839,7 @@
 
           if (COMMENT_CONFIG.includeReplies && reply.replies) {
             for (const sub of reply.replies) {
-              if (allComments.length >= COMMENT_CONFIG.commentLimit) break;
+              if (allComments.length >= commentLimit) break;
               const subName = sub.member?.uname || '匿名';
               const subText = sub.content?.message || '';
               const subLike = sub.like || 0;
@@ -542,7 +851,7 @@
         if (statusCallback) statusCallback('已获取 ' + allComments.length + ' 条评论 (第' + page + '页)...');
 
         if (replies.length < COMMENT_CONFIG.pageSize) break;
-        if (allComments.length >= COMMENT_CONFIG.commentLimit) break;
+        if (allComments.length >= commentLimit) break;
 
       } catch (e) {
         console.warn('[省流助手] 获取第' + page + '页评论失败:', e.message);
@@ -1297,6 +1606,51 @@
       .tabbit-settings-group {
         margin-bottom: 18px;
       }
+      .tabbit-collapse {
+        margin-bottom: 18px;
+        border: 1px solid #e8e8ef;
+        border-radius: 12px;
+        overflow: hidden;
+        background: #fafbfc;
+      }
+      .tabbit-collapse-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 14px 16px;
+        cursor: pointer;
+        user-select: none;
+        transition: background 0.2s;
+      }
+      .tabbit-collapse-header:hover {
+        background: #f0f2f8;
+      }
+      .tabbit-collapse-header .tabbit-collapse-title {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 13px;
+        font-weight: 600;
+        color: #444;
+      }
+      .tabbit-collapse-header .tabbit-collapse-arrow {
+        font-size: 12px;
+        color: #999;
+        transition: transform 0.3s ease;
+      }
+      .tabbit-collapse.open .tabbit-collapse-arrow {
+        transform: rotate(90deg);
+      }
+      .tabbit-collapse-body {
+        display: none;
+        padding: 0 16px 16px;
+      }
+      .tabbit-collapse.open .tabbit-collapse-body {
+        display: block;
+      }
+      .tabbit-collapse-body .tabbit-settings-group:last-child {
+        margin-bottom: 0;
+      }
       .tabbit-settings-label {
         font-size: 12px;
         font-weight: 600;
@@ -1479,19 +1833,19 @@
         50% { box-shadow: 0 4px 24px rgba(102,126,234,0.75); }
       }
       #tabbit-float-btn {
-        position: fixed;
-        top: 50%;
-        right: 0;
-        z-index: 9999998;
-        display: flex;
+        position: fixed !important;
+        top: 50% !important;
+        right: 0 !important;
+        z-index: 2147483647 !important;
+        display: flex !important;
         flex-direction: column;
         align-items: center;
         justify-content: center;
         width: 50px;
         padding: 10px 0;
-        background: linear-gradient(160deg, #667eea 0%, #764ba2 100%);
-        color: white;
-        border: none;
+        background: linear-gradient(160deg, #667eea 0%, #764ba2 100%) !important;
+        color: white !important;
+        border: none !important;
         border-radius: 12px 0 0 12px;
         cursor: grab;
         font-size: 18px;
@@ -1502,6 +1856,9 @@
         transition: width 0.2s, background 0.2s;
         user-select: none;
         gap: 6px;
+        pointer-events: auto !important;
+        visibility: visible !important;
+        opacity: 1 !important;
       }
       #tabbit-float-btn.dragging { cursor: grabbing; animation: none; }
       #tabbit-float-btn:hover {
@@ -1885,8 +2242,8 @@
       panel.style.animation = 'slideOutRight 0.3s ease forwards';
       setTimeout(() => {
         panel.style.display = 'none';
-        showFloatBtn(panel);
-      }, 300);
+        try { showFloatBtn(panel); } catch(e) { console.warn('[省流助手] 显示悬浮窗失败:', e); }
+      }, 350);
     });
 
     bindModelChips(panel);
@@ -2007,14 +2364,19 @@
   // ==================== 悬浮按钮 ====================
   function applyFloatBtnPosition(btn) {
     if (POSITIONS.floatBtn) {
-      btn.style.left = POSITIONS.floatBtn.left + 'px';
-      btn.style.top = POSITIONS.floatBtn.top + 'px';
+      const maxLeft = window.innerWidth - 60;
+      const maxTop = window.innerHeight - 100;
+      const left = Math.max(0, Math.min(POSITIONS.floatBtn.left, maxLeft));
+      const top = Math.max(0, Math.min(POSITIONS.floatBtn.top, maxTop));
+      btn.style.left = left + 'px';
+      btn.style.top = top + 'px';
       btn.style.right = 'auto';
       btn.style.transform = 'none';
     }
   }
 
   function showFloatBtn(panel) {
+    createStyles();
     const old = document.querySelector('#tabbit-float-btn');
     if (old) old.remove();
 
@@ -2022,6 +2384,7 @@
     btn.id = 'tabbit-float-btn';
     btn.title = panel ? '打开省流助手（可拖动）' : '点击开始解析（可拖动）';
     btn.innerHTML = '<span class="tabbit-float-icon">🎬</span><span class="tabbit-float-label">省流助手</span>';
+    btn.style.cssText = 'position:fixed!important;z-index:2147483647!important;display:flex!important;visibility:visible!important;opacity:1!important;pointer-events:auto!important;';
     document.body.appendChild(btn);
 
     applyFloatBtnPosition(btn);
@@ -2217,16 +2580,7 @@
         });
         imgDiv.appendChild(img);
 
-        const saveRow = document.createElement('div');
-        saveRow.style.cssText = 'display:flex;gap:8px;justify-content:center;margin-top:8px;';
-        const saveBtn = document.createElement('button');
-        saveBtn.className = 'tabbit-copy-btn';
-        saveBtn.textContent = '💾 保存图片';
-        saveBtn.addEventListener('click', function() {
-          downloadGeneratedImage(imageDataUrl, videoInfo, '_配图');
-        });
-        saveRow.appendChild(saveBtn);
-        imgDiv.appendChild(saveRow);
+        imgDiv.appendChild(createImageActionRow(imageDataUrl, videoInfo, '_配图'));
 
         resultContainer.appendChild(imgDiv);
       }
@@ -2896,6 +3250,31 @@
     return CONFIG.enableImageGen === true;
   }
 
+  function createImageActionRow(imageDataUrl, videoInfo, filenameSuffix) {
+    const row = document.createElement('div');
+    row.className = 'tabbit-img-actions';
+    row.style.cssText = 'display:flex;gap:8px;justify-content:center;flex-wrap:wrap;margin-top:8px;';
+
+    const saveBtn = document.createElement('button');
+    saveBtn.className = 'tabbit-copy-btn tabbit-save-img-btn';
+    saveBtn.textContent = '💾 保存图片';
+    saveBtn.addEventListener('click', function() {
+      downloadGeneratedImage(imageDataUrl, videoInfo, filenameSuffix || '_总结');
+    });
+    row.appendChild(saveBtn);
+
+    const commentTextBtn = document.createElement('button');
+    commentTextBtn.className = 'tabbit-copy-btn tabbit-comment-text-btn';
+    commentTextBtn.textContent = '💬 填字并点上传';
+    commentTextBtn.title = '随机填入一条评论预设，并尝试点开B站评论区图片上传按钮';
+    commentTextBtn.addEventListener('click', function() {
+      fillBiliCommentTextOnly(commentTextBtn);
+    });
+    row.appendChild(commentTextBtn);
+
+    return row;
+  }
+
   function showImageResult(contentDiv, textContent, imageDataUrl, _url, videoInfo) {
     rawMarkdownResult = textContent || '（生图模式 - 图片总结）';
     const resultContainer = contentDiv.querySelector('.tabbit-result');
@@ -2939,21 +3318,16 @@
           overlay.addEventListener('click', function() { overlay.remove(); });
           document.body.appendChild(overlay);
         });
+        const wrap = img.closest('.tabbit-img-wrap');
+        if (wrap && !wrap.querySelector('.tabbit-img-actions')) {
+          wrap.appendChild(createImageActionRow(imageDataUrl, videoInfo, '_总结'));
+        }
       }
     }
 
     const actionsDiv = contentDiv.querySelector('.tabbit-result-actions');
     if (actionsDiv) {
       actionsDiv.innerHTML = '';
-      if (imageDataUrl && imageDataUrl !== 'ERROR') {
-        const saveImgBtn = document.createElement('button');
-        saveImgBtn.className = 'tabbit-copy-btn';
-        saveImgBtn.textContent = '💾 保存图片';
-        saveImgBtn.addEventListener('click', function() {
-          downloadGeneratedImage(imageDataUrl, videoInfo, '_总结');
-        });
-        actionsDiv.appendChild(saveImgBtn);
-      }
       if (textContent && textContent.trim()) {
         const copyBtn = document.createElement('button');
         copyBtn.className = 'tabbit-copy-btn';
@@ -3015,15 +3389,8 @@
       });
     }
 
-    const actionsDiv = contentDiv.querySelector('.tabbit-result-actions');
-    if (actionsDiv && !actionsDiv.querySelector('.tabbit-save-img-btn')) {
-      const saveImgBtn = document.createElement('button');
-      saveImgBtn.className = 'tabbit-copy-btn tabbit-save-img-btn';
-      saveImgBtn.textContent = '💾 保存图片';
-      saveImgBtn.addEventListener('click', function() {
-        downloadGeneratedImage(imageDataUrl, videoInfo, '_总结');
-      });
-      actionsDiv.insertBefore(saveImgBtn, actionsDiv.firstChild);
+    if (!wrap.querySelector('.tabbit-img-actions')) {
+      wrap.appendChild(createImageActionRow(imageDataUrl, videoInfo, '_总结'));
 
       if (CONFIG.enableImageAutoDownload !== false) {
         setTimeout(function() {
@@ -3658,6 +4025,7 @@
     overlay.id = 'tabbit-settings-overlay';
 
     const currentModelList = (CONFIG.modelList || DEFAULT_CONFIG.modelList).join('\n');
+    const currentCommentTextPresets = getCommentTextPresets().join('\n');
     const cacheStats = getSummaryCacheStats();
 
     overlay.innerHTML = `
@@ -3681,44 +4049,102 @@
             </div>
           </div>
 
-          <div class="tabbit-settings-group">
-            <div class="tabbit-settings-label">API URL</div>
-            <input class="tabbit-settings-input" id="ts-apiUrl" type="text" value="${escapeHtml(CONFIG.apiUrl || '')}" placeholder="https://your-api/v1/chat/completions" />
-            <div class="tabbit-settings-hint">OpenAI 兼容接口地址</div>
-          </div>
-          <div class="tabbit-settings-group">
-            <div class="tabbit-settings-label">API Key</div>
-            <input class="tabbit-settings-input" id="ts-apiKey" type="password" value="${escapeHtml(CONFIG.apiKey || '')}" placeholder="sk-..." />
-            <div class="tabbit-settings-hint">你的 API 密钥（本地存储，不会上传）</div>
-          </div>
-          <div class="tabbit-settings-group">
-            <div class="tabbit-settings-label">默认模型</div>
-            <input class="tabbit-settings-input" id="ts-model" type="text" value="${escapeHtml(CONFIG.model || '')}" placeholder="gpt-4o" />
-            <div class="tabbit-settings-hint">启动时默认选中的模型名称</div>
-          </div>
-          <div class="tabbit-settings-group">
-            <div class="tabbit-settings-label">候选模型列表</div>
-            <div class="tabbit-input-with-btn" style="margin-bottom:6px;">
-              <button class="tabbit-fetch-models-btn" id="ts-fetch-models">🔍 自动获取所有模型</button>
-              <button class="tabbit-fetch-models-btn" id="ts-append-models" style="border-color:#aaa;color:#666;">➕ 追加获取（不覆盖）</button>
+          <div class="tabbit-collapse open">
+            <div class="tabbit-collapse-header" data-collapse="api-settings">
+              <div class="tabbit-collapse-title">🤖 大模型 API 设置</div>
+              <span class="tabbit-collapse-arrow">▶</span>
             </div>
-            <textarea class="tabbit-settings-textarea" id="ts-modelList" placeholder="每行一个模型名称">${escapeHtml(currentModelList)}</textarea>
-            <div class="tabbit-settings-hint">每行一个模型名称。点击「自动获取」会从 API URL 自动调用 /v1/models 拉取并覆盖列表</div>
+            <div class="tabbit-collapse-body">
+              <div class="tabbit-settings-group">
+                <div class="tabbit-settings-label">API URL</div>
+                <input class="tabbit-settings-input" id="ts-apiUrl" type="text" value="${escapeHtml(CONFIG.apiUrl || '')}" placeholder="https://your-api/v1/chat/completions" />
+                <div class="tabbit-settings-hint">OpenAI 兼容接口地址</div>
+              </div>
+              <div class="tabbit-settings-group">
+                <div class="tabbit-settings-label">API Key</div>
+                <input class="tabbit-settings-input" id="ts-apiKey" type="password" value="${escapeHtml(CONFIG.apiKey || '')}" placeholder="sk-..." />
+                <div class="tabbit-settings-hint">你的 API 密钥（本地存储，不会上传）</div>
+              </div>
+              <div class="tabbit-settings-group">
+                <div class="tabbit-settings-label">默认模型</div>
+                <input class="tabbit-settings-input" id="ts-model" type="text" value="${escapeHtml(CONFIG.model || '')}" placeholder="gpt-4o" />
+                <div class="tabbit-settings-hint">启动时默认选中的模型名称</div>
+              </div>
+              <div class="tabbit-settings-group">
+                <div class="tabbit-settings-label">候选模型列表</div>
+                <div class="tabbit-input-with-btn" style="margin-bottom:6px;">
+                  <button class="tabbit-fetch-models-btn" id="ts-fetch-models">🔍 自动获取所有模型</button>
+                  <button class="tabbit-fetch-models-btn" id="ts-append-models" style="border-color:#aaa;color:#666;">➕ 追加获取（不覆盖）</button>
+                </div>
+                <textarea class="tabbit-settings-textarea" id="ts-modelList" placeholder="每行一个模型名称">${escapeHtml(currentModelList)}</textarea>
+                <div class="tabbit-settings-hint">每行一个模型名称。点击「自动获取」会从 API URL 自动调用 /v1/models 拉取并覆盖列表</div>
+              </div>
+            </div>
           </div>
-          <div class="tabbit-settings-group">
-            <div class="tabbit-settings-label">🌱 Flomo API</div>
-            <input class="tabbit-settings-input" id="ts-flomoApiUrl" type="text" value="${escapeHtml(CONFIG.flomoApiUrl || '')}" placeholder="https://flomoapp.com/iwh/xxx/xxx/" />
-            <div class="tabbit-settings-hint">flomo 的 API 地址，在 flomo 设置 → API 中获取</div>
+
+          <div class="tabbit-collapse">
+            <div class="tabbit-collapse-header" data-collapse="flomo-settings">
+              <div class="tabbit-collapse-title">🌱 Flomo 设置（发送笔记相关，不填不影响）</div>
+              <span class="tabbit-collapse-arrow">▶</span>
+            </div>
+            <div class="tabbit-collapse-body">
+              <div class="tabbit-settings-group">
+                <div class="tabbit-settings-label">Flomo API</div>
+                <input class="tabbit-settings-input" id="ts-flomoApiUrl" type="text" value="${escapeHtml(CONFIG.flomoApiUrl || '')}" placeholder="https://flomoapp.com/iwh/xxx/xxx/" />
+                <div class="tabbit-settings-hint">flomo 的 API 地址，在 flomo 设置 → API 中获取</div>
+              </div>
+              <div class="tabbit-settings-group">
+                <div class="tabbit-settings-label">🏷️ 自动标签</div>
+                <input class="tabbit-settings-input" id="ts-flomoTags" type="text" value="${escapeHtml(CONFIG.flomoTags || '')}" placeholder="#B站省流助手 #视频摘要" />
+                <div class="tabbit-settings-hint">发送到 flomo 时自动追加在内容末尾，多个标签用空格分隔</div>
+              </div>
+            </div>
           </div>
+
           <div class="tabbit-settings-group">
-            <div class="tabbit-settings-label">🏷️ Flomo 自动标签</div>
-            <input class="tabbit-settings-input" id="ts-flomoTags" type="text" value="${escapeHtml(CONFIG.flomoTags || '')}" placeholder="#B站省流助手 #视频摘要" />
-            <div class="tabbit-settings-hint">发送到 flomo 时自动追加在内容末尾，多个标签用空格分隔</div>
+            <div class="tabbit-settings-label">🎨 视频摘要预设（多个总结风格，可在面板中切换）</div>
+            <div class="tabbit-preset-manage-list" id="ts-preset-list"></div>
+            <button class="tabbit-preset-add-btn" id="ts-preset-add">＋ 添加新预设</button>
+            <div class="tabbit-settings-hint">每个预设有独立的提示词，在主面板可一键切换并重新分析</div>
           </div>
-          <div class="tabbit-settings-group">
-            <div class="tabbit-settings-label">⏱️ 短视频跳过阈值（秒）</div>
-            <input class="tabbit-settings-input" id="ts-skipDuration" type="number" min="0" value="${CONFIG.skipDuration || 60}" placeholder="60" />
-            <div class="tabbit-settings-hint">视频时长低于此秒数时自动跳过字幕获取，设为 0 则不跳过</div>
+
+          <div class="tabbit-collapse">
+            <div class="tabbit-collapse-header" data-collapse="comment-settings">
+              <div class="tabbit-collapse-title">💬 评论区设置</div>
+              <span class="tabbit-collapse-arrow">▶</span>
+            </div>
+            <div class="tabbit-collapse-body">
+              <div class="tabbit-settings-group">
+                <div class="tabbit-settings-label">最大获取页数</div>
+                <input class="tabbit-settings-input" id="ts-commentMaxPages" type="number" min="1" max="20" value="${CONFIG.commentMaxPages || 8}" placeholder="8" />
+                <div class="tabbit-settings-hint">最多获取多少页评论，范围 1-20 页</div>
+              </div>
+              <div class="tabbit-settings-group">
+                <div class="tabbit-settings-label">最大评论数量</div>
+                <input class="tabbit-settings-input" id="ts-commentLimit" type="number" min="10" max="500" value="${CONFIG.commentLimit || 188}" placeholder="188" />
+                <div class="tabbit-settings-hint">最多获取多少条评论，范围 10-500 条</div>
+              </div>
+              <div class="tabbit-settings-group">
+                <div class="tabbit-settings-label">页面间最小延迟（毫秒）</div>
+                <input class="tabbit-settings-input" id="ts-commentMinDelay" type="number" min="500" max="10000" value="${CONFIG.commentMinDelay || 1800}" placeholder="1800" />
+                <div class="tabbit-settings-hint">每页评论之间的最小等待时间，防止触发风控</div>
+              </div>
+              <div class="tabbit-settings-group">
+                <div class="tabbit-settings-label">页面间最大延迟（毫秒）</div>
+                <input class="tabbit-settings-input" id="ts-commentMaxDelay" type="number" min="1000" max="15000" value="${CONFIG.commentMaxDelay || 3800}" placeholder="3800" />
+                <div class="tabbit-settings-hint">每页评论之间的最大等待时间，防止触发风控</div>
+              </div>
+              <div class="tabbit-settings-group">
+                <div class="tabbit-settings-label">评论区总结提示词</div>
+                <textarea class="tabbit-settings-textarea" id="ts-commentPromptText" placeholder="评论区总结的系统提示词...">${escapeHtml(CONFIG.commentPromptText || COMMENT_PROMPT_TEXT)}</textarea>
+                <div class="tabbit-settings-hint">发送给AI的评论区总结指令</div>
+              </div>
+              <div class="tabbit-settings-group">
+                <div class="tabbit-settings-label">评论发布文字预设</div>
+                <textarea class="tabbit-settings-textarea" id="ts-commentTextPresets" placeholder="每行一条，点击填字按钮时随机选择">${escapeHtml(currentCommentTextPresets)}</textarea>
+                <div class="tabbit-settings-hint">用于图片下方「填字并点上传」按钮。每次随机选一条填入评论框。</div>
+              </div>
+            </div>
           </div>
 
           <div class="tabbit-settings-group" style="background:linear-gradient(135deg,#f0f4ff 0%,#fff5f8 100%);border:1px solid #d6e0ff;border-radius:10px;padding:14px 16px;">
@@ -3781,28 +4207,27 @@
             </div>
           </div>
 
-          <div class="tabbit-settings-group">
-            <div class="tabbit-settings-label">🎨 视频摘要预设（多个总结风格，可在面板中切换）</div>
-            <div class="tabbit-preset-manage-list" id="ts-preset-list"></div>
-            <button class="tabbit-preset-add-btn" id="ts-preset-add">＋ 添加新预设</button>
-            <div class="tabbit-settings-hint">每个预设有独立的提示词，在主面板可一键切换并重新分析</div>
-          </div>
-
-          <div class="tabbit-settings-group">
-            <div class="tabbit-settings-label">💬 评论区总结提示词</div>
-            <textarea class="tabbit-settings-textarea" id="ts-commentPromptText" placeholder="评论区总结的系统提示词...">${escapeHtml(CONFIG.commentPromptText || COMMENT_PROMPT_TEXT)}</textarea>
-            <div class="tabbit-settings-hint">发送给AI的评论区总结指令</div>
-          </div>
-
-          <div class="tabbit-settings-group">
-            <div class="tabbit-settings-label">📍 位置和尺寸</div>
-            <button class="tabbit-settings-btn tabbit-settings-btn-secondary" id="ts-reset-pos">重置面板/悬浮窗位置和尺寸</button>
-          </div>
-
-          <div class="tabbit-settings-group">
-            <div class="tabbit-settings-label">🧠 摘要缓存</div>
-            <div class="tabbit-settings-hint" id="ts-cache-info">当前缓存 ${cacheStats.count} 条，约 ${Math.ceil(cacheStats.chars / 1000)}K 字符。最多保留 ${SUMMARY_CACHE_MAX_ENTRIES} 条，超出自动清理旧缓存。</div>
-            <button class="tabbit-settings-btn tabbit-settings-btn-secondary" id="ts-clear-summary-cache" style="margin-top:8px;">清理摘要缓存</button>
+          <div class="tabbit-collapse">
+            <div class="tabbit-collapse-header" data-collapse="other-settings">
+              <div class="tabbit-collapse-title">⚙️ 其他设置</div>
+              <span class="tabbit-collapse-arrow">▶</span>
+            </div>
+            <div class="tabbit-collapse-body">
+              <div class="tabbit-settings-group">
+                <div class="tabbit-settings-label">⏱️ 短视频跳过阈值（秒）</div>
+                <input class="tabbit-settings-input" id="ts-skipDuration" type="number" min="0" value="${CONFIG.skipDuration || 60}" placeholder="60" />
+                <div class="tabbit-settings-hint">视频时长低于此秒数时自动跳过字幕获取，设为 0 则不跳过</div>
+              </div>
+              <div class="tabbit-settings-group">
+                <div class="tabbit-settings-label">📍 位置和尺寸</div>
+                <button class="tabbit-settings-btn tabbit-settings-btn-secondary" id="ts-reset-pos">重置面板/悬浮窗位置和尺寸</button>
+              </div>
+              <div class="tabbit-settings-group">
+                <div class="tabbit-settings-label">🧠 摘要缓存</div>
+                <div class="tabbit-settings-hint" id="ts-cache-info">当前缓存 ${cacheStats.count} 条，约 ${Math.ceil(cacheStats.chars / 1000)}K 字符。最多保留 ${SUMMARY_CACHE_MAX_ENTRIES} 条，超出自动清理旧缓存。</div>
+                <button class="tabbit-settings-btn tabbit-settings-btn-secondary" id="ts-clear-summary-cache" style="margin-top:8px;">清理摘要缓存</button>
+              </div>
+            </div>
           </div>
 
         </div>
@@ -3899,6 +4324,13 @@
       });
     }
 
+    overlay.querySelectorAll('.tabbit-collapse-header').forEach(function(header) {
+      header.addEventListener('click', function() {
+        const collapse = header.parentElement;
+        collapse.classList.toggle('open');
+      });
+    });
+
     function closeSettings() { overlay.remove(); }
     overlay.querySelector('#tabbit-settings-close').addEventListener('click', closeSettings);
     overlay.addEventListener('click', function(e) {
@@ -3979,6 +4411,10 @@
       const newFlomoApiUrl = overlay.querySelector('#ts-flomoApiUrl').value.trim();
       const newFlomoTags = overlay.querySelector('#ts-flomoTags').value.trim();
       const newCommentPromptText = overlay.querySelector('#ts-commentPromptText').value.trim();
+      const newCommentTextPresets = (overlay.querySelector('#ts-commentTextPresets').value || '')
+        .split('\n')
+        .map(function(s) { return s.trim(); })
+        .filter(Boolean);
       const newAutoParse = overlay.querySelector('#ts-autoParse').checked;
 
       const cleanedPresets = editingPresets
@@ -4013,6 +4449,15 @@
       const activeP = cleanedPresets.find(function(p) { return p.id === validActiveId; });
       if (activeP) CONFIG.promptText = activeP.prompt;
       CONFIG.commentPromptText = newCommentPromptText || COMMENT_PROMPT_TEXT;
+      CONFIG.commentTextPresets = newCommentTextPresets.length > 0 ? newCommentTextPresets : DEFAULT_CONFIG.commentTextPresets.slice();
+      const newCommentMaxPages = parseInt(overlay.querySelector('#ts-commentMaxPages').value, 10);
+      CONFIG.commentMaxPages = isNaN(newCommentMaxPages) ? 8 : Math.max(1, Math.min(20, newCommentMaxPages));
+      const newCommentLimit = parseInt(overlay.querySelector('#ts-commentLimit').value, 10);
+      CONFIG.commentLimit = isNaN(newCommentLimit) ? 188 : Math.max(10, Math.min(500, newCommentLimit));
+      const newCommentMinDelay = parseInt(overlay.querySelector('#ts-commentMinDelay').value, 10);
+      CONFIG.commentMinDelay = isNaN(newCommentMinDelay) ? 1800 : Math.max(500, Math.min(10000, newCommentMinDelay));
+      const newCommentMaxDelay = parseInt(overlay.querySelector('#ts-commentMaxDelay').value, 10);
+      CONFIG.commentMaxDelay = isNaN(newCommentMaxDelay) ? 3800 : Math.max(1000, Math.min(15000, newCommentMaxDelay));
       const newSkipDuration = parseInt(overlay.querySelector('#ts-skipDuration').value, 10);
       CONFIG.skipDuration = isNaN(newSkipDuration) ? 60 : newSkipDuration;
       CONFIG.autoParse = newAutoParse;
@@ -4085,6 +4530,17 @@
             if (imported.flomoApiUrl !== undefined) overlay.querySelector('#ts-flomoApiUrl').value = imported.flomoApiUrl;
             if (imported.flomoTags !== undefined) overlay.querySelector('#ts-flomoTags').value = imported.flomoTags;
             if (imported.commentPromptText) overlay.querySelector('#ts-commentPromptText').value = imported.commentPromptText;
+            if (imported.commentTextPresets !== undefined) {
+              var importedCommentTexts = Array.isArray(imported.commentTextPresets)
+                ? imported.commentTextPresets
+                : String(imported.commentTextPresets || '').split('\n');
+              var commentTextPresetsEl = overlay.querySelector('#ts-commentTextPresets');
+              if (commentTextPresetsEl) commentTextPresetsEl.value = importedCommentTexts.map(function(s) { return String(s || '').trim(); }).filter(Boolean).join('\n') || '省流';
+            }
+            if (imported.commentMaxPages !== undefined) overlay.querySelector('#ts-commentMaxPages').value = imported.commentMaxPages;
+            if (imported.commentLimit !== undefined) overlay.querySelector('#ts-commentLimit').value = imported.commentLimit;
+            if (imported.commentMinDelay !== undefined) overlay.querySelector('#ts-commentMinDelay').value = imported.commentMinDelay;
+            if (imported.commentMaxDelay !== undefined) overlay.querySelector('#ts-commentMaxDelay').value = imported.commentMaxDelay;
             if (imported.skipDuration !== undefined) overlay.querySelector('#ts-skipDuration').value = imported.skipDuration;
             if (imported.autoParse !== undefined) overlay.querySelector('#ts-autoParse').checked = !!imported.autoParse;
             if (imported.enableImageGen !== undefined) overlay.querySelector('#ts-enableImageGen').checked = !!imported.enableImageGen;
@@ -4134,6 +4590,11 @@
       overlay.querySelector('#ts-flomoApiUrl').value = '';
       overlay.querySelector('#ts-flomoTags').value = DEFAULT_CONFIG.flomoTags;
       overlay.querySelector('#ts-commentPromptText').value = COMMENT_PROMPT_TEXT;
+      overlay.querySelector('#ts-commentTextPresets').value = DEFAULT_CONFIG.commentTextPresets.join('\n');
+      overlay.querySelector('#ts-commentMaxPages').value = DEFAULT_CONFIG.commentMaxPages;
+      overlay.querySelector('#ts-commentLimit').value = DEFAULT_CONFIG.commentLimit;
+      overlay.querySelector('#ts-commentMinDelay').value = DEFAULT_CONFIG.commentMinDelay;
+      overlay.querySelector('#ts-commentMaxDelay').value = DEFAULT_CONFIG.commentMaxDelay;
       overlay.querySelector('#ts-skipDuration').value = DEFAULT_CONFIG.skipDuration;
       overlay.querySelector('#ts-autoParse').checked = DEFAULT_CONFIG.autoParse;
       overlay.querySelector('#ts-enableImageGen').checked = false;
