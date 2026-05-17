@@ -82,9 +82,24 @@
       autoSyncHours: 4,
     },
     extractMaxChars: 16000,
+    analysisTemplates: [],
+    customAnalysisTemplates: [],
   };
 
   function clone(obj) { return JSON.parse(JSON.stringify(obj)); }
+
+  // 获取合并后的分析模板列表（默认 + 自定义）
+  function getAllAnalysisTemplates() {
+    const custom = cfg.analysisTemplates || [];
+    const defaultIds = ANALYSIS_TEMPLATES.map(t => t.id);
+    // 合并：自定义覆盖同ID默认模板，新模板追加
+    const merged = [...ANALYSIS_TEMPLATES];
+    custom.forEach(ct => {
+      const idx = merged.findIndex(t => t.id === ct.id);
+      if (idx >= 0) merged[idx] = ct; else merged.push(ct);
+    });
+    return merged;
+  }
 
   function deepMerge(base, patch) {
     if (!patch || typeof patch !== 'object') return base;
@@ -575,7 +590,8 @@
   ];
 
   function buildAnalysisPrompt(records, timeRangeDesc, templateId) {
-    const tpl = ANALYSIS_TEMPLATES.find(t => t.id === templateId) || ANALYSIS_TEMPLATES[0];
+    const allTemplates = getAllAnalysisTemplates().filter(t => !t._deleted);
+    const tpl = allTemplates.find(t => t.id === templateId) || allTemplates[0] || ANALYSIS_TEMPLATES[0];
     const lines = prepareRecordsForAI(records);
     const prompt = tpl.prompt
       .replace(/\{timeRangeDesc\}/g, timeRangeDesc)
@@ -1110,7 +1126,23 @@ ${lines}`;
     // 每次切换 tab 都刷新对应内容
     if (tabName === 'history') refreshHistoryTab();
     if (tabName === 'settings') fillSettingsTab();
-    if (tabName === 'analysis') renderConversation();
+    if (tabName === 'analysis') {
+      renderConversation();
+      // 刷新分析Tab的模板下拉框
+      const tplSelect = document.getElementById('analysis-tpl-select');
+      if (tplSelect) {
+        const allTemplates = getAllAnalysisTemplates().filter(t => !t._deleted);
+        const currentVal = tplSelect.value;
+        tplSelect.innerHTML = '';
+        allTemplates.forEach(t => {
+          const opt = document.createElement('option');
+          opt.value = t.id;
+          opt.textContent = `${t.icon || '📝'} ${t.name || t.id}`;
+          tplSelect.appendChild(opt);
+        });
+        if (currentVal && allTemplates.some(t => t.id === currentVal)) tplSelect.value = currentVal;
+      }
+    }
   }
 
   function updateBadge() {
@@ -1294,9 +1326,22 @@ ${lines}`;
         </div>
         <div class="mpush-input-hint">Enter 发送 · Shift+Enter 换行</div>
       </div>`;
-    // 填充模板下拉框
+    // 填充模板下拉框（使用合并后的模板列表）
     const tplSelect = pane.querySelector('#analysis-tpl-select');
-    ANALYSIS_TEMPLATES.forEach(t => { const opt = document.createElement('option'); opt.value = t.id; opt.textContent = `${t.icon} ${t.name}`; tplSelect.appendChild(opt); });
+    function refreshAnalysisTemplateSelect() {
+      const allTemplates = getAllAnalysisTemplates().filter(t => !t._deleted);
+      const currentVal = tplSelect.value;
+      tplSelect.innerHTML = '';
+      allTemplates.forEach(t => {
+        const opt = document.createElement('option');
+        opt.value = t.id;
+        opt.textContent = `${t.icon || '📝'} ${t.name || t.id}`;
+        tplSelect.appendChild(opt);
+      });
+      // 恢复选择
+      if (currentVal && allTemplates.some(t => t.id === currentVal)) tplSelect.value = currentVal;
+    }
+    refreshAnalysisTemplateSelect();
 
     // 数据范围切换：显示/隐藏自定义时间输入
     const rangeSelect = pane.querySelector('#analysis-range-select');
@@ -1322,6 +1367,8 @@ ${lines}`;
       const result = getAnalysisRecords();
       if (!result) return;
       if (!result.records.length) { toast('没有记录可分析'); return; }
+      // 刷新模板列表以获取最新配置
+      refreshAnalysisTemplateSelect();
       runAnalysis(result.records, result.desc, tplSelect.value);
     });
     pane.querySelector('#analysis-copy-btn').addEventListener('click', () => { const text = conversation.filter(m => m.role !== 'system' && !m.meta?.hidden).map(m => { const tag = m.role === 'user' ? '【我】' : `【AI】`; return `${tag}\n${m.content}`; }).join('\n\n---\n\n'); if (!text.trim()) { toast('没有内容'); return; } if (typeof GM_setClipboard === 'function') GM_setClipboard(text); else navigator.clipboard?.writeText(text); toast('已复制'); });
@@ -1386,6 +1433,247 @@ ${lines}`;
         <button class="mpush-btn" id="set-fetch-models">🔄 获取模型</button>
       </div>`;
 
+    // ── AI 分析提示词 ──
+    const tplSection = makeCollapseSection('📝 AI 分析提示词');
+    tplSection.body.innerHTML = `
+      <div class="mpush-field">
+        <div class="mpush-field-label">当前模板列表</div>
+        <div id="set-tpl-list" style="max-height:300px;overflow-y:auto;border:1px solid #eee;border-radius:8px;"></div>
+      </div>
+      <div class="mpush-btns" style="margin-top:12px;">
+        <button class="mpush-btn" id="set-tpl-add">➕ 新建模板</button>
+        <button class="mpush-btn" id="set-tpl-reset-default">🔄 恢复默认模板</button>
+        <button class="mpush-btn" id="set-tpl-export">📦 导出全部</button>
+        <button class="mpush-btn" id="set-tpl-import">📥 导入模板</button>
+      </div>
+      <div id="set-tpl-editor" style="display:none;margin-top:12px;padding:12px;border:1px solid #e5e5ea;border-radius:8px;background:#fafafa;">
+        <div class="mpush-field"><div class="mpush-field-label">模板ID</div><input type="text" id="set-tpl-edit-id" placeholder="唯一标识，如：summary"><small>用于内部识别，不可重复</small></div>
+        <div class="mpush-field"><div class="mpush-field-label">图标</div><input type="text" id="set-tpl-edit-icon" placeholder="如：📊" style="width:60px;"></div>
+        <div class="mpush-field"><div class="mpush-field-label">名称</div><input type="text" id="set-tpl-edit-name" placeholder="如：时段浏览总结"></div>
+        <div class="mpush-field"><div class="mpush-field-label">描述</div><input type="text" id="set-tpl-edit-desc" placeholder="简短说明模板用途"></div>
+        <div class="mpush-field">
+          <div class="mpush-field-label">提示词内容</div>
+          <textarea id="set-tpl-edit-prompt" rows="8" style="min-height:150px;" placeholder="输入 AI 分析提示词..."></textarea>
+          <small>可用变量：{timeRangeDesc} = 时间范围描述，{count} = 记录总数</small>
+        </div>
+        <div class="mpush-btns">
+          <button class="mpush-btn primary" id="set-tpl-save">💾 保存模板</button>
+          <button class="mpush-btn" id="set-tpl-cancel">取消</button>
+        </div>
+      </div>`;
+
+    // 初始化模板列表
+    function refreshTemplateList() {
+      const listEl = tplSection.body.querySelector('#set-tpl-list');
+      if (!listEl) return;
+      const allTemplates = getAllAnalysisTemplates();
+      const defaultIds = ANALYSIS_TEMPLATES.map(t => t.id);
+      if (!allTemplates.length) {
+        listEl.innerHTML = '<div style="padding:16px;text-align:center;color:#888;font-size:12px;">暂无模板</div>';
+        return;
+      }
+      listEl.innerHTML = allTemplates.map(t => {
+        const isDefault = defaultIds.includes(t.id);
+        return `<div class="mpush-history-item" data-tpl-id="${escapeAttr(t.id)}" style="cursor:pointer;padding:10px 12px;">
+          <span style="font-size:18px;flex-shrink:0;margin-right:8px;">${escapeAttr(t.icon || '📝')}</span>
+          <span class="mpush-history-main">
+            <span class="mpush-history-title" style="font-size:13px;font-weight:600;">${escapeAttr(t.name || t.id)}</span>
+            <span class="mpush-history-url" style="color:#888;font-size:11px;">${escapeAttr(t.desc || '')}</span>
+          </span>
+          <span class="mpush-history-meta" style="gap:4px;">
+            ${isDefault ? '<span style="font-size:10px;color:#8b5cf6;background:#ede9fe;padding:2px 6px;border-radius:4px;">默认</span>' : ''}
+            <button class="mpush-icon-btn" data-action="edit" data-tpl-id="${escapeAttr(t.id)}" title="编辑" style="width:24px;height:24px;font-size:12px;background:#f3f4f6;">✏️</button>
+            <button class="mpush-icon-btn" data-action="clone" data-tpl-id="${escapeAttr(t.id)}" title="复制" style="width:24px;height:24px;font-size:12px;background:#f3f4f6;">📋</button>
+            <button class="mpush-icon-btn" data-action="delete" data-tpl-id="${escapeAttr(t.id)}" title="删除" style="width:24px;height:24px;font-size:12px;background:#fee2e2;">🗑️</button>
+          </span>
+        </div>`;
+      }).join('');
+
+      // 绑定模板操作事件
+      listEl.querySelectorAll('[data-action]').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          const action = btn.dataset.action;
+          const tplId = btn.dataset.tplId;
+          if (action === 'edit') openTemplateEditor(tplId);
+          else if (action === 'clone') cloneTemplate(tplId);
+          else if (action === 'delete') deleteTemplate(tplId);
+        });
+      });
+
+      // 点击模板项打开编辑
+      listEl.querySelectorAll('.mpush-history-item').forEach(item => {
+        item.addEventListener('click', () => openTemplateEditor(item.dataset.tplId));
+      });
+    }
+
+    // 打开模板编辑器
+    let _editingTemplateId = null;
+    function openTemplateEditor(tplId) {
+      const allTemplates = getAllAnalysisTemplates();
+      const tpl = allTemplates.find(t => t.id === tplId);
+      if (!tpl) return;
+      _editingTemplateId = tplId;
+      const editor = tplSection.body.querySelector('#set-tpl-editor');
+      editor.style.display = 'block';
+      const defaultIds = ANALYSIS_TEMPLATES.map(t => t.id);
+      const isDefault = defaultIds.includes(tplId);
+      tplSection.body.querySelector('#set-tpl-edit-id').value = tpl.id || '';
+      tplSection.body.querySelector('#set-tpl-edit-id').readOnly = !!isDefault; // 默认模板ID不可改
+      tplSection.body.querySelector('#set-tpl-edit-icon').value = tpl.icon || '';
+      tplSection.body.querySelector('#set-tpl-edit-name').value = tpl.name || '';
+      tplSection.body.querySelector('#set-tpl-edit-desc').value = tpl.desc || '';
+      tplSection.body.querySelector('#set-tpl-edit-prompt').value = tpl.prompt || '';
+      tplSection.body.querySelector('#set-tpl-edit-id').focus();
+    }
+
+    // 保存模板
+    function saveTemplateFromEditor() {
+      const id = tplSection.body.querySelector('#set-tpl-edit-id').value.trim();
+      const icon = tplSection.body.querySelector('#set-tpl-edit-icon').value.trim();
+      const name = tplSection.body.querySelector('#set-tpl-edit-name').value.trim();
+      const desc = tplSection.body.querySelector('#set-tpl-edit-desc').value.trim();
+      const prompt = tplSection.body.querySelector('#set-tpl-edit-prompt').value;
+      if (!id) { alert('模板ID不能为空'); return; }
+      if (!name) { alert('模板名称不能为空'); return; }
+      if (!prompt) { alert('提示词内容不能为空'); return; }
+      // 检查ID冲突（排除当前编辑的）
+      const allTemplates = getAllAnalysisTemplates();
+      const conflict = allTemplates.find(t => t.id === id && t.id !== _editingTemplateId);
+      if (conflict) { alert(`模板ID "${id}" 已存在，请使用其他ID`); return; }
+      // 如果是编辑默认模板，覆盖到自定义
+      const newTpl = { id, icon, name, desc, prompt };
+      const custom = cfg.analysisTemplates || [];
+      if (_editingTemplateId) {
+        const idx = custom.findIndex(t => t.id === _editingTemplateId);
+        if (idx >= 0) custom[idx] = newTpl;
+        else custom.push(newTpl); // 覆盖默认模板
+      } else {
+        custom.push(newTpl);
+      }
+      cfg.analysisTemplates = custom;
+      saveConfig(cfg);
+      closeTemplateEditor();
+      refreshTemplateList();
+      toast('✅ 模板已保存');
+    }
+
+    // 关闭编辑器
+    function closeTemplateEditor() {
+      _editingTemplateId = null;
+      const editor = tplSection.body.querySelector('#set-tpl-editor');
+      editor.style.display = 'none';
+    }
+
+    // 复制模板
+    function cloneTemplate(tplId) {
+      const allTemplates = getAllAnalysisTemplates();
+      const tpl = allTemplates.find(t => t.id === tplId);
+      if (!tpl) return;
+      const newId = tpl.id + '_copy_' + Date.now().toString(36);
+      const newTpl = { ...tpl, id: newId, name: tpl.name + '（副本）' };
+      const custom = cfg.analysisTemplates || [];
+      custom.push(newTpl);
+      cfg.analysisTemplates = custom;
+      saveConfig(cfg);
+      refreshTemplateList();
+      toast('✅ 已复制模板');
+    }
+
+    // 删除模板
+    function deleteTemplate(tplId) {
+      const defaultIds = ANALYSIS_TEMPLATES.map(t => t.id);
+      const isDefault = defaultIds.includes(tplId);
+      const tpl = getAllAnalysisTemplates().find(t => t.id === tplId);
+      if (!tpl) return;
+      if (isDefault) {
+        if (!confirm(`「${tpl.name}」是默认模板，删除后将恢复为内置默认内容，继续？`)) return;
+      } else {
+        if (!confirm(`确定删除模板「${tpl.name}」？`)) return;
+      }
+      // 从自定义列表中移除（如果是默认模板，则覆盖为空占位防止恢复）
+      let custom = cfg.analysisTemplates || [];
+      if (isDefault) {
+        // 对默认模板：添加一个空的覆盖标记（id保留，prompt清空）
+        const idx = custom.findIndex(t => t.id === tplId);
+        const marker = { id: tplId, icon: tpl.icon, name: tpl.name + '（已删除）', desc: '', prompt: '', _deleted: true };
+        if (idx >= 0) custom[idx] = marker; else custom.push(marker);
+      } else {
+        custom = custom.filter(t => t.id !== tplId);
+      }
+      cfg.analysisTemplates = custom;
+      saveConfig(cfg);
+      if (_editingTemplateId === tplId) closeTemplateEditor();
+      refreshTemplateList();
+      toast('✅ 已删除模板');
+    }
+
+    // 恢复默认模板
+    tplSection.body.querySelector('#set-tpl-reset-default')?.addEventListener('click', () => {
+      if (!confirm('确定恢复默认模板？这将清除所有自定义模板和对默认模板的修改。')) return;
+      cfg.analysisTemplates = [];
+      saveConfig(cfg);
+      refreshTemplateList();
+      closeTemplateEditor();
+      toast('✅ 已恢复默认模板');
+    });
+
+    // 新建模板
+    tplSection.body.querySelector('#set-tpl-add')?.addEventListener('click', () => {
+      _editingTemplateId = null;
+      const editor = tplSection.body.querySelector('#set-tpl-editor');
+      editor.style.display = 'block';
+      tplSection.body.querySelector('#set-tpl-edit-id').value = 'custom_' + Date.now().toString(36);
+      tplSection.body.querySelector('#set-tpl-edit-id').readOnly = false;
+      tplSection.body.querySelector('#set-tpl-edit-icon').value = '📝';
+      tplSection.body.querySelector('#set-tpl-edit-name').value = '';
+      tplSection.body.querySelector('#set-tpl-edit-desc').value = '';
+      tplSection.body.querySelector('#set-tpl-edit-prompt').value = '';
+      tplSection.body.querySelector('#set-tpl-edit-name').focus();
+    });
+
+    // 保存/取消按钮
+    tplSection.body.querySelector('#set-tpl-save')?.addEventListener('click', saveTemplateFromEditor);
+    tplSection.body.querySelector('#set-tpl-cancel')?.addEventListener('click', closeTemplateEditor);
+
+    // 导出全部模板
+    tplSection.body.querySelector('#set-tpl-export')?.addEventListener('click', () => {
+      const allTemplates = getAllAnalysisTemplates();
+      const exportData = { version: 1, exportedAt: Date.now(), templates: allTemplates };
+      downloadText(JSON.stringify(exportData, null, 2), `analysis-templates-${formatDate(Date.now())}.json`);
+      toast('✅ 已导出模板');
+    });
+
+    // 导入模板
+    tplSection.body.querySelector('#set-tpl-import')?.addEventListener('click', () => {
+      const input = document.createElement('input');
+      input.type = 'file'; input.accept = '.json,application/json';
+      input.onchange = async () => {
+        const file = input.files[0]; if (!file) return;
+        try {
+          const text = await file.text();
+          const data = JSON.parse(text);
+          const templates = data.templates || data;
+          if (!Array.isArray(templates)) { alert('文件格式不正确'); return; }
+          const custom = cfg.analysisTemplates || [];
+          let added = 0;
+          templates.forEach(t => {
+            if (!t.id || !t.prompt) return;
+            const idx = custom.findIndex(ct => ct.id === t.id);
+            if (idx >= 0) custom[idx] = t; else { custom.push(t); added++; }
+          });
+          cfg.analysisTemplates = custom;
+          saveConfig(cfg);
+          refreshTemplateList();
+          toast(`✅ 导入完成，新增 ${added} 个模板`);
+        } catch (e) { alert('导入失败：' + e.message); }
+      };
+      input.click();
+    });
+
+    // 初始渲染
+    refreshTemplateList();
+
     // ── 浏览记录 ──
     const histSection = makeCollapseSection('📦 浏览记录');
     histSection.body.innerHTML = `
@@ -1424,6 +1712,7 @@ ${lines}`;
     pane.appendChild(tgSection.container);
     pane.appendChild(fsSection.container);
     pane.appendChild(aiSection.container);
+    pane.appendChild(tplSection.container);
     pane.appendChild(histSection.container);
     pane.appendChild(cloudSection.container);
 

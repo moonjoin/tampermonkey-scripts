@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         B站省流助手 - 字幕AI摘要 Pro
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      3.8.2
-// @description  自动提取B站视频字幕，通过自定义AI API生成极简摘要，支持模型切换、持续对话和评论区总结；支持自动解析开关、自动获取模型列表、flomo自动加标签，新增总结生图功能；v3.7.1 增加打断总结功能，在"无字幕"状态下，新增"手动上传字幕"按钮
+// @version      3.8.3
+// @description  自动提取B站视频字幕，通过自定义AI API生成极简摘要，支持模型切换、持续对话和评论区总结；支持自动解析开关、自动获取模型列表、flomo自动加标签，新增总结生图功能；v3.7.1 增加打断总结功能，在"无字幕"状态下，新增"手动上传字幕"按钮；v3.8.3 修复首次打开视频页字幕获取失败的bug
 // @author       次元饺子
 // @match        https://www.bilibili.com/video/*
 // @match        https://www.bilibili.com/list/*
@@ -4736,8 +4736,30 @@
 
     if (loadingSpan) loadingSpan.textContent = '正在获取字幕并生成摘要...';
 
-    const subtitles = await fetchSubtitles(videoInfo.cid, videoInfo.bvid);
+    let subtitles = await fetchSubtitles(videoInfo.cid, videoInfo.bvid);
     if (isStaleRoute(parsingGeneration)) return;
+
+    // ✅ 兜底：首次获取字幕为空时，等待 2 秒后重新获取视频信息并重试
+    // 解决 B 站 SPA 页面初始化时 __INITIAL_STATE__ 数据尚未就绪的问题
+    if (subtitles.length === 0) {
+      console.log('[省流助手] 首次获取字幕为空，2 秒后重试...');
+      if (loadingSpan) loadingSpan.textContent = '首次获取字幕为空，等待重试...';
+      await new Promise(function(r) { setTimeout(r, 2000); });
+      if (isStaleRoute(parsingGeneration)) return;
+
+      // 重新获取最新视频信息（此时 B 站数据可能已更新）
+      var freshInfo = getVideoInfo();
+      if (freshInfo.bvid) {
+        videoInfo = freshInfo;
+        currentVideoInfo = videoInfo;
+        console.log('[省流助手] 重试时刷新视频信息 - BVID: ' + videoInfo.bvid + ', CID: ' + videoInfo.cid);
+      }
+
+      if (loadingSpan) loadingSpan.textContent = '正在重新获取字幕...';
+      subtitles = await fetchSubtitles(videoInfo.cid, videoInfo.bvid);
+      if (isStaleRoute(parsingGeneration)) return;
+    }
+
     if (subtitles.length === 0) {
       showNoSubtitleState(panel, videoInfo);
       return;
@@ -4771,13 +4793,16 @@
 
   function init() {
     lastRouteKey = getRouteKey();
-    installRouteWatcher();
-    setTimeout(() => {
+    // ✅ 延迟安装路由监听器：等第一次 startParsing 完成后再安装
+    // 避免 B 站页面初始化时的 replaceState（URL 规范化）被误判为路由切换
+    setTimeout(async () => {
       if (CONFIG.autoParse) {
-        startParsing();
+        await startParsing();
       } else {
         showFloatOnlyMode();
       }
+      // 第一次解析流程结束后再安装路由监听器
+      installRouteWatcher();
     }, INIT_DELAY_MS);
   }
 
