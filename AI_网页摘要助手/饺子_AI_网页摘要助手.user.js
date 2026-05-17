@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         饺子 AI 网页摘要助手
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      2.7.1
+// @version      2.7.2
 // @description  指定网站自动弹出 AI 网页摘要，支持连续对话、多预设、多模板、SPA路由，flomo、坚果云双文件云同步。
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
@@ -78,7 +78,8 @@
     panel: { width: 460, height: null, heightRatio: 0.82, left: null, top: null },
     extractMaxChars: 16000,
     cloudSync: { account: '', appPassword: '', lastSyncAt: 0, lastSyncDirection: '' },
-    autoCopy: { enabled: true, withSource: false }
+    autoCopy: { enabled: true, withSource: false },
+    flomoTags: '#饺子AI摘要'
   };
 
   function clone(obj) { return JSON.parse(JSON.stringify(obj)); }
@@ -2043,13 +2044,38 @@
    * 13. 📋 复制 / 🌱 flomo / 🗑 清空
    ******************************************************************/
   function buildConversationText() {
-    return conversation
-      .filter(m => m.role !== 'system' && !m.meta?.hidden)   // ← 加上 && !m.meta?.hidden
-      .map(m => {
+    const visible = conversation.filter(m => m.role !== 'system' && !m.meta?.hidden);
+    if (!visible.length) return '';
+
+    const lines = [];
+    lines.push(`📄 ${document.title}`);
+    lines.push(`🔗 ${location.href}`);
+    lines.push('');
+
+    // 找到第一条 AI 回复作为"总结"，后续作为"对话"
+    const firstAiIdx = visible.findIndex(m => m.role === 'assistant');
+    if (firstAiIdx >= 0) {
+      lines.push('===== 🤖 AI 总结 =====');
+      lines.push(visible[firstAiIdx].content);
+      const rest = visible.slice(firstAiIdx + 1);
+      if (rest.length) {
+        lines.push('');
+        lines.push('===== 💬 后续对话 =====');
+        rest.forEach(m => {
+          const tag = m.role === 'user' ? '【我】' : `【AI · ${m.meta?.model || ''}】`;
+          lines.push(`${tag}\n${m.content}`);
+          lines.push('');
+        });
+      }
+    } else {
+      // 没有 AI 回复，只显示用户消息
+      visible.forEach(m => {
         const tag = m.role === 'user' ? '【我】' : `【AI · ${m.meta?.model || ''}】`;
-        return `${tag}\n${m.content}`;
-      })
-      .join('\n\n---\n\n');
+        lines.push(`${tag}\n${m.content}`);
+        lines.push('');
+      });
+    }
+    return lines.join('\n').trim();
   }
 
   function copyAllConversation() {
@@ -2068,8 +2094,8 @@
     const text = buildConversationText();
     if (!text.trim()) { setStatus('没有可发送的内容', 'error', 1500); return; }
 
-    const content =
-      `${text}\n\n---\n📄 ${document.title}\n🔗 ${location.href}\n#饺子AI摘要`;
+    const tags = (config.flomoTags || '').trim();
+    const content = tags ? `${text}\n\n---\n${tags}` : text;
 
     const btn = panelEl.querySelector('#tabbit-flomo-btn');
     if (btn) { btn.disabled = true; btn.textContent = '⏳'; }
@@ -2528,6 +2554,10 @@
         <label class="tabbit-field"><span>flomo API（可选，PRO 会员功能）</span>
           <input id="tabbit-set-flomo-api" type="text" placeholder="https://flomoapp.com/iwh/...">
         </label>
+        <label class="tabbit-field"><span>🏷️ flomo 标签</span>
+          <input id="tabbit-set-flomo-tags" type="text" placeholder="#饺子AI摘要">
+          <small>发送到 flomo 时自动追加在内容末尾，多个标签用空格分隔</small>
+        </label>
 
         <div class="tabbit-section-title">📋 自动复制</div>
         <small class="tabbit-help">选中文本后自动复制到剪贴板，可选择是否附带页面标题和链接作为出处。也可右键点击浮动按钮快速切换。</small>
@@ -2674,6 +2704,7 @@
     settingsEl.querySelector('#tabbit-set-extract-max').value = config.extractMaxChars || 16000;
     settingsEl.querySelector('#tabbit-set-auto-run').checked = !!config.autoRun;
     settingsEl.querySelector('#tabbit-set-flomo-api').value = config.flomoApiUrl || '';
+    settingsEl.querySelector('#tabbit-set-flomo-tags').value = config.flomoTags || '#饺子AI摘要';
     settingsEl.querySelector('#tabbit-set-auto-copy').checked = config.autoCopy?.enabled !== false;
     settingsEl.querySelector('#tabbit-set-auto-copy-source').checked = !!config.autoCopy?.withSource;
     settingsEl.querySelector('#tabbit-set-jgy-account').value = config.cloudSync?.account || '';
@@ -2837,6 +2868,7 @@
     config.autoRun = settingsEl.querySelector('#tabbit-set-auto-run').checked;
     config.extractMaxChars = Number(settingsEl.querySelector('#tabbit-set-extract-max').value || 16000);
     config.flomoApiUrl = settingsEl.querySelector('#tabbit-set-flomo-api').value.trim();
+    config.flomoTags = settingsEl.querySelector('#tabbit-set-flomo-tags').value.trim() || '#饺子AI摘要';
     config.autoCopy = {
       enabled: settingsEl.querySelector('#tabbit-set-auto-copy').checked,
       withSource: settingsEl.querySelector('#tabbit-set-auto-copy-source').checked

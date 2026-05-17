@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Folo 网站增强工具
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      13.7.1
+// @version      13.7.2
 // @description  Folo 增强：Jina Reader + Readability + 启发式三级抓取 + AI 总结 + 自动总结 + 预加载缓存 + 后续对话 + 多配置管理 + 坚果云 WebDAV 同步 + 复制对话 + 保存到 flomo
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
@@ -449,6 +449,8 @@
 
     function getFlomoApiUrl() { return GM_getValue("ai_flomo_api_url", ""); }
     function setFlomoApiUrl(v) { GM_setValue("ai_flomo_api_url", String(v || "").trim()); }
+    function getFlomoTags() { return GM_getValue("ai_flomo_tags", "#Folo增强 #AI总结"); }
+    function setFlomoTags(v) { GM_setValue("ai_flomo_tags", String(v || "").trim() || "#Folo增强 #AI总结"); }
 
     function getProfiles() {
         let profiles = GM_getValue("ai_profiles", []);
@@ -1519,7 +1521,8 @@
             preloadIframeEnabled: getPreloadIframeEnabled(),
             fetchFulltext: getFetchFulltextEnabled(),
             maxChars: getMaxChars(),
-            flomoApiUrl: getFlomoApiUrl()
+            flomoApiUrl: getFlomoApiUrl(),
+            flomoTags: getFlomoTags()
         };
     }
 
@@ -1537,6 +1540,7 @@
         if (typeof remote.fetchFulltext === 'boolean') setFetchFulltextEnabled(remote.fetchFulltext);
         if (typeof remote.maxChars === 'number') setMaxChars(remote.maxChars);
         if (typeof remote.flomoApiUrl === 'string') setFlomoApiUrl(remote.flomoApiUrl);
+        if (typeof remote.flomoTags === 'string') setFlomoTags(remote.flomoTags);
     }
 
     function mergeProfiles(baseList, patchList) {
@@ -1633,7 +1637,8 @@
                 preloadIframeEnabled: typeof local.preloadIframeEnabled === 'boolean' ? local.preloadIframeEnabled : remote.preloadIframeEnabled,
                 fetchFulltext: typeof local.fetchFulltext === 'boolean' ? local.fetchFulltext : remote.fetchFulltext,
                 maxChars: typeof local.maxChars === 'number' ? local.maxChars : remote.maxChars,
-                flomoApiUrl: local.flomoApiUrl || remote.flomoApiUrl || ""
+                flomoApiUrl: local.flomoApiUrl || remote.flomoApiUrl || "",
+                flomoTags: local.flomoTags || remote.flomoTags || ""
             };
         }
         await webdavUploadRaw(merged);
@@ -1657,7 +1662,8 @@
             preloadIframeEnabled: typeof remote.preloadIframeEnabled === 'boolean' ? remote.preloadIframeEnabled : local.preloadIframeEnabled,
             fetchFulltext: typeof remote.fetchFulltext === 'boolean' ? remote.fetchFulltext : local.fetchFulltext,
             maxChars: typeof remote.maxChars === 'number' ? remote.maxChars : local.maxChars,
-            flomoApiUrl: remote.flomoApiUrl || local.flomoApiUrl || ""
+            flomoApiUrl: remote.flomoApiUrl || local.flomoApiUrl || "",
+            flomoTags: remote.flomoTags || local.flomoTags || ""
         };
         applyRemotePayloadToLocal(merged);
         return merged;
@@ -2282,6 +2288,11 @@
                                 填写后,可在对话框中一键将"AI 总结 + 后续对话"保存到 flomo（需 PRO 会员）。<br>
                                 获取地址：flomo App → 我的 → API & Webhook
                             </div>
+                            <div style="margin-top:8px;">
+                                <div style="font-size:11px;color:#666;margin-bottom:3px;font-weight:bold;">🏷️ 自动标签</div>
+                                <input id="cfg-flomo-tags" class="my-input" type="text" placeholder="#Folo增强 #AI总结">
+                                <div class="desc">发送到 flomo 时自动追加在内容末尾，多个标签用空格分隔</div>
+                            </div>
                         </div>
                     </div>
 
@@ -2331,6 +2342,7 @@
         document.getElementById('cfg-preload-concurrency').value = getPreloadConcurrency();
         document.getElementById('cfg-preload-iframe').checked = getPreloadIframeEnabled();
         document.getElementById('cfg-flomo-url').value = getFlomoApiUrl();
+        document.getElementById('cfg-flomo-tags').value = getFlomoTags();
         document.getElementById('webdav-user').value = getWebDAVUser();
         document.getElementById('webdav-pass').value = getWebDAVPass();
         const statusEl = document.getElementById('webdav-status');
@@ -2474,6 +2486,7 @@
             saveStrategiesFromUI();
             setAutoSummarizeEnabled(document.getElementById('cfg-auto-summarize').checked);
             setFlomoApiUrl(document.getElementById('cfg-flomo-url').value);
+            setFlomoTags(document.getElementById('cfg-flomo-tags').value);
             persistWebDAVCredsFromForm();
             if (!getWebDAVUser() || !getWebDAVPass()) return setWebDAVStatus("请先填写邮箱和应用密码", "error");
             lockBtns(true);
@@ -2515,6 +2528,7 @@
             saveStrategiesFromUI();
             setAutoSummarizeEnabled(document.getElementById('cfg-auto-summarize').checked);
             setFlomoApiUrl(document.getElementById('cfg-flomo-url').value);
+            setFlomoTags(document.getElementById('cfg-flomo-tags').value);
             persistWebDAVCredsFromForm();
             if (!getWebDAVUser() || !getWebDAVPass()) return setWebDAVStatus("请先填写邮箱和应用密码", "error");
             if (!confirm("⚠️ 危险操作\n\n将用本地配置完全覆盖云端文件,云端独有的配置会丢失！\n\n确定继续？")) return;
@@ -2582,6 +2596,7 @@
             setPreloadConcurrency(document.getElementById('cfg-preload-concurrency').value);
             setPreloadIframeEnabled(document.getElementById('cfg-preload-iframe').checked);
             setFlomoApiUrl(document.getElementById('cfg-flomo-url').value);
+            setFlomoTags(document.getElementById('cfg-flomo-tags').value);
             persistWebDAVCredsFromForm();
             modal.style.display = 'none';
             alert("已保存");
@@ -3080,7 +3095,8 @@
         if (dialog.length) {
             lines.push('===== 💬 后续对话 =====');
             dialog.forEach(m => {
-                const tag = m.role === 'user' ? '【我】' : '【AI】';
+                const model = getActiveConfig().model || '';
+                const tag = m.role === 'user' ? '【我】' : `【AI · ${model}】`;
                 lines.push(`${tag}\n${m.content}\n`);
             });
         }
@@ -3118,13 +3134,8 @@
             return;
         }
 
-        const ctx = wrapper.__articleContext || {};
-        const content =
-            text +
-            '\n\n---' +
-            (ctx.title ? `\n📄 ${ctx.title}` : '') +
-            (ctx.url   ? `\n🔗 ${ctx.url}`   : '') +
-            '\n#Folo增强 #AI总结';
+        const tags = getFlomoTags();
+        const content = tags ? `${text}\n\n---\n${tags}` : text;
 
         const btn = wrapper.querySelector('.my-ai-chat-flomo');
         if (btn) { btn.disabled = true; btn.innerText = '⏳ 发送中...'; }

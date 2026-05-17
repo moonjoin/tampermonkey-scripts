@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站省流助手 - 字幕AI摘要 Pro
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      3.8.3
+// @version      3.8.4
 // @description  自动提取B站视频字幕，通过自定义AI API生成极简摘要，支持模型切换、持续对话和评论区总结；支持自动解析开关、自动获取模型列表、flomo自动加标签，新增总结生图功能；v3.7.1 增加打断总结功能，在"无字幕"状态下，新增"手动上传字幕"按钮；v3.8.3 修复首次打开视频页字幕获取失败的bug
 // @author       次元饺子
 // @match        https://www.bilibili.com/video/*
@@ -2417,11 +2417,34 @@
   }
 
   // ==================== 发送到 flomo ====================
-  function buildFlomoContent(text) {
-    const plainText = markdownToPlainText(text);
+  function buildFlomoContent(text, videoInfo) {
+    const lines = [];
+    if (videoInfo) {
+      lines.push('📄 ' + (videoInfo.title || '未知标题'));
+      lines.push('🔗 ' + window.location.href);
+      lines.push('');
+    }
+    lines.push('===== 🤖 AI 总结 =====');
+    lines.push(text);
+    // 后续对话（跳过第一条 user 消息，那是含字幕的完整 prompt）
+    const dialog = conversationHistory.filter(m => m.role !== 'system').slice(2);
+    if (dialog.length) {
+      lines.push('');
+      lines.push('===== 💬 后续对话 =====');
+      for (let i = 0; i < dialog.length; i++) {
+        const m = dialog[i];
+        const tag = m.role === 'user' ? '【我】' : '【AI · ' + currentModel + '】';
+        lines.push(tag);
+        lines.push(m.content);
+        lines.push('');
+      }
+    }
     const tags = (CONFIG.flomoTags || '').trim();
-    if (!tags) return plainText;
-    return plainText + '\n\n' + tags;
+    if (tags) {
+      lines.push('---');
+      lines.push(tags);
+    }
+    return lines.join('\n');
   }
 
   async function sendToFlomo(text, btn) {
@@ -2429,7 +2452,7 @@
       alert('请先在设置中配置 flomo API 地址');
       return;
     }
-    const content = buildFlomoContent(text);
+    const content = buildFlomoContent(text, currentVideoInfo);
     const originalText = btn.textContent;
     btn.textContent = '⏳ 发送中...';
     btn.disabled = true;
