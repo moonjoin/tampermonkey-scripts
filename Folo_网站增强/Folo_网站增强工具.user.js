@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Folo 网站增强工具
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      13.7.0
+// @version      13.7.1
 // @description  Folo 增强：Jina Reader + Readability + 启发式三级抓取 + AI 总结 + 自动总结 + 预加载缓存 + 后续对话 + 多配置管理 + 坚果云 WebDAV 同步 + 复制对话 + 保存到 flomo
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
@@ -1123,14 +1123,25 @@
         return payload;
     }
 
-    function startPreloadScheduler() {
+    function startAutoScanTimer() {
         if (preloadScanTimer) return;
-        installNetworkArticleCapture();
         preloadScanTimer = setInterval(() => {
             ensurePreloadPanel();
             scanListDomForPreloadArticles();
             enqueuePreloadArticles();
         }, 30000);
+    }
+
+    function stopAutoScanTimer() {
+        if (preloadScanTimer) {
+            clearInterval(preloadScanTimer);
+            preloadScanTimer = null;
+        }
+    }
+
+    function startPreloadScheduler() {
+        installNetworkArticleCapture();
+        // 初始只做一次发现，不启动持续扫描
         setTimeout(() => {
             ensurePreloadPanel();
             scanListDomForPreloadArticles();
@@ -1149,7 +1160,7 @@
                 <div class="preload-head">
                     <span>⚡ AI 预加载</span>
                     <span class="preload-mini"></span>
-                    <button class="preload-scan-mini" title="扫描当前列表">扫描</button>
+                    <button class="preload-scan-mini" title="发现当前列表中的新文章">发现</button>
                     <button class="preload-toggle" title="收起/展开">收起</button>
                 </div>
                 <div class="preload-body">
@@ -1163,7 +1174,7 @@
                     </div>
                     <div class="preload-scope"></div>
                     <div class="preload-actions">
-                        <button data-act="scan" class="preload-act-primary">扫描</button>
+                        <button data-act="scan" class="preload-act-primary">发现</button>
                         <button data-act="toggle" class="preload-act-primary"></button>
                         <button data-act="clear-cache" class="preload-act-primary">清理</button>
                         <button data-act="overview">总览</button>
@@ -1197,38 +1208,33 @@
                     applyPreloadPanelLayout(panel, preloadPanelExpandedLayout);
                 }
             };
-            panel.querySelector('.preload-scan-mini').onclick = () => {
+            function doDiscover() {
                 if (!getPreloadEnabled()) setPreloadEnabled(true);
                 const beforeCount = PRELOAD_ARTICLES.size;
-                setPreloadStatus("手动扫描当前列表...", "info");
+                setPreloadStatus("正在发现当前列表...", "info");
                 scanListDomForPreloadArticles();
                 const newCount = PRELOAD_ARTICLES.size - beforeCount;
                 enqueuePreloadArticles();
                 if (newCount > 0) {
-                    setPreloadStatus(`扫描完成：新增 ${newCount} 篇，队列共 ${PRELOAD_QUEUE.length} 篇`, "ok");
+                    setPreloadStatus(`发现完成：新增 ${newCount} 篇，队列共 ${PRELOAD_QUEUE.length} 篇`, "ok");
                 } else {
-                    setPreloadStatus(`扫描完成：无新文章，队列共 ${PRELOAD_QUEUE.length} 篇`, "info");
+                    setPreloadStatus(`发现完成：无新文章，队列共 ${PRELOAD_QUEUE.length} 篇`, "info");
                 }
                 updatePreloadPanel();
-            };
-            panel.querySelector('[data-act="scan"]').onclick = () => {
-                if (!getPreloadEnabled()) setPreloadEnabled(true);
-                const beforeCount = PRELOAD_ARTICLES.size;
-                setPreloadStatus("手动扫描当前列表...", "info");
-                scanListDomForPreloadArticles();
-                const newCount = PRELOAD_ARTICLES.size - beforeCount;
-                enqueuePreloadArticles();
-                if (newCount > 0) {
-                    setPreloadStatus(`扫描完成：新增 ${newCount} 篇，队列共 ${PRELOAD_QUEUE.length} 篇`, "ok");
-                } else {
-                    setPreloadStatus(`扫描完成：无新文章，队列共 ${PRELOAD_QUEUE.length} 篇`, "info");
-                }
-                updatePreloadPanel();
-            };
+            }
+            panel.querySelector('.preload-scan-mini').onclick = doDiscover;
+            panel.querySelector('[data-act="scan"]').onclick = doDiscover;
             panel.querySelector('[data-act="overview"]').onclick = runCurrentListOverview;
             panel.querySelector('[data-act="toggle"]').onclick = () => {
-                setPreloadEnabled(!getPreloadEnabled());
-                setPreloadStatus(getPreloadEnabled() ? "后台预总结已开启" : "后台预总结已关闭", "info");
+                const willEnable = !getPreloadEnabled();
+                setPreloadEnabled(willEnable);
+                if (willEnable) {
+                    startAutoScanTimer();
+                    setPreloadStatus("已开启后台自动发现（每30秒）", "ok");
+                } else {
+                    stopAutoScanTimer();
+                    setPreloadStatus("已关闭后台自动发现", "info");
+                }
                 updatePreloadPanel();
             };
             panel.querySelector('[data-act="clear-cache"]').onclick = () => {
@@ -1365,7 +1371,7 @@
             const route = getTimelineRouteInfo(location.href);
             const scopeEl = panel.querySelector('.preload-scope');
             if (scopeEl) scopeEl.innerText = route.scopePath ? `当前列表：${route.scopePath}` : "当前列表：未识别";
-            panel.querySelector('[data-act="toggle"]').innerText = getPreloadEnabled() ? "暂停" : "开启";
+            panel.querySelector('[data-act="toggle"]').innerText = getPreloadEnabled() ? "⏸ 暂停" : "▶ 开启";
             panel.querySelector('.preload-log').innerHTML = PRELOAD_STATS.logs.map(log =>
                 `<div class="preload-log-row ${log.level || "info"}"><span>${log.time}</span>${String(log.text || "").replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]))}</div>`
             ).join("");
