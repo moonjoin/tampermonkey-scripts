@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站省流助手 - 字幕AI摘要 Pro
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      3.8.5
+// @version      3.8.6
 // @description  自动提取B站视频字幕，通过自定义AI API生成极简摘要，支持模型切换、持续对话和评论区总结；支持自动解析开关、自动获取模型列表、flomo自动加标签，新增总结生图功能；v3.8.5 优化 API URL 自动补全，并兼容 images/responses/chat 多类生图接口
 // @author       次元饺子
 // @match        https://www.bilibili.com/video/*
@@ -336,6 +336,7 @@
     const externalSignal = options.signal;
     const controller = new AbortController();
     let timedOut = false;
+    let fetchResolved = false;
     const onExternalAbort = function() {
       try { controller.abort(); } catch(e) {}
     };
@@ -350,9 +351,27 @@
         externalSignal.addEventListener('abort', onExternalAbort);
       }
     }
+
+    // 🆕 Promise.race 兜底：即使 AbortController 在某些环境下静默失效，
+    // 也能保证请求不会永远挂起（常见于安卓 WebView / Tampermonkey）
+    var raceTimer = null;
+    var raceTimeoutPromise = new Promise(function(_, reject) {
+      raceTimer = setTimeout(function() {
+        if (!fetchResolved) {
+          reject(new Error('请求超时（' + Math.round(timeoutMs / 1000) + '秒）'));
+        }
+      }, timeoutMs + 3000);
+    });
+
     try {
-      return await fetch(url, Object.assign({}, options, { signal: controller.signal }));
+      var result = await Promise.race([
+        fetch(url, Object.assign({}, options, { signal: controller.signal })),
+        raceTimeoutPromise
+      ]);
+      fetchResolved = true;
+      return result;
     } catch (err) {
+      fetchResolved = true;
       if (isAbortError(err)) {
         if (externalSignal && externalSignal.aborted && !timedOut) {
           const abortErr = new Error('用户已打断');
@@ -364,6 +383,7 @@
       throw err;
     } finally {
       clearTimeout(timer);
+      if (raceTimer) clearTimeout(raceTimer);
       if (externalSignal) externalSignal.removeEventListener('abort', onExternalAbort);
     }
   }
@@ -1423,22 +1443,36 @@
       .tabbit-close-btn:hover { opacity: 1; }
 
       .tabbit-model-bar {
-        padding: 10px 14px;
+        padding: 0;
         background: #f5f6fa;
         border-bottom: 1px solid #e8e8ef;
         flex-shrink: 0;
       }
+      .tabbit-model-bar-summary {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 10px 14px;
+        cursor: pointer;
+        user-select: none;
+        list-style: none;
+      }
+      .tabbit-model-bar-summary::-webkit-details-marker { display: none; }
+      .tabbit-model-bar-summary::marker { display: none; content: ''; }
       .tabbit-model-bar-title {
         font-size: 11px;
         color: #999;
-        margin-bottom: 6px;
         font-weight: 600;
         letter-spacing: 0.5px;
+      }
+      details[open] > .tabbit-model-bar-summary .tabbit-video-info-toggle {
+        transform: rotate(90deg);
       }
       .tabbit-model-list {
         display: flex;
         flex-wrap: wrap;
         gap: 6px;
+        padding: 0 14px 10px;
       }
       .tabbit-model-chip {
         padding: 4px 10px;
@@ -1507,14 +1541,47 @@
         margin-bottom: 4px;
       }
       .tabbit-video-info-bottom {
-        margin: 12px 0 0;
-        padding: 8px 10px 10px;
+        margin: 0 0 12px;
         background: #f6fbfd;
         border: 1px solid #ddebf2;
+        border-radius: 8px;
+        overflow: hidden;
+      }
+      .tabbit-video-info-summary {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 8px 10px;
+        cursor: pointer;
+        font-size: 13px;
+        font-weight: 600;
+        color: #444;
+        user-select: none;
+        list-style: none;
+      }
+      .tabbit-video-info-summary::-webkit-details-marker { display: none; }
+      .tabbit-video-info-summary::marker { display: none; content: ''; }
+      .tabbit-video-info-title-text {
+        flex: 1;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        padding-right: 8px;
+      }
+      .tabbit-video-info-toggle {
+        font-size: 10px;
+        color: #999;
+        transition: transform 0.25s ease;
+        flex-shrink: 0;
+      }
+      details[open] > .tabbit-video-info-summary .tabbit-video-info-toggle {
+        transform: rotate(90deg);
       }
       .tabbit-video-meta-body {
-        padding-top: 8px;
+        padding: 0 10px 10px;
         border-top: 1px solid #ddebf2;
+        font-size: 12.5px;
+        color: #555;
       }
       .tabbit-video-url-inline {
         margin-top: 6px;
@@ -1532,6 +1599,9 @@
       }
       .tabbit-image-slot {
         margin-bottom: 12px;
+      }
+      .tabbit-comment-section:empty {
+        display: none;
       }
       .tabbit-result-actions {
         display: flex;
@@ -2479,12 +2549,15 @@
           <button class="tabbit-close-btn">&times;</button>
         </div>
       </div>
-      <div class="tabbit-model-bar">
-        <div class="tabbit-model-bar-title">🤖 选择模型（点击切换并重新分析）</div>
+      <details class="tabbit-model-bar">
+        <summary class="tabbit-model-bar-summary">
+          <span class="tabbit-model-bar-title">🤖 选择模型</span>
+          <span class="tabbit-video-info-toggle">▶</span>
+        </summary>
         <div class="tabbit-model-list">${modelChips}</div>
-      </div>
+      </details>
       <div class="tabbit-panel-content">
-        ${renderPresetBarHtml()}
+        ${renderVideoMetaBottomHtml(videoInfo, window.location.href)}
         <div class="tabbit-image-slot"></div>
         <div class="tabbit-result">
           <div class="tabbit-loading">
@@ -2493,11 +2566,12 @@
           </div>
         </div>
         <div class="tabbit-result-actions"></div>
+        ${renderPresetBarHtml()}
         <button class="tabbit-comment-summary-btn" id="tabbit-comment-btn" disabled>
           <span class="tabbit-btn-icon">💬</span>
           <span>总结评论区</span>
         </button>
-        ${renderVideoMetaBottomHtml(videoInfo, window.location.href)}
+        <div class="tabbit-comment-section" id="tabbit-comment-section"></div>
         <div class="tabbit-chat-messages"></div>
       </div>
       <div class="tabbit-chat-input-bar">
@@ -2577,15 +2651,17 @@
     const safeInfo = videoInfo || {};
     const pageUrl = url || window.location.href;
     return `
-      <div class="tabbit-video-info tabbit-video-info-bottom">
-        <div style="font-size:12px;color:#666;font-weight:600;margin-bottom:6px;">📌 视频信息 / 原链接</div>
+      <details class="tabbit-video-info tabbit-video-info-bottom">
+        <summary class="tabbit-video-info-summary">
+          <span class="tabbit-video-info-title-text">${escapeHtml(safeInfo.title || '未知标题')}</span>
+          <span class="tabbit-video-info-toggle">▶</span>
+        </summary>
         <div class="tabbit-video-meta-body">
-          <div class="tabbit-video-title">${escapeHtml(safeInfo.title || '未知标题')}</div>
           <div>UP主: ${escapeHtml(safeInfo.upName || '未知')}</div>
           ${safeInfo.desc ? '<div style="margin-top:6px;white-space:pre-wrap;">简介: ' + escapeHtml(limitText(safeInfo.desc, 500)) + '</div>' : ''}
           <div class="tabbit-video-url-inline">🔗 <a href="${safeHref(pageUrl)}" target="_blank" rel="noopener">${escapeHtml(pageUrl)}</a></div>
         </div>
-      </div>
+      </details>
     `;
   }
 
@@ -2917,6 +2993,7 @@
       : '该视频暂无可用字幕，无法生成视频摘要。可尝试手动获取，或使用下方按钮总结评论区！';
 
     contentDiv.innerHTML = `
+      ${renderVideoMetaBottomHtml(videoInfo, window.location.href)}
       <div class="tabbit-no-subtitle">
         <div class="tabbit-no-subtitle-icon">${noSubIcon}</div>
         <div class="tabbit-no-subtitle-text">${noSubTitle}</div>
@@ -2934,7 +3011,7 @@
         <span class="tabbit-btn-icon">💬</span>
         <span>总结评论区</span>
       </button>
-      ${renderVideoMetaBottomHtml(videoInfo, window.location.href)}
+      <div class="tabbit-comment-section" id="tabbit-comment-section"></div>
     `;
 
     const manualFetchBtn = contentDiv.querySelector('#tabbit-manual-fetch-btn');
@@ -3693,7 +3770,12 @@
         const newPresetBar = wrapper.firstElementChild;
         if (newPresetBar) oldPresetBar.replaceWith(newPresetBar);
       } else {
-        contentDiv.insertAdjacentHTML('afterbegin', presetBarHtml);
+        const commentBtnEl = contentDiv.querySelector('#tabbit-comment-btn');
+        if (commentBtnEl) {
+          commentBtnEl.insertAdjacentHTML('beforebegin', presetBarHtml);
+        } else {
+          contentDiv.insertAdjacentHTML('beforeend', presetBarHtml);
+        }
       }
 
       const resultContainer = contentDiv.querySelector('.tabbit-result');
@@ -3715,23 +3797,23 @@
         const newMeta = wrapper.firstElementChild;
         if (newMeta) oldMeta.replaceWith(newMeta);
       } else {
-        const chatMessages = contentDiv.querySelector('.tabbit-chat-messages');
-        if (chatMessages) chatMessages.insertAdjacentHTML('beforebegin', metaHtml);
+        contentDiv.insertAdjacentHTML('afterbegin', metaHtml);
       }
 
       const commentBtn = contentDiv.querySelector('#tabbit-comment-btn');
       commentBtn.disabled = true;
     } else {
       contentDiv.innerHTML = `
-      ${presetBarHtml}
-      <div class="tabbit-image-slot"></div>
-      <div class="tabbit-result"><span class="tabbit-typing-cursor"></span></div>
+        ${renderVideoMetaBottomHtml(videoInfo, pageUrl)}
+        <div class="tabbit-image-slot"></div>
+        <div class="tabbit-result"><span class="tabbit-typing-cursor"></span></div>
         <div class="tabbit-result-actions"></div>
+        ${presetBarHtml}
         <button class="tabbit-comment-summary-btn" id="tabbit-comment-btn" disabled>
           <span class="tabbit-btn-icon">💬</span>
           <span>总结评论区</span>
         </button>
-        ${renderVideoMetaBottomHtml(videoInfo, pageUrl)}
+        <div class="tabbit-comment-section" id="tabbit-comment-section"></div>
         <div class="tabbit-chat-messages"></div>
       `;
     }
@@ -3975,11 +4057,13 @@
     const commentBtn = contentDiv.querySelector('#tabbit-comment-btn');
     if (commentBtn) commentBtn.disabled = true;
 
-    const oldSection = contentDiv.querySelector('.tabbit-comment-section');
-    if (oldSection) oldSection.remove();
-
-    let commentSection = document.createElement('div');
-    commentSection.className = 'tabbit-comment-section';
+    let commentSection = contentDiv.querySelector('#tabbit-comment-section');
+    if (!commentSection) {
+      commentSection = document.createElement('div');
+      commentSection.className = 'tabbit-comment-section';
+      commentSection.id = 'tabbit-comment-section';
+      contentDiv.appendChild(commentSection);
+    }
     commentSection.innerHTML = `
       <div class="tabbit-comment-section-title">💬 评论区总结</div>
       <div class="tabbit-loading">
@@ -3987,13 +4071,6 @@
         <span id="tabbit-comment-status">正在获取评论...</span>
       </div>
     `;
-
-    const chatMessages = contentDiv.querySelector('.tabbit-chat-messages');
-    if (chatMessages) {
-      contentDiv.insertBefore(commentSection, chatMessages);
-    } else {
-      contentDiv.appendChild(commentSection);
-    }
 
     const statusEl = commentSection.querySelector('#tabbit-comment-status');
 
@@ -4819,8 +4896,8 @@
   }
 
   function waitForSubtitleButton(maxWait, interval) {
-    maxWait = maxWait || 100;
-    interval = interval || 50;
+    maxWait = maxWait || 2000;
+    interval = interval || 200;
     return new Promise(function(resolve) {
       const startTime = Date.now();
       function check() {
@@ -4897,6 +4974,9 @@
   }
 
   // ==================== 自动启动主流程 ====================
+  // 🆕 字幕获取整体超时（5 秒），防止 B 站 SPA 初始化竞态导致永久卡住
+  const SUBTITLE_FETCH_OVERALL_TIMEOUT_MS = 5000;
+
   async function startParsing() {
     if (hasParsed) return;
     hasParsed = true;
@@ -4926,67 +5006,84 @@
         return;
       }
 
-      console.log('[省流助手] 检测字幕可用性...');
-      const loadingSpan = panel.querySelector('.tabbit-panel-content .tabbit-loading span');
-      if (loadingSpan) loadingSpan.textContent = '正在检测字幕可用性...';
+      // 🆕 用 Promise.race 包裹整个字幕获取流程，防止永久卡住
+      var overallTimer = null;
+      var overallTimeout = new Promise(function(_, reject) {
+        overallTimer = setTimeout(function() {
+          reject(new Error('字幕获取超时（' + Math.round(SUBTITLE_FETCH_OVERALL_TIMEOUT_MS / 1000) + '秒）'));
+        }, SUBTITLE_FETCH_OVERALL_TIMEOUT_MS);
+      });
 
-      const hasSubtitleButton = await waitForSubtitleButton(1000, 500);
-      if (isStaleRoute(parsingGeneration)) return;
-      if (!hasSubtitleButton) {
-        showNoSubtitleState(panel, videoInfo);
-        return;
-      }
+      var fetchFlow = (async function() {
+        console.log('[省流助手] 检测字幕可用性...');
+        const loadingSpan = panel.querySelector('.tabbit-panel-content .tabbit-loading span');
+        if (loadingSpan) loadingSpan.textContent = '正在检测字幕可用性...';
 
-      if (loadingSpan) loadingSpan.textContent = '正在获取字幕并生成摘要...';
-
-      let subtitles = await fetchSubtitles(videoInfo.cid, videoInfo.bvid);
-      if (isStaleRoute(parsingGeneration)) return;
-
-      // ✅ 兜底：首次获取字幕为空时，等待 2 秒后重新获取视频信息并重试
-      // 解决 B 站 SPA 页面初始化时 __INITIAL_STATE__ 数据尚未就绪的问题
-      if (subtitles.length === 0) {
-        console.log('[省流助手] 首次获取字幕为空，2 秒后重试...');
-        if (loadingSpan) loadingSpan.textContent = '首次获取字幕为空，等待重试...';
-        await new Promise(function(r) { setTimeout(r, 2000); });
-        if (isStaleRoute(parsingGeneration)) return;
-
-        // 重新获取最新视频信息（此时 B 站数据可能已更新）
-        var freshInfo = getVideoInfo();
-        if (freshInfo.bvid) {
-          videoInfo = freshInfo;
-          currentVideoInfo = videoInfo;
-          console.log('[省流助手] 重试时刷新视频信息 - BVID: ' + videoInfo.bvid + ', CID: ' + videoInfo.cid);
+        const hasSubtitleButton = await waitForSubtitleButton(2000, 200);
+        if (isStaleRoute(parsingGeneration)) return 'stale';
+        if (!hasSubtitleButton) {
+          return 'no_subtitle';
         }
 
-        if (loadingSpan) loadingSpan.textContent = '正在重新获取字幕...';
-        subtitles = await fetchSubtitles(videoInfo.cid, videoInfo.bvid);
-        if (isStaleRoute(parsingGeneration)) return;
-      }
+        if (loadingSpan) loadingSpan.textContent = '正在获取字幕并生成摘要...';
 
-      if (subtitles.length === 0) {
+        let subtitles = await fetchSubtitles(videoInfo.cid, videoInfo.bvid);
+        if (isStaleRoute(parsingGeneration)) return 'stale';
+
+        // ✅ 兜底：首次获取字幕为空时，等待 2 秒后重新获取视频信息并重试
+        if (subtitles.length === 0) {
+          console.log('[省流助手] 首次获取字幕为空，2 秒后重试...');
+          if (loadingSpan) loadingSpan.textContent = '首次获取字幕为空，等待重试...';
+          await new Promise(function(r) { setTimeout(r, 2000); });
+          if (isStaleRoute(parsingGeneration)) return 'stale';
+
+          var freshInfo = getVideoInfo();
+          if (freshInfo.bvid) {
+            videoInfo = freshInfo;
+            currentVideoInfo = videoInfo;
+            console.log('[省流助手] 重试时刷新视频信息 - BVID: ' + videoInfo.bvid + ', CID: ' + videoInfo.cid);
+          }
+
+          if (loadingSpan) loadingSpan.textContent = '正在重新获取字幕...';
+          subtitles = await fetchSubtitles(videoInfo.cid, videoInfo.bvid);
+          if (isStaleRoute(parsingGeneration)) return 'stale';
+        }
+
+        if (subtitles.length === 0) {
+          return 'no_subtitle';
+        }
+
+        const targetSubtitle = subtitles.find(s => s.lan === 'zh-CN' || s.lan === 'ai-zh') || subtitles[0];
+        const content = await fetchSubtitleContent(targetSubtitle.subtitle_url);
+        if (isStaleRoute(parsingGeneration)) return 'stale';
+        if (content.length === 0) {
+          return 'no_subtitle';
+        }
+
+        const transcript = formatTranscript(content);
+        if (!transcript.trim()) {
+          return 'no_subtitle';
+        }
+
+        return transcript;
+      })();
+
+      var fetchResult = await Promise.race([fetchFlow, overallTimeout]);
+      if (overallTimer) clearTimeout(overallTimer);
+
+      if (fetchResult === 'stale') return;
+      if (fetchResult === 'no_subtitle') {
         showNoSubtitleState(panel, videoInfo);
         return;
       }
 
-      const targetSubtitle = subtitles.find(s => s.lan === 'zh-CN' || s.lan === 'ai-zh') || subtitles[0];
-      const content = await fetchSubtitleContent(targetSubtitle.subtitle_url);
+      // fetchResult 是 transcript 字符串
+      rawTranscript = fetchResult;
+      console.log('[省流助手] 字幕获取完成');
       if (isStaleRoute(parsingGeneration)) return;
-      if (content.length === 0) {
-        showNoSubtitleState(panel, videoInfo);
-        return;
-      }
-
-      const transcript = formatTranscript(content);
-      if (!transcript.trim()) {
-        showNoSubtitleState(panel, videoInfo);
-        return;
-      }
-
-      rawTranscript = transcript;
-      console.log('[省流助手] 字幕获取完成，共 ' + content.length + ' 条');
-      if (isStaleRoute(parsingGeneration)) return;
-      await runSummary(panel, transcript, videoInfo);
+      await runSummary(panel, fetchResult, videoInfo);
     } catch (err) {
+      if (overallTimer) clearTimeout(overallTimer);
       console.error('[省流助手] 自动解析失败:', err);
       hasParsed = false;
       if (panel && videoInfo && !isStaleRoute(parsingGeneration)) {
