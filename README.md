@@ -48,7 +48,7 @@
 
 文件：`AI_网页摘要助手/饺子_AI_网页摘要助手.user.js`
 
-用途：打开指定网页后，自动提取正文并生成摘要。
+用途：打开指定网页后，自动提取正文并生成摘要。（已集成 5. 网页一键自动复制）
 
 关键功能：
 - 支持指定网站规则，匹配后自动总结。
@@ -184,5 +184,11 @@
 - `claude-haiku` 类模型
 
 原则：先用快模型做摘要；只有需要深度分析、复杂推理时再换强模型。
+
+想要试试生图 API 的可以试试这个：https://api.laozhang.ai/register/?aff_code=OUla ，
+大概是我找到的国内最便宜的中转站了，
+gemini-3.1-flash-image-preview（Nano Banana 2）1K（1024px） 
+一张图 0.04刀（3 毛钱一张），注册送 0.5 刀 ，可以免费生成 10-11 张。
+或者目前还看到有 gpt-image-2，按次收费，0.03 刀一张，更优解。
 
 <img width="772" height="1004" alt="模型参考" src="https://github.com/user-attachments/assets/6189d7fc-d2ec-4386-8cd7-315342dd3ff6" />
