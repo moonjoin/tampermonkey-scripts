@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Folo 网站增强工具
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      13.7.2
-// @description  Folo 增强：Jina Reader + Readability + 启发式三级抓取 + AI 总结 + 自动总结 + 预加载缓存 + 后续对话 + 多配置管理 + 坚果云 WebDAV 同步 + 复制对话 + 保存到 flomo
+// @version      13.8.1
+// @description  Folo 增强：Jina Reader + Readability + 启发式三级抓取 + AI 总结 + 自动总结 + 手动列表全量预加载 + 后续对话 + 多配置管理 + 坚果云 WebDAV 同步 + 复制对话 + 保存到 flomo
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
 // @match        https://app.folo.is/*
@@ -23,7 +23,7 @@
 (function() {
     'use strict';
 
-    console.log("🚀 Folo 增强脚本 (预加载缓存版) 已启动");
+    console.log("🚀 Folo 增强脚本 (手动列表预加载版) 已启动");
 
     // ==================== 0. 内联 Markdown 渲染器（含 GFM 表格） ====================
     const _md = (function() {
@@ -441,6 +441,29 @@
     function setPreloadConcurrency(v) { GM_setValue("ai_preload_concurrency", Math.max(1, Math.min(3, Number(v) || 2))); }
     function getPreloadIframeEnabled() { return GM_getValue("ai_preload_iframe_enabled", false) === true; }
     function setPreloadIframeEnabled(v) { GM_setValue("ai_preload_iframe_enabled", !!v); }
+    function getIgnoredPreloadScopes() {
+        const scopes = GM_getValue("ai_preload_ignored_scopes", {});
+        return scopes && typeof scopes === "object" ? scopes : {};
+    }
+    function setPreloadScopeIgnored(scopePath, ignored) {
+        if (!scopePath) return;
+        const scopes = getIgnoredPreloadScopes();
+        const key = getPreloadScopeStorageKey(scopePath);
+        if (ignored) scopes[key] = Date.now();
+        else {
+            delete scopes[key];
+            delete scopes[scopePath];
+        }
+        GM_setValue("ai_preload_ignored_scopes", scopes);
+    }
+    function isPreloadScopeIgnored(scopePath) {
+        if (!scopePath) return false;
+        const scopes = getIgnoredPreloadScopes();
+        return !!(scopes[scopePath] || scopes[getPreloadScopeStorageKey(scopePath)]);
+    }
+    function getPreloadScopeStorageKey(scopePath) {
+        return getTimelineScopeCompareKey(scopePath) || String(scopePath || "");
+    }
 
     function getExtractStrategies() {
         return GM_getValue("ai_extract_strategies", ['jina', 'readability', 'heuristic']);
@@ -478,6 +501,8 @@
     const PRELOAD_RUNNING = new Set();
     const PRELOAD_FAILED_UNTIL = new Map();
     const PRELOAD_TASKS = new Map();
+    const PRELOAD_ARTICLE_STATES = new Map();
+    const PRELOAD_ACTIVE_SCOPES = new Set();
     const PRELOAD_STATS = {
         detected: 0,
         queued: 0,
@@ -490,8 +515,11 @@
     let preloadPumpTimer = null;
     let preloadScanTimer = null;
     let preloadPanelTimer = null;
+    let preloadMarkerTimer = null;
     let preloadPanelExpandedLayout = null;
     let preloadClearToken = 0;
+    let preloadLastScopePath = "";
+    let preloadLastPassiveScanAt = 0;
 
     function setPreloadStatus(message, level) {
         PRELOAD_STATS.lastMessage = message || "";
@@ -558,9 +586,24 @@
         if (!info.isTimeline || !info.entryId) return false;
         // 完全匹配
         if (info.scopePath === scopePath) return true;
-        // "all" 视图下接受任何 timeline 文章链接
-        if (scopePath.startsWith('/timeline/all/')) return true;
+        const wantedKey = getTimelineScopeCompareKey(scopePath);
+        const itemKey = getTimelineScopeCompareKey(info.scopePath);
+        if (wantedKey && itemKey && wantedKey === itemKey) return true;
         return false;
+    }
+
+    function getTimelineScopeCompareKey(scopePath) {
+        const parts = String(scopePath || "").split("/").filter(Boolean);
+        const last = parts[parts.length - 1] || "";
+        if (!last) return "";
+        if (/^folder-/i.test(last)) return "folder:" + last;
+        if (/^feed-/i.test(last)) return "feed:" + last;
+        if (/^\d{8,}$/.test(last) && parts[0] === "timeline" && parts[1] === "all") return "source:" + last;
+        return parts.join("/");
+    }
+
+    function isNumericSourceTimelineScope(scopePath) {
+        return /^\/timeline\/all\/\d{8,}$/.test(String(scopePath || ""));
     }
 
     function getCacheIdentity(parts) {
@@ -603,11 +646,49 @@
         return PRELOAD_TASKS.get(makeSummaryKey(url, title, entryId, appUrl));
     }
 
+    function getPreloadStateId(item) {
+        item = item || {};
+        const appUrl = String(item.appUrl || "").trim();
+        const route = appUrl ? getTimelineRouteInfo(appUrl) : null;
+        const entryId = String(item.entryId || (route && route.entryId) || "").trim();
+        if (entryId) return "entry:" + entryId;
+        if (appUrl) return "app:" + appUrl;
+        if (item.url) return "url:" + String(item.url).trim();
+        if (item.title) return "title:" + normalizeTitleKey(item.title);
+        return "";
+    }
+
+    function setPreloadArticleState(item, state, extra) {
+        const id = getPreloadStateId(item);
+        if (!id) return;
+        if (!state || state === "idle") {
+            PRELOAD_ARTICLE_STATES.delete(id);
+        } else {
+            PRELOAD_ARTICLE_STATES.set(id, Object.assign({}, PRELOAD_ARTICLE_STATES.get(id) || {}, item || {}, extra || {}, {
+                state,
+                updatedAt: Date.now()
+            }));
+        }
+        schedulePreloadMarkerRender();
+        updatePreloadPanel();
+    }
+
+    function getPreloadArticleState(item) {
+        if (!item) return "";
+        if (peekSummaryCache(item.url || "", item.title || "", item.entryId || "", item.appUrl || "")) return "cached";
+        const key = makeSummaryKey(item.url || "", item.title || "", item.entryId || "", item.appUrl || "");
+        if (PRELOAD_RUNNING.has(key)) return "running";
+        if (PRELOAD_QUEUE.some(q => q.key === key)) return "queued";
+        const saved = PRELOAD_ARTICLE_STATES.get(getPreloadStateId(item));
+        return saved ? saved.state : "";
+    }
+
     function removeQueuedPreloadTask(url, title, entryId, appUrl) {
         const key = makeSummaryKey(url, title, entryId, appUrl);
         const idx = PRELOAD_QUEUE.findIndex(q => q.key === key);
         if (idx === -1) return false;
-        PRELOAD_QUEUE.splice(idx, 1);
+        const removed = PRELOAD_QUEUE.splice(idx, 1)[0];
+        if (removed && removed.item) setPreloadArticleState(removed.item, "idle");
         PRELOAD_STATS.queued = PRELOAD_QUEUE.length;
         updatePreloadPanel();
         return true;
@@ -628,6 +709,8 @@
         PRELOAD_RUNNING.clear();
         PRELOAD_FAILED_UNTIL.clear();
         PRELOAD_TASKS.clear();
+        PRELOAD_ARTICLE_STATES.clear();
+        PRELOAD_ACTIVE_SCOPES.clear();
         PRELOAD_STATS.detected = 0;
         PRELOAD_STATS.queued = 0;
         PRELOAD_STATS.running = 0;
@@ -636,6 +719,17 @@
         PRELOAD_STATS.logs = [];
         if (clearCache) GM_setValue(SUMMARY_CACHE_KEY, {});
         setPreloadStatus(clearCache ? "已清空缓存和预加载队列" : "已清空预加载队列", "ok");
+        schedulePreloadMarkerRender();
+        updatePreloadPanel();
+    }
+
+    function clearSummaryCacheOnly() {
+        GM_setValue(SUMMARY_CACHE_KEY, {});
+        Array.from(PRELOAD_ARTICLE_STATES.entries()).forEach(([id, item]) => {
+            if (item && item.state === "cached") PRELOAD_ARTICLE_STATES.delete(id);
+        });
+        setPreloadStatus("已清空 AI 总结缓存", "ok");
+        schedulePreloadMarkerRender();
         updatePreloadPanel();
     }
 
@@ -721,6 +815,24 @@
         return cache[foundKey];
     }
 
+    function peekSummaryCache(url, title, entryId, appUrl) {
+        const cache = readSummaryCache();
+        const exact = cache[makeSummaryKey(url, title, entryId, appUrl)];
+        if (exact) return exact;
+        const routeEntryId = entryId || (appUrl ? getTimelineRouteInfo(appUrl).entryId : "") || getTimelineRouteInfo(location.href).entryId;
+        const titleKey = normalizeTitleKey(title);
+        const nowVersion = summaryVersionKey();
+        const foundKey = Object.keys(cache).find(k => {
+            const item = cache[k];
+            if (!item || item.version !== nowVersion) return false;
+            if (routeEntryId && String(item.entryId || "") === String(routeEntryId)) return true;
+            if (url && item.url === url) return true;
+            if (appUrl && item.appUrl === appUrl) return true;
+            return titleKey && normalizeTitleKey(item.title) === titleKey;
+        });
+        return foundKey ? cache[foundKey] : null;
+    }
+
     function saveSummaryCache(payload) {
         if (!payload || !payload.summary || (!payload.url && !payload.title && !payload.entryId && !payload.appUrl)) return;
         const cache = readSummaryCache();
@@ -735,6 +847,7 @@
             lastAccess: now
         });
         writeSummaryCache(cache);
+        setPreloadArticleState(Object.assign({}, payload, { entryId }), "cached");
     }
 
     function applyCachedSummary(item, btn, resultDiv, statusDiv, wrapper) {
@@ -778,26 +891,8 @@
 
     function markListEntryStatus(entryId, status, title) {
         if (!entryId) return;
-        const markerClass = "folo-preload-mark-" + status;
-        const links = Array.from(document.querySelectorAll('a[href]'))
-            .filter(a => {
-                const info = getTimelineRouteInfo(a.href);
-                return info.entryId === String(entryId);
-            });
-        links.forEach(link => {
-            const row = link.closest('[role="article"], [data-radix-collection-item], [data-testid*="entry"], article, li') || link.closest('div');
-            if (!row) return;
-            const oldMark = row.querySelector('.folo-preload-mark');
-            if (oldMark) oldMark.remove();
-            const mark = document.createElement('span');
-            mark.className = 'folo-preload-mark ' + markerClass;
-            const icons = { success: '✅', failed: '❌', running: '🔄', queued: '⏳' };
-            mark.innerText = icons[status] || '';
-            mark.title = '预加载' + (status === 'success' ? '成功' : status === 'failed' ? '失败' : status === 'running' ? '进行中' : '排队中') + '：' + (title || '');
-            if (link.parentElement) {
-                link.parentElement.insertBefore(mark, link);
-            }
-        });
+        const mapped = status === "success" ? "cached" : status;
+        setPreloadArticleState({ entryId: String(entryId), title: title || "" }, mapped);
     }
 
     function rememberPreloadArticle(article) {
@@ -813,12 +908,13 @@
         const old = PRELOAD_ARTICLES.get(key) || {};
         PRELOAD_ARTICLES.set(key, Object.assign({}, old, { title, url, appUrl, entryId, text: text || old.text || "", seenAt: Date.now() }));
         PRELOAD_STATS.detected = PRELOAD_ARTICLES.size;
+        return !old.seenAt;
     }
 
     function extractArticleHintsFromObject(obj, depth) {
         if (!obj || depth > 8) return;
         if (Array.isArray(obj)) {
-            obj.slice(0, 80).forEach(v => extractArticleHintsFromObject(v, depth + 1));
+            obj.forEach(v => extractArticleHintsFromObject(v, depth + 1));
             return;
         }
         if (typeof obj !== "object") return;
@@ -848,8 +944,9 @@
             if (!data || data.type !== "FOLO_AI_PRELOAD_HINTS" || !Array.isArray(data.items)) return;
             data.items.forEach(rememberPreloadArticle);
             if (data.items.length) {
-                setPreloadStatus(`接口捕获到 ${data.items.length} 条文章线索`, "ok");
-                enqueuePreloadArticles();
+                setPreloadStatus(`接口捕获到 ${data.items.length} 条文章线索，等待手动预加载`, "ok");
+                schedulePreloadMarkerRender();
+                updatePreloadPanel();
             }
         });
 
@@ -866,8 +963,8 @@
                     return "";
                 };
                 const walk = (obj, depth, out) => {
-                    if (!obj || depth > 7 || out.length > 60) return;
-                    if (Array.isArray(obj)) { obj.slice(0, 80).forEach(v => walk(v, depth + 1, out)); return; }
+                    if (!obj || depth > 7) return;
+                    if (Array.isArray(obj)) { obj.forEach(v => walk(v, depth + 1, out)); return; }
                     if (typeof obj !== "object") return;
                     const title = pick(obj, ["title", "name", "entryTitle", "feedTitle", "articleTitle"]);
                     const url = pick(obj, ["url", "originalUrl", "original_url", "externalUrl", "external_url", "targetUrl", "target_url", "link", "href", "sourceUrl", "source_url"]);
@@ -960,68 +1057,167 @@
         };
     }
 
-    function scanListDomForPreloadArticles() {
-        if (!getPreloadEnabled()) return;
+    function scanListDomForPreloadArticles(options) {
+        options = options || {};
         const route = getTimelineRouteInfo(location.href);
         if (!route.isTimeline || !route.scopePath) {
-            setPreloadStatus("当前不是 Folo timeline 页面,跳过扫描", "warn");
-            return;
+            if (!options.silent) setPreloadStatus("当前不是 Folo timeline 页面,跳过扫描", "warn");
+            return 0;
         }
         let found = 0;
-        const anchors = Array.from(document.querySelectorAll('a[href]'))
-            .filter(a => a.offsetParent)
-            .filter(a => sameTimelineScope(a.href, route.scopePath))
-            .slice(0, 120);
+        let added = 0;
+        const anchors = getCurrentListArticleAnchors(route);
         anchors.forEach(a => {
             const href = a.href || "";
             const title = getTitleFromRow(a);
             const rowText = getVisibleRowText(a);
             const itemRoute = getTimelineRouteInfo(href);
             const entryId = itemRoute.entryId;
-            rememberPreloadArticle({ title, appUrl: href, entryId: entryId, text: rowText });
-            // 已发现标记（仅在没有其他标记时显示）
-            if (entryId) {
-                const row = a.closest('[role="article"], [data-radix-collection-item], [data-testid*="entry"], article, li') || a.closest('div');
-                if (row && !row.querySelector('.folo-preload-mark')) {
-                    const mark = document.createElement('span');
-                    mark.className = 'folo-preload-mark folo-preload-mark-discovered';
-                    mark.innerText = '🔍';
-                    mark.title = '已发现：' + title;
-                    if (a.parentElement) a.parentElement.insertBefore(mark, a.nextSibling);
-                }
-            }
+            if (rememberPreloadArticle({ title, appUrl: href, entryId: entryId, text: rowText })) added++;
             found++;
         });
-        if (found) setPreloadStatus(`当前列表扫描到 ${found} 篇 · ${route.scopePath}`, "ok");
-        else setPreloadStatus(`当前列表未扫到文章链接 · ${route.scopePath}`, "warn");
+        schedulePreloadMarkerRender();
+        if (!options.silent) {
+            if (found) setPreloadStatus(`当前列表识别到 ${found} 篇 · 新增 ${added} 篇 · ${route.scopePath}`, "ok");
+            else setPreloadStatus(`当前列表未扫到文章链接 · ${route.scopePath}`, "warn");
+        }
+        return found;
     }
 
-    function enqueuePreloadArticles() {
-        if (!getPreloadEnabled()) return;
+    function getCurrentListArticleAnchors(route) {
+        route = route || getTimelineRouteInfo(location.href);
+        if (!route.isTimeline || !route.scopePath) return [];
+        const allAnchors = Array.from(document.querySelectorAll('a[href]'))
+            .filter(a => a.offsetParent)
+            .filter(a => !a.closest('#my-ai-preload-panel, #my-config-modal, #my-custom-ai-wrapper'));
+        const strict = allAnchors.filter(a => sameTimelineScope(a.href, route.scopePath));
+        if (strict.length || !isNumericSourceTimelineScope(route.scopePath)) return strict;
+
+        const seen = new Set();
+        return allAnchors.filter(a => {
+            const info = getTimelineRouteInfo(a.href);
+            if (!info.isTimeline || !info.entryId || seen.has(info.entryId)) return false;
+            const row = getPreloadRowFromLink(a);
+            const text = row ? (row.innerText || row.textContent || "").replace(/\s+/g, " ").trim() : "";
+            if (text.length < 8) return false;
+            seen.add(info.entryId);
+            return true;
+        });
+    }
+
+    function refreshCurrentListSnapshot(options) {
+        options = options || {};
+        const route = getTimelineRouteInfo(location.href);
+        const scopePath = route.scopePath || "";
+        const now = Date.now();
+        const scopeChanged = scopePath !== preloadLastScopePath;
+        if (!scopePath) return;
+        if (!options.force && !scopeChanged && now - preloadLastPassiveScanAt < 1200) return;
+        preloadLastScopePath = scopePath;
+        preloadLastPassiveScanAt = now;
+        scanListDomForPreloadArticles({ silent: true });
+        if (PRELOAD_ACTIVE_SCOPES.has(scopePath) && !isPreloadScopeIgnored(scopePath) && getPreloadEnabled()) {
+            enqueuePreloadArticles(getCurrentScopePreloadCandidates());
+        }
+        updatePreloadPanel();
+    }
+
+    function getCurrentScopePreloadCandidates() {
         const currentRoute = getTimelineRouteInfo(location.href);
-        const isAllView = currentRoute.scopePath && currentRoute.scopePath.startsWith('/timeline/all/');
-        const candidates = Array.from(PRELOAD_ARTICLES.values())
-            .filter(item => {
-                if (!currentRoute.scopePath) return true;
-                if (!item.appUrl) return false;
-                const itemScope = getTimelineRouteInfo(item.appUrl).scopePath;
-                if (itemScope === currentRoute.scopePath) return true;
-                if (isAllView) return true;
-                return false;
-            })
-            .sort((a, b) => (b.seenAt || 0) - (a.seenAt || 0));
+        if (!currentRoute.scopePath) return [];
+        const currentScopeKey = getTimelineScopeCompareKey(currentRoute.scopePath);
+        const map = new Map();
+        const add = (item) => {
+            if (!item) return;
+            const id = getPreloadStateId(item);
+            if (!id || map.has(id)) return;
+            map.set(id, item);
+        };
+        getCurrentListEntriesFromDom().forEach(add);
+        Array.from(PRELOAD_ARTICLES.values()).forEach(item => {
+            if (!item.appUrl) return;
+            const itemScope = getTimelineRouteInfo(item.appUrl).scopePath;
+            const itemScopeKey = getTimelineScopeCompareKey(itemScope);
+            if (itemScope === currentRoute.scopePath || (currentScopeKey && itemScopeKey === currentScopeKey)) add(item);
+        });
+        return Array.from(map.values());
+    }
+
+    function enqueuePreloadArticles(items, options) {
+        if (!getPreloadEnabled()) return;
+        options = options || {};
+        const candidates = Array.isArray(items) ? items : getCurrentScopePreloadCandidates();
+        let added = 0;
         candidates.forEach(item => {
             const key = makeSummaryKey(item.url, item.title, item.entryId, item.appUrl);
-            if (findSummaryCache(item.url, item.title, item.entryId, item.appUrl)) return;
-            if ((PRELOAD_FAILED_UNTIL.get(key) || 0) > Date.now()) return;
+            if (findSummaryCache(item.url, item.title, item.entryId, item.appUrl)) {
+                setPreloadArticleState(item, "cached");
+                return;
+            }
+            if ((PRELOAD_FAILED_UNTIL.get(key) || 0) > Date.now() && !options.forceRetry) return;
             if (PRELOAD_RUNNING.has(key) || PRELOAD_QUEUE.some(q => q.key === key)) return;
+            if (options.forceRetry) PRELOAD_FAILED_UNTIL.delete(key);
             PRELOAD_QUEUE.push({ key, item });
+            setPreloadArticleState(item, "queued");
             markListEntryStatus(item.entryId, 'queued', item.title);
+            added++;
         });
         PRELOAD_STATS.queued = PRELOAD_QUEUE.length;
         PRELOAD_STATS.running = PRELOAD_RUNNING.size;
         updatePreloadPanel();
         pumpPreloadQueue();
+        return added;
+    }
+
+    function preloadCurrentListAll() {
+        const route = getTimelineRouteInfo(location.href);
+        if (!route.isTimeline || !route.scopePath) {
+            setPreloadStatus("当前不是可预加载的 Folo 列表", "warn");
+            return;
+        }
+        if (isPreloadScopeIgnored(route.scopePath)) {
+            setPreloadStatus("本列表已忽略，先取消忽略再预加载", "warn");
+            return;
+        }
+        if (!getPreloadEnabled()) setPreloadEnabled(true);
+        PRELOAD_ACTIVE_SCOPES.add(route.scopePath);
+        const scanned = scanListDomForPreloadArticles();
+        const snapshot = getCurrentScopePreloadCandidates();
+        const added = enqueuePreloadArticles(snapshot, { forceRetry: true }) || 0;
+        const stats = getCurrentListPreloadStats(snapshot);
+        setPreloadStatus(`本列表已加入预加载：新增 ${added} 篇 · 已缓存 ${stats.cached}/${stats.total} · 识别 ${scanned}`, added ? "ok" : "info");
+        updatePreloadPanel();
+    }
+
+    function retryCurrentListFailed() {
+        const candidates = getCurrentScopePreloadCandidates().filter(item => getPreloadArticleState(item) === "failed");
+        if (!candidates.length) {
+            setPreloadStatus("当前列表没有失败项可重试", "info");
+            return;
+        }
+        const added = enqueuePreloadArticles(candidates, { forceRetry: true }) || 0;
+        setPreloadStatus(`已重试当前列表失败项：${added} 篇`, added ? "ok" : "info");
+    }
+
+    function clearCurrentScopeQueuedTasks() {
+        const route = getTimelineRouteInfo(location.href);
+        const scopePath = route.scopePath;
+        const scopeKey = getTimelineScopeCompareKey(scopePath);
+        let removed = 0;
+        for (let i = PRELOAD_QUEUE.length - 1; i >= 0; i--) {
+            const item = PRELOAD_QUEUE[i].item || {};
+            const itemScope = item.appUrl ? getTimelineRouteInfo(item.appUrl).scopePath : "";
+            const itemScopeKey = getTimelineScopeCompareKey(itemScope);
+            if (!scopePath || itemScope === scopePath || (scopeKey && itemScopeKey === scopeKey)) {
+                const removedTask = PRELOAD_QUEUE.splice(i, 1)[0];
+                if (removedTask && removedTask.item) setPreloadArticleState(removedTask.item, "idle");
+                removed++;
+            }
+        }
+        PRELOAD_STATS.queued = PRELOAD_QUEUE.length;
+        setPreloadStatus(`已清空当前列表排队项：${removed} 篇`, "ok");
+        updatePreloadPanel();
+        schedulePreloadMarkerRender();
     }
 
     function pumpPreloadQueue() {
@@ -1130,7 +1326,6 @@
         preloadScanTimer = setInterval(() => {
             ensurePreloadPanel();
             scanListDomForPreloadArticles();
-            enqueuePreloadArticles();
         }, 30000);
     }
 
@@ -1143,11 +1338,10 @@
 
     function startPreloadScheduler() {
         installNetworkArticleCapture();
-        // 初始只做一次发现，不启动持续扫描
+        // 初始只识别当前列表，不自动排队。预加载由用户手动触发。
         setTimeout(() => {
             ensurePreloadPanel();
             scanListDomForPreloadArticles();
-            enqueuePreloadArticles();
         }, 1500);
     }
 
@@ -1162,23 +1356,26 @@
                 <div class="preload-head">
                     <span>⚡ AI 预加载</span>
                     <span class="preload-mini"></span>
-                    <button class="preload-scan-mini" title="发现当前列表中的新文章">发现</button>
+                    <button class="preload-scan-mini" title="预加载当前列表全部文章">预加载</button>
                     <button class="preload-toggle" title="收起/展开">收起</button>
                 </div>
                 <div class="preload-body">
                     <div class="preload-grid">
-                        <span>发现 <b data-k="detected">0</b></span>
-                        <span>排队 <b data-k="queued">0</b></span>
+                        <span>本列表 <b data-k="listTotal">0</b></span>
+                        <span>已缓存 <b data-k="listCached">0</b></span>
+                        <span>计划 <b data-k="listPlanned">0</b></span>
                         <span>运行 <b data-k="running">0</b></span>
-                        <span>成功 <b data-k="success">0</b></span>
                         <span>失败 <b data-k="failed">0</b></span>
                         <span>缓存 <b data-k="cache">0</b></span>
                     </div>
                     <div class="preload-scope"></div>
                     <div class="preload-actions">
-                        <button data-act="scan" class="preload-act-primary">发现</button>
-                        <button data-act="toggle" class="preload-act-primary"></button>
-                        <button data-act="clear-cache" class="preload-act-primary">清理</button>
+                        <button data-act="preload-list" class="preload-act-primary">预加载本列表全部</button>
+                        <button data-act="pause" class="preload-act-primary"></button>
+                        <button data-act="ignore"></button>
+                        <button data-act="clear-queue">清空队列</button>
+                        <button data-act="clear-cache">清空缓存</button>
+                        <button data-act="retry-failed">重试失败</button>
                         <button data-act="overview">总览</button>
                         <button data-act="settings">设置</button>
                     </div>
@@ -1201,8 +1398,8 @@
                     };
                     savePreloadPanelLayout(panel);
                     panel.classList.add('is-minimized');
-                    panel.style.width = "300px";
-                    panel.style.height = "92px";
+                    panel.style.width = "420px";
+                    panel.style.height = "58px";
                     panel.querySelector('.preload-toggle').innerText = '展开';
                 } else {
                     panel.classList.remove('is-minimized');
@@ -1211,37 +1408,52 @@
                 }
             };
             function doDiscover() {
-                if (!getPreloadEnabled()) setPreloadEnabled(true);
                 const beforeCount = PRELOAD_ARTICLES.size;
                 setPreloadStatus("正在发现当前列表...", "info");
                 scanListDomForPreloadArticles();
                 const newCount = PRELOAD_ARTICLES.size - beforeCount;
-                enqueuePreloadArticles();
                 if (newCount > 0) {
-                    setPreloadStatus(`发现完成：新增 ${newCount} 篇，队列共 ${PRELOAD_QUEUE.length} 篇`, "ok");
+                    setPreloadStatus(`发现完成：新增 ${newCount} 篇，未自动预加载`, "ok");
                 } else {
-                    setPreloadStatus(`发现完成：无新文章，队列共 ${PRELOAD_QUEUE.length} 篇`, "info");
+                    setPreloadStatus("发现完成：无新文章，未自动预加载", "info");
                 }
                 updatePreloadPanel();
             }
-            panel.querySelector('.preload-scan-mini').onclick = doDiscover;
-            panel.querySelector('[data-act="scan"]').onclick = doDiscover;
+            panel.querySelector('.preload-scan-mini').onclick = preloadCurrentListAll;
+            panel.querySelector('[data-act="preload-list"]').onclick = preloadCurrentListAll;
             panel.querySelector('[data-act="overview"]').onclick = runCurrentListOverview;
-            panel.querySelector('[data-act="toggle"]').onclick = () => {
+            panel.querySelector('[data-act="pause"]').onclick = () => {
                 const willEnable = !getPreloadEnabled();
                 setPreloadEnabled(willEnable);
                 if (willEnable) {
-                    startAutoScanTimer();
-                    setPreloadStatus("已开启后台自动发现（每30秒）", "ok");
+                    setPreloadStatus("已继续预加载队列", "ok");
+                    pumpPreloadQueue();
                 } else {
-                    stopAutoScanTimer();
-                    setPreloadStatus("已关闭后台自动发现", "info");
+                    setPreloadStatus("已暂停预加载队列，正在运行的请求会自然结束", "info");
                 }
                 updatePreloadPanel();
             };
+            panel.querySelector('[data-act="ignore"]').onclick = () => {
+                const route = getTimelineRouteInfo(location.href);
+                if (!route.scopePath) return;
+                const willIgnore = !isPreloadScopeIgnored(route.scopePath);
+                setPreloadScopeIgnored(route.scopePath, willIgnore);
+                if (willIgnore) {
+                    PRELOAD_ACTIVE_SCOPES.delete(route.scopePath);
+                    clearCurrentScopeQueuedTasks();
+                }
+                setPreloadStatus(willIgnore ? "已忽略本列表，不再显示预加载标记" : "已取消忽略本列表", willIgnore ? "warn" : "ok");
+                schedulePreloadMarkerRender();
+                updatePreloadPanel();
+            };
+            panel.querySelector('[data-act="clear-queue"]').onclick = () => {
+                if (!confirm("确定清空当前列表的排队项？正在运行的请求无法强制中断，但不会再追加新任务。")) return;
+                clearCurrentScopeQueuedTasks();
+            };
+            panel.querySelector('[data-act="retry-failed"]').onclick = retryCurrentListFailed;
             panel.querySelector('[data-act="clear-cache"]').onclick = () => {
-                if (!confirm("确定清空缓存、发现列表、排队列表和运行状态？正在请求中的网络调用无法强制中断，但返回后不会再写入缓存。")) return;
-                resetPreloadState(true);
+                if (!confirm("确定清空所有 AI 总结缓存？这不会删除当前排队任务。")) return;
+                clearSummaryCacheOnly();
             };
             panel.querySelector('[data-act="settings"]').onclick = showSettingsModal;
         }
@@ -1352,6 +1564,19 @@
         });
     }
 
+    function getCurrentListPreloadStats(entries) {
+        entries = Array.isArray(entries) ? entries : getCurrentScopePreloadCandidates();
+        const stats = { total: entries.length, cached: 0, planned: 0, running: 0, failed: 0 };
+        entries.forEach(item => {
+            const state = getPreloadArticleState(item);
+            if (state === "cached") stats.cached++;
+            else if (state === "running") stats.running++;
+            else if (state === "failed") stats.failed++;
+            else if (state === "queued" || state === "planned") stats.planned++;
+        });
+        return stats;
+    }
+
     function updatePreloadPanel() {
         clearTimeout(preloadPanelTimer);
         preloadPanelTimer = setTimeout(() => {
@@ -1360,33 +1585,104 @@
             PRELOAD_STATS.detected = PRELOAD_ARTICLES.size;
             PRELOAD_STATS.queued = PRELOAD_QUEUE.length;
             PRELOAD_STATS.running = PRELOAD_RUNNING.size;
-            panel.querySelector('[data-k="detected"]').innerText = PRELOAD_STATS.detected;
-            panel.querySelector('[data-k="queued"]').innerText = PRELOAD_STATS.queued;
-            panel.querySelector('[data-k="running"]').innerText = PRELOAD_STATS.running;
-            panel.querySelector('[data-k="success"]').innerText = PRELOAD_STATS.success;
-            panel.querySelector('[data-k="failed"]').innerText = PRELOAD_STATS.failed;
-            panel.querySelector('[data-k="cache"]').innerText = getCacheCount();
+            const route = getTimelineRouteInfo(location.href);
+            const ignored = isPreloadScopeIgnored(route.scopePath);
+            const listStats = getCurrentListPreloadStats();
+            const setText = (key, value) => {
+                const el = panel.querySelector(`[data-k="${key}"]`);
+                if (el) el.innerText = value;
+            };
+            setText("listTotal", listStats.total);
+            setText("listCached", listStats.cached);
+            setText("listPlanned", listStats.planned);
+            setText("running", listStats.running);
+            setText("failed", listStats.failed);
+            setText("cache", getCacheCount());
             const mini = panel.querySelector('.preload-mini');
             if (mini) {
-                mini.innerText = `发现 ${PRELOAD_STATS.detected} · 排队 ${PRELOAD_STATS.queued}`;
+                mini.innerText = ignored
+                    ? `已忽略 · ${listStats.total}篇`
+                    : `${listStats.cached}/${listStats.total} 缓存 · 计划 ${listStats.planned} · 运行 ${listStats.running} · 失败 ${listStats.failed}`;
             }
-            const route = getTimelineRouteInfo(location.href);
             const scopeEl = panel.querySelector('.preload-scope');
-            if (scopeEl) scopeEl.innerText = route.scopePath ? `当前列表：${route.scopePath}` : "当前列表：未识别";
-            panel.querySelector('[data-act="toggle"]').innerText = getPreloadEnabled() ? "⏸ 暂停" : "▶ 开启";
+            if (scopeEl) scopeEl.innerText = route.scopePath ? `当前列表：${route.scopePath}${ignored ? "（已忽略）" : ""}` : "当前列表：未识别";
+            const preloadBtn = panel.querySelector('[data-act="preload-list"]');
+            if (preloadBtn) {
+                preloadBtn.disabled = ignored || !route.scopePath;
+                preloadBtn.innerText = ignored ? "已忽略" : "预加载本列表全部";
+            }
+            const miniPreloadBtn = panel.querySelector('.preload-scan-mini');
+            if (miniPreloadBtn) {
+                miniPreloadBtn.disabled = ignored || !route.scopePath;
+                miniPreloadBtn.innerText = ignored ? "已忽略" : "预加载";
+                miniPreloadBtn.title = ignored ? "本列表已忽略，展开后可取消忽略" : "预加载当前列表全部文章";
+            }
+            const pauseBtn = panel.querySelector('[data-act="pause"]');
+            if (pauseBtn) pauseBtn.innerText = getPreloadEnabled() ? "暂停" : "继续";
+            const ignoreBtn = panel.querySelector('[data-act="ignore"]');
+            if (ignoreBtn) ignoreBtn.innerText = ignored ? "取消忽略" : "忽略本列表";
             panel.querySelector('.preload-log').innerHTML = PRELOAD_STATS.logs.map(log =>
                 `<div class="preload-log-row ${log.level || "info"}"><span>${log.time}</span>${String(log.text || "").replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]))}</div>`
             ).join("");
         }, 50);
     }
 
+    function schedulePreloadMarkerRender() {
+        clearTimeout(preloadMarkerTimer);
+        preloadMarkerTimer = setTimeout(renderPreloadMarkers, 80);
+    }
+
+    function getPreloadRowFromLink(link) {
+        return link && (link.closest('[role="article"], [data-radix-collection-item], [data-testid*="entry"], article, li') || link.closest('div'));
+    }
+
+    function renderPreloadMarkers() {
+        const route = getTimelineRouteInfo(location.href);
+        if (!route.isTimeline || !route.scopePath) return;
+        const ignored = isPreloadScopeIgnored(route.scopePath);
+        const seenRows = new Set();
+        getCurrentListArticleAnchors(route)
+            .forEach(link => {
+                const itemRoute = getTimelineRouteInfo(link.href);
+                const entryId = itemRoute.entryId;
+                if (!entryId) return;
+                const row = getPreloadRowFromLink(link);
+                if (!row || seenRows.has(row)) return;
+                seenRows.add(row);
+                row.querySelectorAll('.folo-preload-mark').forEach(el => el.remove());
+                const oldBadge = row.querySelector('.folo-preload-badge');
+                const item = { title: getTitleFromRow(link), appUrl: link.href, entryId };
+                const state = ignored ? "" : getPreloadArticleState(item);
+                if (!state) {
+                    if (oldBadge) oldBadge.remove();
+                    return;
+                }
+                const labels = { queued: "计划", planned: "计划", running: "加载中", cached: "已缓存", failed: "失败" };
+                const titles = {
+                    queued: "已加入本列表预加载计划",
+                    planned: "已加入本列表预加载计划",
+                    running: "正在预加载总结",
+                    cached: "已有本地摘要缓存",
+                    failed: "预加载失败，可点重试失败"
+                };
+                let badge = oldBadge;
+                if (!badge) {
+                    badge = document.createElement('span');
+                    badge.className = 'folo-preload-badge';
+                    badge.dataset.foloPreloadEntry = entryId;
+                    if (link.parentElement) link.parentElement.insertBefore(badge, link);
+                }
+                badge.className = `folo-preload-badge folo-preload-badge-${state}`;
+                badge.innerText = labels[state] || state;
+                badge.title = `${titles[state] || "预加载状态"}：${item.title || ""}`;
+            });
+    }
+
     function getCurrentListEntriesFromDom() {
         const route = getTimelineRouteInfo(location.href);
         if (!route.isTimeline || !route.scopePath) return [];
         const seen = new Set();
-        return Array.from(document.querySelectorAll('a[href]'))
-            .filter(a => a.offsetParent)
-            .filter(a => sameTimelineScope(a.href, route.scopePath))
+        return getCurrentListArticleAnchors(route)
             .map(a => {
                 const itemRoute = getTimelineRouteInfo(a.href);
                 return {
@@ -1412,25 +1708,95 @@
         return { entries, cached };
     }
 
-    function showListOverviewResult(markdown, meta) {
-        const panel = document.getElementById("my-ai-preload-panel");
-        if (!panel) return;
-        let box = panel.querySelector(".preload-overview");
-        if (!box) {
-            box = document.createElement("div");
-            box.className = "preload-overview";
-            panel.querySelector(".preload-body").appendChild(box);
-        }
-        box.innerHTML = `
-            <div class="preload-overview-head">
-                <span>列表总览 ${meta ? `(${meta.cached}/${meta.total})` : ""}</span>
-                <button data-act="copy-overview">复制</button>
-            </div>
-            <div class="preload-overview-content">${_md(markdown)}</div>`;
-        box.querySelector('[data-act="copy-overview"]').onclick = () => {
-            GM_setClipboard(markdown);
-            setPreloadStatus("已复制列表总览", "ok");
+    function ensureListOverviewWindow() {
+        let win = document.getElementById("my-list-overview-window");
+        if (win) return win;
+        win = document.createElement("div");
+        win.id = "my-list-overview-window";
+        win.innerHTML = `
+            <div class="list-overview-window">
+                <div class="list-overview-titlebar">
+                    <div>
+                        <div class="list-overview-title">列表总览</div>
+                        <div class="list-overview-meta"></div>
+                    </div>
+                    <div class="list-overview-title-actions">
+                        <button data-act="overview-refresh" title="重新生成总览">重新生成</button>
+                        <button data-act="overview-close" title="关闭">关闭</button>
+                    </div>
+                </div>
+                <div class="list-overview-scroll">
+                    <div class="my-ai-content list-overview-content"></div>
+                    <div class="my-ai-chat-area list-overview-chat" style="display:block;">
+                        <div class="my-ai-chat-actions">
+                            <button class="my-ai-chat-clear" title="清空对话">🧹 清空对话</button>
+                            <button class="my-ai-chat-copy" title="复制全部对话(含总览)">📋 复制对话</button>
+                            <button class="my-ai-chat-flomo" title="保存到 flomo">🌱 保存到 flomo</button>
+                        </div>
+                        <div class="my-ai-chat-history"></div>
+                        <div class="my-ai-chat-input-row">
+                            <textarea class="my-ai-chat-input" placeholder="基于当前列表总览继续提问...（Enter 发送,Shift+Enter 换行）" rows="1"></textarea>
+                            <button class="my-ai-chat-send">发送</button>
+                        </div>
+                    </div>
+                </div>
+            </div>`;
+        document.body.appendChild(win);
+
+        win.querySelector('[data-act="overview-close"]').onclick = () => { win.style.display = 'none'; };
+        win.querySelector('[data-act="overview-refresh"]').onclick = runCurrentListOverview;
+        const chatInput = win.querySelector('.my-ai-chat-input');
+        const sendBtn = win.querySelector('.my-ai-chat-send');
+        const clearBtn = win.querySelector('.my-ai-chat-clear');
+        const copyBtn = win.querySelector('.my-ai-chat-copy');
+        const flomoBtn = win.querySelector('.my-ai-chat-flomo');
+        sendBtn.onclick = () => handleChatSend(win);
+        chatInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                handleChatSend(win);
+            }
+        });
+        chatInput.addEventListener('input', () => {
+            chatInput.style.height = 'auto';
+            chatInput.style.height = Math.min(chatInput.scrollHeight, 150) + 'px';
+        });
+        clearBtn.onclick = () => {
+            if (!win.__chatHistory) return;
+            if (!confirm('确定清空当前对话历史？（列表上下文会保留）')) return;
+            win.__chatHistory = win.__chatHistory.slice(0, 1);
+            win.querySelector('.my-ai-chat-history').innerHTML = '';
         };
+        copyBtn.onclick = () => handleCopyConversation(win);
+        flomoBtn.onclick = () => handleSendToFlomo(win);
+        return win;
+    }
+
+    function showListOverviewResult(markdown, meta) {
+        const win = ensureListOverviewWindow();
+        const route = getTimelineRouteInfo(location.href);
+        const scope = route.scopePath || "当前列表";
+        const sourceText = meta && meta.sourceText ? meta.sourceText : "";
+        win.style.display = 'flex';
+        win.querySelector('.list-overview-meta').innerText = meta ? `${scope} · 已缓存 ${meta.cached}/${meta.total} · 使用 ${meta.used || meta.cached} 篇` : scope;
+        win.querySelector('.list-overview-content').innerHTML = _md(markdown);
+        win.querySelector('.my-ai-chat-history').innerHTML = '';
+        win.__articleContext = {
+            title: `Folo 列表总览：${scope}`,
+            text: sourceText,
+            url: location.href,
+            truncated: false
+        };
+        win.__summaryContent = markdown;
+        win.__contentLabel = "列表总览";
+        win.__chatHistory = [
+            { role: "system", content:
+                "你是 RSS 列表分析助手。用户正在查看一个 Folo 列表总览。请基于下面给出的列表总览和单篇摘要回答后续问题；不要声称你能访问网络。\n\n" +
+                `==== 列表 ====\n${scope}\n${location.href}\n\n` +
+                `==== 已生成的列表总览 ====\n${markdown}\n\n` +
+                (sourceText ? `==== 可参考的单篇摘要材料 ====\n${sourceText}` : "")
+            }
+        ];
     }
 
     function runCurrentListOverview() {
@@ -1478,7 +1844,7 @@
             ],
             (content) => {
                 if (btn) { btn.disabled = false; btn.innerText = "总览"; }
-                showListOverviewResult(content, { cached: cached.length, total: entries.length });
+                showListOverviewResult(content, { cached: cached.length, total: entries.length, used: useItems.length, sourceText: joined });
                 setPreloadStatus("列表总览生成完成", "ok");
             },
             (err) => {
@@ -1519,6 +1885,7 @@
             preloadLimit: getPreloadLimit(),
             preloadConcurrency: getPreloadConcurrency(),
             preloadIframeEnabled: getPreloadIframeEnabled(),
+            preloadIgnoredScopes: getIgnoredPreloadScopes(),
             fetchFulltext: getFetchFulltextEnabled(),
             maxChars: getMaxChars(),
             flomoApiUrl: getFlomoApiUrl(),
@@ -1537,6 +1904,7 @@
         if (typeof remote.preloadLimit === 'number') setPreloadLimit(remote.preloadLimit);
         if (typeof remote.preloadConcurrency === 'number') setPreloadConcurrency(remote.preloadConcurrency);
         if (typeof remote.preloadIframeEnabled === 'boolean') setPreloadIframeEnabled(remote.preloadIframeEnabled);
+        if (remote.preloadIgnoredScopes && typeof remote.preloadIgnoredScopes === 'object') GM_setValue("ai_preload_ignored_scopes", remote.preloadIgnoredScopes);
         if (typeof remote.fetchFulltext === 'boolean') setFetchFulltextEnabled(remote.fetchFulltext);
         if (typeof remote.maxChars === 'number') setMaxChars(remote.maxChars);
         if (typeof remote.flomoApiUrl === 'string') setFlomoApiUrl(remote.flomoApiUrl);
@@ -1635,6 +2003,7 @@
                 preloadLimit: typeof local.preloadLimit === 'number' ? local.preloadLimit : remote.preloadLimit,
                 preloadConcurrency: typeof local.preloadConcurrency === 'number' ? local.preloadConcurrency : remote.preloadConcurrency,
                 preloadIframeEnabled: typeof local.preloadIframeEnabled === 'boolean' ? local.preloadIframeEnabled : remote.preloadIframeEnabled,
+                preloadIgnoredScopes: Object.assign({}, remote.preloadIgnoredScopes || {}, local.preloadIgnoredScopes || {}),
                 fetchFulltext: typeof local.fetchFulltext === 'boolean' ? local.fetchFulltext : remote.fetchFulltext,
                 maxChars: typeof local.maxChars === 'number' ? local.maxChars : remote.maxChars,
                 flomoApiUrl: local.flomoApiUrl || remote.flomoApiUrl || "",
@@ -1660,6 +2029,7 @@
             preloadLimit: typeof remote.preloadLimit === 'number' ? remote.preloadLimit : local.preloadLimit,
             preloadConcurrency: typeof remote.preloadConcurrency === 'number' ? remote.preloadConcurrency : local.preloadConcurrency,
             preloadIframeEnabled: typeof remote.preloadIframeEnabled === 'boolean' ? remote.preloadIframeEnabled : local.preloadIframeEnabled,
+            preloadIgnoredScopes: Object.assign({}, local.preloadIgnoredScopes || {}, remote.preloadIgnoredScopes || {}),
             fetchFulltext: typeof remote.fetchFulltext === 'boolean' ? remote.fetchFulltext : local.fetchFulltext,
             maxChars: typeof remote.maxChars === 'number' ? remote.maxChars : local.maxChars,
             flomoApiUrl: remote.flomoApiUrl || local.flomoApiUrl || "",
@@ -1685,13 +2055,13 @@
         setAutoSummarizeEnabled(!getAutoSummarizeEnabled());
         alert("已切换。当前：" + (getAutoSummarizeEnabled() ? "开启自动总结" : "关闭自动总结"));
     });
-    GM_registerMenuCommand("⚡ 切换『后台预总结』(当前: " + (getPreloadEnabled() ? "开" : "关") + ")", () => {
+    GM_registerMenuCommand("⚡ 切换『手动预加载队列』(当前: " + (getPreloadEnabled() ? "开" : "关") + ")", () => {
         setPreloadEnabled(!getPreloadEnabled());
-        alert("已切换。当前：" + (getPreloadEnabled() ? "开启后台预总结" : "关闭后台预总结"));
+        alert("已切换。当前：" + (getPreloadEnabled() ? "允许手动预加载队列执行" : "暂停手动预加载队列"));
     });
     GM_registerMenuCommand("🧹 清空 AI 总结缓存", () => {
         if (confirm("确定清空本地 AI 总结缓存？")) {
-            GM_setValue(SUMMARY_CACHE_KEY, {});
+            clearSummaryCacheOnly();
             alert("已清空缓存");
         }
     });
@@ -1789,26 +2159,30 @@
             overflow: hidden;
             text-overflow: ellipsis;
             white-space: nowrap;
-            text-align: right;
-            font-size: 11px;
-            font-weight: 500;
+            text-align: left;
+            font-size: 12px;
+            font-weight: 600;
             color: #64748b;
         }
         #my-ai-preload-panel .preload-scan-mini {
             border: 1px solid rgba(124, 58, 237, 0.35);
             background: linear-gradient(135deg, rgba(124, 58, 237, 0.18), rgba(37, 99, 235, 0.14));
             cursor: pointer;
-            font-size: 11px;
+            font-size: 12px;
             font-weight: 700;
             color: #4c1d95;
-            min-width: 42px;
+            min-width: 62px;
             height: 26px;
             border-radius: 999px;
-            padding: 0 10px;
+            padding: 0 12px;
             line-height: 24px;
             text-align: center;
             flex: 0 0 auto;
             display: none;
+        }
+        #my-ai-preload-panel .preload-scan-mini:disabled {
+            opacity: 0.55;
+            cursor: not-allowed;
         }
         .dark #my-ai-preload-panel .preload-scan-mini {
             color: #c4b5fd;
@@ -1828,7 +2202,7 @@
             font-size: 12px;
             font-weight: 700;
             color: inherit;
-            min-width: 54px;
+            min-width: 58px;
             height: 28px;
             border-radius: 999px;
             padding: 0 10px;
@@ -1841,16 +2215,41 @@
             border-color: rgba(139, 92, 246, 0.4);
         }
         #my-ai-preload-panel.is-minimized {
-            min-height: 92px;
+            width: min(420px, calc(100vw - 36px)) !important;
+            min-height: 58px;
+            height: 58px !important;
+            overflow: hidden;
             resize: none;
+        }
+        #my-ai-preload-panel.is-minimized .preload-head {
+            height: 58px;
+            padding: 10px 12px;
+            gap: 8px;
+            box-sizing: border-box;
+            border-bottom: none;
+        }
+        #my-ai-preload-panel.is-minimized .preload-head > span:first-child {
+            flex: 0 0 auto;
+            white-space: nowrap;
+            font-size: 12px;
+            max-width: 76px;
+            overflow: hidden;
+        }
+        #my-ai-preload-panel.is-minimized .preload-mini {
+            text-align: left;
+            font-size: 13px;
+            font-weight: 800;
+            color: #334155;
+            min-width: 120px;
+        }
+        .dark #my-ai-preload-panel.is-minimized .preload-mini {
+            color: #e5e7eb;
         }
         #my-ai-preload-panel.is-minimized .preload-resize-handle {
             display: none;
         }
         #my-ai-preload-panel.is-minimized .preload-body {
-            padding: 8px 10px 10px;
-            max-height: none;
-            overflow: hidden;
+            display: none;
         }
         #my-ai-preload-panel.is-minimized .preload-grid,
         #my-ai-preload-panel.is-minimized .preload-scope,
@@ -1862,10 +2261,7 @@
             display: none;
         }
         #my-ai-preload-panel.is-minimized .preload-log {
-            max-height: 34px;
-            padding: 5px 8px;
-            border-radius: 9px;
-            overflow: hidden;
+            display: none;
         }
         #my-ai-preload-panel.is-minimized .preload-log-row {
             white-space: nowrap;
@@ -1908,7 +2304,7 @@
         }
         #my-ai-preload-panel .preload-actions {
             display: grid;
-            grid-template-columns: repeat(5, minmax(0, 1fr));
+            grid-template-columns: repeat(3, minmax(0, 1fr));
             gap: 6px;
             margin-bottom: 10px;
         }
@@ -1917,16 +2313,26 @@
             background: rgba(139, 92, 246, 0.08);
             color: inherit;
             border-radius: 8px;
-            padding: 7px 4px;
+            padding: 7px 3px;
             cursor: pointer;
-            font-size: 12px;
-            white-space: nowrap;
+            font-size: 11px;
+            line-height: 1.2;
+            white-space: normal;
+            word-break: keep-all;
+            overflow-wrap: anywhere;
+            min-width: 0;
+            min-height: 34px;
+            overflow: hidden;
+        }
+        #my-ai-preload-panel .preload-actions button[data-act="preload-list"] {
+            grid-column: 1 / -1;
+            min-height: 38px;
+            font-size: 13px;
         }
         #my-ai-preload-panel .preload-actions .preload-act-primary {
             background: linear-gradient(135deg, rgba(124, 58, 237, 0.18), rgba(37, 99, 235, 0.14));
             border-color: rgba(124, 58, 237, 0.35);
             font-weight: 700;
-            font-size: 13px;
             color: #4c1d95;
         }
         .dark #my-ai-preload-panel .preload-actions .preload-act-primary {
@@ -1976,6 +2382,56 @@
         .folo-preload-mark-discovered { opacity: 0.45; font-size: 11px; }
         .folo-preload-mark-queued { opacity: 0.55; }
         .folo-preload-mark-running { animation: folo-spin 1.5s linear infinite; }
+        .folo-preload-badge {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            height: 18px;
+            min-width: 38px;
+            padding: 0 6px;
+            margin-right: 6px;
+            border-radius: 999px;
+            border: 1px solid rgba(100, 116, 139, 0.24);
+            background: rgba(248, 250, 252, 0.92);
+            color: #475569;
+            font-size: 11px;
+            font-weight: 700;
+            line-height: 18px;
+            white-space: nowrap;
+            vertical-align: middle;
+            flex-shrink: 0;
+            pointer-events: auto;
+        }
+        .folo-preload-badge-queued,
+        .folo-preload-badge-planned {
+            border-color: rgba(124, 58, 237, 0.32);
+            background: rgba(139, 92, 246, 0.12);
+            color: #5b21b6;
+        }
+        .folo-preload-badge-running {
+            border-color: rgba(37, 99, 235, 0.35);
+            background: rgba(59, 130, 246, 0.12);
+            color: #1d4ed8;
+        }
+        .folo-preload-badge-cached {
+            border-color: rgba(5, 150, 105, 0.32);
+            background: rgba(16, 185, 129, 0.12);
+            color: #047857;
+        }
+        .folo-preload-badge-failed {
+            border-color: rgba(220, 38, 38, 0.28);
+            background: rgba(239, 68, 68, 0.10);
+            color: #b91c1c;
+        }
+        .dark .folo-preload-badge {
+            background: rgba(15, 23, 42, 0.78);
+            color: #cbd5e1;
+        }
+        .dark .folo-preload-badge-queued,
+        .dark .folo-preload-badge-planned { color: #c4b5fd; }
+        .dark .folo-preload-badge-running { color: #93c5fd; }
+        .dark .folo-preload-badge-cached { color: #6ee7b7; }
+        .dark .folo-preload-badge-failed { color: #fca5a5; }
         @keyframes folo-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
         #my-ai-preload-panel .preload-overview {
             margin-top: 10px;
@@ -2022,6 +2478,114 @@
         #my-ai-preload-panel .preload-overview-content ul,
         #my-ai-preload-panel .preload-overview-content ol {
             margin: 5px 0;
+        }
+
+        #my-list-overview-window {
+            position: fixed;
+            inset: 0;
+            z-index: 100000;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            padding: 22px;
+            background: rgba(15, 23, 42, 0.22);
+            backdrop-filter: blur(4px);
+            box-sizing: border-box;
+        }
+        #my-list-overview-window .list-overview-window {
+            width: min(980px, calc(100vw - 44px));
+            height: min(860px, calc(100vh - 44px));
+            display: flex;
+            flex-direction: column;
+            border: 1px solid rgba(139, 92, 246, 0.28);
+            border-radius: 12px;
+            background: rgba(255, 255, 255, 0.98);
+            box-shadow: 0 22px 70px rgba(15, 23, 42, 0.28);
+            color: #1f2937;
+            overflow: hidden;
+        }
+        .dark #my-list-overview-window .list-overview-window {
+            background: rgba(17, 24, 39, 0.98);
+            color: #e5e7eb;
+            border-color: rgba(139, 92, 246, 0.46);
+        }
+        #my-list-overview-window .list-overview-titlebar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            padding: 12px 16px;
+            border-bottom: 1px solid rgba(139, 92, 246, 0.16);
+            background: linear-gradient(90deg, rgba(124,58,237,0.10), rgba(37,99,235,0.06));
+            flex: 0 0 auto;
+        }
+        #my-list-overview-window .list-overview-title {
+            font-weight: 800;
+            font-size: 15px;
+        }
+        #my-list-overview-window .list-overview-meta {
+            margin-top: 3px;
+            color: #64748b;
+            font-size: 12px;
+            word-break: break-all;
+        }
+        #my-list-overview-window .list-overview-title-actions {
+            display: flex;
+            gap: 8px;
+            flex: 0 0 auto;
+        }
+        #my-list-overview-window .list-overview-title-actions button {
+            border: 1px solid rgba(139, 92, 246, 0.28);
+            background: rgba(139, 92, 246, 0.08);
+            color: inherit;
+            border-radius: 8px;
+            padding: 7px 12px;
+            cursor: pointer;
+            font-weight: 700;
+        }
+        #my-list-overview-window .list-overview-scroll {
+            flex: 1;
+            overflow-y: auto;
+            padding: 18px 22px 20px;
+            box-sizing: border-box;
+        }
+        #my-list-overview-window .list-overview-content {
+            display: block !important;
+            max-width: 820px;
+            margin: 0 auto 16px;
+            padding: 0 0 14px;
+            border-top: none;
+            border-bottom: 1px dashed rgba(139, 92, 246, 0.26);
+            font-size: 15px;
+            line-height: 1.75;
+        }
+        #my-list-overview-window .list-overview-content h1,
+        #my-list-overview-window .list-overview-content h2,
+        #my-list-overview-window .list-overview-content h3 {
+            margin: 14px 0 8px;
+        }
+        #my-list-overview-window .list-overview-chat {
+            max-width: 820px;
+            margin: 0 auto;
+        }
+        #my-list-overview-window .my-ai-chat-history {
+            max-height: 280px;
+        }
+        @media (max-width: 720px) {
+            #my-list-overview-window {
+                padding: 8px;
+            }
+            #my-list-overview-window .list-overview-window {
+                width: calc(100vw - 16px);
+                height: calc(100vh - 16px);
+            }
+            #my-list-overview-window .list-overview-titlebar {
+                align-items: flex-start;
+                flex-direction: column;
+            }
+            #my-list-overview-window .list-overview-scroll {
+                padding: 14px;
+            }
         }
 
         .my-ai-chat-area { margin-top: 12px; padding-top: 10px; border-top: 1px dashed rgba(139,92,246,0.3); display: none; }
@@ -2258,11 +2822,10 @@
                     <div class="my-input-group">
                         <label class="my-input-label">⚡ 预加载缓存</label>
                         <div class="auto-summary-row">
-                            <label><input type="checkbox" id="cfg-preload-enabled"> 开启后台预总结</label>
-                            <div class="desc">开启后,脚本会提前总结当前列表里识别到的前几篇文章；点击文章时优先秒读本地缓存</div>
-                            <label style="margin-top:6px;">预加载篇数 <input id="cfg-preload-limit" class="my-input" type="number" min="1" max="20" style="width:90px;padding:4px 8px;"></label>
+                            <label><input type="checkbox" id="cfg-preload-enabled"> 允许执行手动预加载队列</label>
+                            <div class="desc">脚本只识别列表,不会自动预加载；需要在预加载面板点“预加载本列表全部”</div>
                             <label style="margin-top:6px;">同时总结 <input id="cfg-preload-concurrency" class="my-input" type="number" min="1" max="3" style="width:90px;padding:4px 8px;"> 篇</label>
-                            <div class="desc">建议 2。设置太高会增加 API 并发费用，也更容易触发原站抓取限制</div>
+                            <div class="desc">控制并发速度。预加载不设篇数上限,点一次会处理当前列表识别到的全部文章</div>
                             <label style="margin-top:6px;"><input type="checkbox" id="cfg-preload-iframe"> 启用隐藏详情页预取</label>
                             <div class="desc">默认关闭。开启后可提高预加载命中率，但更耗资源，也可能触发 Folo 已读</div>
                         </div>
@@ -2338,7 +2901,6 @@
         loadStrategiesUI();
         document.getElementById('cfg-auto-summarize').checked = getAutoSummarizeEnabled();
         document.getElementById('cfg-preload-enabled').checked = getPreloadEnabled();
-        document.getElementById('cfg-preload-limit').value = getPreloadLimit();
         document.getElementById('cfg-preload-concurrency').value = getPreloadConcurrency();
         document.getElementById('cfg-preload-iframe').checked = getPreloadIframeEnabled();
         document.getElementById('cfg-flomo-url').value = getFlomoApiUrl();
@@ -2514,6 +3076,9 @@
                 loadFormData(getActiveConfig());
                 loadStrategiesUI();
                 document.getElementById('cfg-auto-summarize').checked = getAutoSummarizeEnabled();
+                document.getElementById('cfg-preload-enabled').checked = getPreloadEnabled();
+                document.getElementById('cfg-preload-concurrency').value = getPreloadConcurrency();
+                document.getElementById('cfg-preload-iframe').checked = getPreloadIframeEnabled();
                 document.getElementById('cfg-flomo-url').value = getFlomoApiUrl();
                 setWebDAVStatus(`✅ 下载成功 · 配置数:${merged.profiles.length} · ${new Date().toLocaleTimeString()}`, "success");
             } catch(e) {
@@ -2592,7 +3157,6 @@
             saveStrategiesFromUI();
             setAutoSummarizeEnabled(document.getElementById('cfg-auto-summarize').checked);
             setPreloadEnabled(document.getElementById('cfg-preload-enabled').checked);
-            setPreloadLimit(document.getElementById('cfg-preload-limit').value);
             setPreloadConcurrency(document.getElementById('cfg-preload-concurrency').value);
             setPreloadIframeEnabled(document.getElementById('cfg-preload-iframe').checked);
             setFlomoApiUrl(document.getElementById('cfg-flomo-url').value);
@@ -3085,7 +3649,7 @@
         const summaryEl = wrapper.querySelector('.my-ai-content');
         const summaryText = summaryRaw || (summaryEl ? summaryEl.innerText.trim() : '');
         if (summaryText) {
-            lines.push('===== 🤖 AI 总结 =====');
+            lines.push(`===== 🤖 ${wrapper.__contentLabel || "AI 总结"} =====`);
             lines.push(summaryText);
             lines.push('');
         }
@@ -3305,6 +3869,8 @@
 
     function checkAndInject() {
         ensurePreloadPanel();
+        refreshCurrentListSnapshot();
+        schedulePreloadMarkerRender();
         document.querySelectorAll('button[title="Open AI Chat"]').forEach(b => b.style.display = 'none');
 
         let article = document.getElementById('follow-entry-render') || document.querySelector('article[data-testid="entry-render"]');
