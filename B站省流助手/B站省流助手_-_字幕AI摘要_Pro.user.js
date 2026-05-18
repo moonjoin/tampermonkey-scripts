@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         B站省流助手 - 字幕AI摘要 Pro
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      3.8.4
-// @description  自动提取B站视频字幕，通过自定义AI API生成极简摘要，支持模型切换、持续对话和评论区总结；支持自动解析开关、自动获取模型列表、flomo自动加标签，新增总结生图功能；v3.7.1 增加打断总结功能，在"无字幕"状态下，新增"手动上传字幕"按钮；v3.8.3 修复首次打开视频页字幕获取失败的bug
+// @version      3.8.5
+// @description  自动提取B站视频字幕，通过自定义AI API生成极简摘要，支持模型切换、持续对话和评论区总结；支持自动解析开关、自动获取模型列表、flomo自动加标签，新增总结生图功能；v3.8.5 优化 API URL 自动补全，并兼容 images/responses/chat 多类生图接口
 // @author       次元饺子
 // @match        https://www.bilibili.com/video/*
 // @match        https://www.bilibili.com/list/*
@@ -58,7 +58,7 @@
   ];
 
   const DEFAULT_CONFIG = {
-    apiUrl: 'https://xxxx/v1/chat/completions',
+    apiUrl: 'https://xxxx/v1',
     apiKey: 'sk-xxxx',
     model: 'deepseek-v4-flash',
     flomoApiUrl: '',
@@ -226,10 +226,14 @@
   }
 
   let CONFIG = loadConfig();
+  let currentPresetId = CONFIG.activePresetId || 'preset_default';
   let POSITIONS = loadPositions();
   const INIT_DELAY_MS = 2000;
   const MAX_CONVERSATION_HISTORY = 21;
   const IMAGE_GEN_SUMMARY_MAX_LEN = 5000;
+  const BILI_API_TIMEOUT_MS = 12000;
+  const BILI_SUBTITLE_TIMEOUT_MS = 15000;
+  const AUX_REQUEST_TIMEOUT_MS = 30000;
   // 🆕 流式渲染节流间隔（ms），控制 UI 重绘频率
   const STREAM_RENDER_THROTTLE = 80;
 
@@ -292,6 +296,245 @@
     if (value === 'auto') return value;
     if (!/^\d{2,5}x\d{2,5}$/.test(value)) return '';
     return value;
+  }
+
+  function normalizeApiUrlInput(apiUrl) {
+    return String(apiUrl || '').trim().replace(/\/+$/, '');
+  }
+
+  function escapeRegExp(text) {
+    return String(text || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+
+  function buildApiUrl(apiUrl, endpointPath) {
+    const endpoint = String(endpointPath || '').replace(/^\/+/, '');
+    let url = normalizeApiUrlInput(apiUrl);
+    if (!url || !endpoint) return url;
+
+    const exactEndpointReg = new RegExp('/' + escapeRegExp(endpoint) + '$', 'i');
+    if (exactEndpointReg.test(url)) return url;
+
+    const versionMatch = url.match(/^(.*\/v\d+)(?:\/.*)?$/i);
+    if (versionMatch) {
+      return versionMatch[1] + '/' + endpoint;
+    }
+
+    if (/\/(?:chat\/completions|completions|images\/generations|images\/edits|responses|models)$/i.test(url)) {
+      return url.replace(/\/(?:chat\/completions|completions|images\/generations|images\/edits|responses|models)$/i, '/' + endpoint);
+    }
+
+    return url + '/' + endpoint;
+  }
+
+  function buildChatCompletionsUrl(apiUrl) {
+    return buildApiUrl(apiUrl, 'chat/completions');
+  }
+
+  async function fetchWithTimeout(url, options, timeoutMs) {
+    options = options || {};
+    timeoutMs = timeoutMs || BILI_API_TIMEOUT_MS;
+    const externalSignal = options.signal;
+    const controller = new AbortController();
+    let timedOut = false;
+    const onExternalAbort = function() {
+      try { controller.abort(); } catch(e) {}
+    };
+    const timer = setTimeout(function() {
+      timedOut = true;
+      try { controller.abort(); } catch(e) {}
+    }, timeoutMs);
+    if (externalSignal) {
+      if (externalSignal.aborted) {
+        onExternalAbort();
+      } else {
+        externalSignal.addEventListener('abort', onExternalAbort);
+      }
+    }
+    try {
+      return await fetch(url, Object.assign({}, options, { signal: controller.signal }));
+    } catch (err) {
+      if (isAbortError(err)) {
+        if (externalSignal && externalSignal.aborted && !timedOut) {
+          const abortErr = new Error('用户已打断');
+          abortErr.name = 'AbortError';
+          throw abortErr;
+        }
+        throw new Error('请求超时（' + Math.round(timeoutMs / 1000) + '秒）');
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+      if (externalSignal) externalSignal.removeEventListener('abort', onExternalAbort);
+    }
+  }
+
+  function buildImagePrompt(textContent) {
+    const summaryForImage = String(textContent || '').slice(0, IMAGE_GEN_SUMMARY_MAX_LEN).replace(/[#*_\[\]()]/g, '');
+    const promptTemplate = CONFIG.imageGenPromptText || IMAGE_GEN_PROMPT_TEXT;
+    return promptTemplate.includes('{summary}')
+      ? promptTemplate.replace('{summary}', summaryForImage)
+      : promptTemplate + '\n\n' + summaryForImage;
+  }
+
+  function addUniqueImageCandidate(candidates, kind, url) {
+    url = normalizeApiUrlInput(url);
+    if (!url) return;
+    const key = kind + '|' + url;
+    if (candidates.some(function(item) { return item.key === key; })) return;
+    candidates.push({ key: key, kind: kind, url: url });
+  }
+
+  function buildImageApiCandidates(apiUrl) {
+    const url = normalizeApiUrlInput(apiUrl);
+    const candidates = [];
+    if (!url) return candidates;
+
+    if (/\/images\/generations$/i.test(url)) addUniqueImageCandidate(candidates, 'images', url);
+    if (/\/responses$/i.test(url)) addUniqueImageCandidate(candidates, 'responses', url);
+
+    // 保持旧版行为：优先使用支持 size 字段的 Images API，避免 chat 生图忽略 1:1 尺寸。
+    addUniqueImageCandidate(candidates, 'images', buildApiUrl(url, 'images/generations'));
+    addUniqueImageCandidate(candidates, 'responses', buildApiUrl(url, 'responses'));
+    if (/\/chat\/completions$/i.test(url)) addUniqueImageCandidate(candidates, 'chat', url);
+    addUniqueImageCandidate(candidates, 'chat', buildApiUrl(url, 'chat/completions'));
+
+    return candidates;
+  }
+
+  function getImageRequestBodies(kind, model, imagePrompt) {
+    const size = CONFIG.imageGenSize || '1024x1024';
+    if (kind === 'images') {
+      const baseBody = { model: model, prompt: imagePrompt, n: 1, size: size };
+      return [
+        Object.assign({}, baseBody, { response_format: 'b64_json' }),
+        baseBody
+      ];
+    }
+    if (kind === 'responses') {
+      const tool = { type: 'image_generation' };
+      if (size && size !== 'auto') tool.size = size;
+      return [
+        { model: model, input: imagePrompt, tools: [tool] },
+        { model: model, input: imagePrompt, tools: [{ type: 'image_generation' }] }
+      ];
+    }
+    const sizeHint = size && size !== 'auto' ? '\n\n请严格按 ' + size + ' 画布尺寸生成，保持对应宽高比。' : '';
+    return [
+      { model: model, messages: [{ role: 'user', content: imagePrompt + sizeHint }] },
+      { model: model, messages: [{ role: 'user', content: imagePrompt + sizeHint }], modalities: ['text', 'image'] }
+    ];
+  }
+
+  function normalizeExtractedImage(value) {
+    const text = String(value || '').trim();
+    if (!text) return '';
+    if (/^data:image\//i.test(text) || /^https?:\/\//i.test(text)) return text;
+    const compact = text.replace(/\s/g, '');
+    if (compact.length > 100 && /^[A-Za-z0-9+/]+={0,2}$/.test(compact)) {
+      return 'data:image/png;base64,' + compact;
+    }
+    return '';
+  }
+
+  function extractImageDataUrlFromResponse(data) {
+    if (!data) return '';
+
+    const seen = new Set();
+    function walk(node, key, parent) {
+      if (node == null) return '';
+      if (typeof node === 'string') {
+        if (/^(b64_json|base64|image_base64|result)$/i.test(key || '')) {
+          const parentType = String(parent && (parent.type || parent.kind || parent.object) || '');
+          if (!parentType || /image|generation/i.test(parentType)) {
+            const direct = normalizeExtractedImage(node);
+            if (direct) return direct;
+          }
+        }
+        if (/^(url|image_url|output_url)$/i.test(key || '')) {
+          const direct = normalizeExtractedImage(node);
+          if (direct) return direct;
+        }
+        const dataUrlMatch = node.match(/data:image\/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=\s]+/i);
+        if (dataUrlMatch) return normalizeExtractedImage(dataUrlMatch[0]);
+        const markdownImageMatch = node.match(/!\[[^\]]*]\((https?:\/\/[^)\s]+|data:image\/[^)\s]+)\)/i);
+        if (markdownImageMatch) return normalizeExtractedImage(markdownImageMatch[1]);
+        return '';
+      }
+      if (typeof node !== 'object') return '';
+      if (seen.has(node)) return '';
+      seen.add(node);
+
+      if (node.image_url && typeof node.image_url === 'object') {
+        const directImageUrl = walk(node.image_url.url || node.image_url.data || node.image_url.b64_json, 'image_url', node.image_url);
+        if (directImageUrl) return directImageUrl;
+      }
+
+      if (Array.isArray(node)) {
+        for (const item of node) {
+          const found = walk(item, key, parent);
+          if (found) return found;
+        }
+        return '';
+      }
+
+      for (const prop of Object.keys(node)) {
+        const found = walk(node[prop], prop, node);
+        if (found) return found;
+      }
+      return '';
+    }
+
+    return walk(data, '', null);
+  }
+
+  async function requestImageFromCandidate(candidate, apiKey, model, imagePrompt, signal) {
+    const bodies = getImageRequestBodies(candidate.kind, model, imagePrompt);
+    let lastError = '';
+    for (const body of bodies) {
+      try {
+        const res = await fetch(candidate.url, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Bearer ' + apiKey
+          },
+          body: JSON.stringify(body),
+          signal: signal
+        });
+        const text = await res.text();
+        let data = null;
+        try { data = text ? JSON.parse(text) : null; } catch (e) {}
+        if (!res.ok) {
+          lastError = 'HTTP ' + res.status + ': ' + (text || '').slice(0, 200);
+          continue;
+        }
+        const imageDataUrl = extractImageDataUrlFromResponse(data || text);
+        if (imageDataUrl) return imageDataUrl;
+        lastError = '响应里没有解析到图片数据';
+      } catch (err) {
+        if (isAbortError(err)) throw err;
+        lastError = err.message || String(err);
+      }
+    }
+    throw new Error(lastError || '生图请求失败');
+  }
+
+  async function generateImageByApi(apiUrl, apiKey, model, imagePrompt, signal) {
+    const candidates = buildImageApiCandidates(apiUrl);
+    let lastError = '';
+    for (const candidate of candidates) {
+      try {
+        console.log('[省流助手-生图] 尝试 ' + candidate.kind + ' 接口:', candidate.url);
+        const imageDataUrl = await requestImageFromCandidate(candidate, apiKey, model, imagePrompt, signal);
+        console.log('[省流助手-生图] ✅ ' + candidate.kind + ' 接口返回图片');
+        return imageDataUrl;
+      } catch (err) {
+        if (isAbortError(err)) throw err;
+        lastError = candidate.kind + ' ' + candidate.url + ' -> ' + (err.message || String(err));
+        console.warn('[省流助手-生图] ' + lastError);
+      }
+    }
+    throw new Error(lastError || '生图 API 未返回图片数据');
   }
 
   function pickDescriptionFromDom() {
@@ -368,9 +611,14 @@
 
   // ==================== 字幕获取部分 ====================
   async function fetchSubtitles(cid, bvid) {
+    if (!cid || !bvid) {
+      console.warn('[省流助手] 缺少 cid 或 bvid，跳过字幕接口请求:', { cid: cid, bvid: bvid });
+      return [];
+    }
     try {
       const url = 'https://api.bilibili.com/x/player/wbi/v2?cid=' + cid + '&bvid=' + bvid;
-      const res = await fetch(url, { credentials: 'include' });
+      const res = await fetchWithTimeout(url, { credentials: 'include' }, BILI_API_TIMEOUT_MS);
+      if (!res.ok) throw new Error('HTTP ' + res.status);
       const data = await res.json();
       if (data?.data?.subtitle?.subtitles?.length > 0) {
         return data.data.subtitle.subtitles;
@@ -380,7 +628,8 @@
     }
     try {
       const url = 'https://api.bilibili.com/x/player/v2?cid=' + cid + '&bvid=' + bvid;
-      const res = await fetch(url, { credentials: 'include' });
+      const res = await fetchWithTimeout(url, { credentials: 'include' }, BILI_API_TIMEOUT_MS);
+      if (!res.ok) throw new Error('HTTP ' + res.status);
       const data = await res.json();
       if (data?.data?.subtitle?.subtitles?.length > 0) {
         return data.data.subtitle.subtitles;
@@ -392,9 +641,11 @@
   }
 
   async function fetchSubtitleContent(subtitleUrl) {
+    if (!subtitleUrl) return [];
     try {
       const url = subtitleUrl.startsWith('http') ? subtitleUrl : 'https:' + subtitleUrl;
-      const res = await fetch(url);
+      const res = await fetchWithTimeout(url, {}, BILI_SUBTITLE_TIMEOUT_MS);
+      if (!res.ok) throw new Error('HTTP ' + res.status);
       const data = await res.json();
       return data.body || [];
     } catch(e) {
@@ -750,33 +1001,65 @@
   }
 
   // ==================== 评论区防Ban工具函数 ====================
-  function randomDelay(min, max) {
-    const delay = min + Math.random() * (max - min);
-    console.log('[省流助手] 等待 ' + (delay / 1000).toFixed(1) + 's...');
-    return new Promise(r => setTimeout(r, delay));
+  function throwIfAborted(signal) {
+    if (signal && signal.aborted) {
+      const abortErr = new Error('用户已打断');
+      abortErr.name = 'AbortError';
+      throw abortErr;
+    }
   }
 
-  async function retryWithBackoff(fn, maxRetries, baseDelay) {
+  function randomDelay(min, max, signal) {
+    const delay = min + Math.random() * (max - min);
+    console.log('[省流助手] 等待 ' + (delay / 1000).toFixed(1) + 's...');
+    return new Promise(function(resolve, reject) {
+      let timer = null;
+      function cleanup() {
+        if (signal) signal.removeEventListener('abort', onAbort);
+      }
+      function onAbort() {
+        if (timer) clearTimeout(timer);
+        cleanup();
+        const abortErr = new Error('用户已打断');
+        abortErr.name = 'AbortError';
+        reject(abortErr);
+      }
+      if (signal && signal.aborted) {
+        onAbort();
+        return;
+      }
+      if (signal) signal.addEventListener('abort', onAbort);
+      timer = setTimeout(function() {
+        cleanup();
+        resolve();
+      }, delay);
+    });
+  }
+
+  async function retryWithBackoff(fn, maxRetries, baseDelay, signal) {
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      throwIfAborted(signal);
       try {
         return await fn();
       } catch (e) {
+        if (isAbortError(e)) throw e;
         if (attempt === maxRetries) throw e;
         const backoffDelay = baseDelay * Math.pow(2, attempt) + Math.random() * 1000;
         console.warn('[省流助手] 第' + (attempt + 1) + '次失败，' + (backoffDelay / 1000).toFixed(1) + 's 后重试: ' + e.message);
-        await new Promise(r => setTimeout(r, backoffDelay));
+        await randomDelay(backoffDelay, backoffDelay, signal);
       }
     }
   }
 
-  function createSafeFetcher() {
+  function createSafeFetcher(signal) {
     return async function safeFetch(url, options) {
       options = options || {};
       const mergedOptions = Object.assign({}, options, {
         credentials: 'include',
         headers: Object.assign({}, SAFE_FETCH_HEADERS, { 'Referer': window.location.href }, options.headers || {})
       });
-      const resp = await fetch(url, mergedOptions);
+      if (signal) mergedOptions.signal = signal;
+      const resp = await fetchWithTimeout(url, mergedOptions, BILI_API_TIMEOUT_MS);
       if (resp.status === 412) throw new BiliRiskControlError('触发B站风控(412)，请求被拒绝，请稍后再试');
       if (resp.status === 403) throw new BiliRiskControlError('被B站拒绝访问(403)，可能需要登录或IP被限制');
       if (resp.status === 429) throw new BiliRiskControlError('请求过于频繁(429)，触发限流');
@@ -807,9 +1090,9 @@
     return data.data;
   }
 
-  async function fetchAllComments(aid, statusCallback) {
+  async function fetchAllComments(aid, statusCallback, signal) {
     const allComments = [];
-    const safeFetch = createSafeFetcher();
+    const safeFetch = createSafeFetcher(signal);
     const maxPages = CONFIG.commentMaxPages || COMMENT_CONFIG.maxPages;
     const commentLimit = CONFIG.commentLimit || COMMENT_CONFIG.commentLimit;
     const minDelay = CONFIG.commentMinDelay || COMMENT_CONFIG.minDelay;
@@ -817,15 +1100,18 @@
 
     for (let page = 1; page <= maxPages; page++) {
       try {
+        throwIfAborted(signal);
         if (page > 1) {
-          await randomDelay(minDelay, maxDelay);
+          await randomDelay(minDelay, maxDelay, signal);
         }
 
         const result = await retryWithBackoff(
           () => fetchComments(safeFetch, aid, page),
           COMMENT_CONFIG.maxRetries,
-          COMMENT_CONFIG.retryBaseDelay
+          COMMENT_CONFIG.retryBaseDelay,
+          signal
         );
+        throwIfAborted(signal);
 
         const replies = result?.replies;
         if (!replies || replies.length === 0) break;
@@ -854,6 +1140,7 @@
         if (allComments.length >= commentLimit) break;
 
       } catch (e) {
+        if (isAbortError(e)) throw e;
         console.warn('[省流助手] 获取第' + page + '页评论失败:', e.message);
         if (e instanceof BiliRiskControlError) {
           console.warn('[省流助手] 检测到风控，停止请求');
@@ -2457,11 +2744,11 @@
     btn.textContent = '⏳ 发送中...';
     btn.disabled = true;
     try {
-      const res = await fetch(CONFIG.flomoApiUrl, {
+      const res = await fetchWithTimeout(CONFIG.flomoApiUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ content: content })
-      });
+      }, AUX_REQUEST_TIMEOUT_MS);
       if (!res.ok) {
         const errText = await res.text();
         throw new Error('HTTP ' + res.status + ' ' + errText);
@@ -2527,60 +2814,10 @@
     btn.disabled = true;
     btn.textContent = '⏳ 生成中...';
 
-    const summaryForImage = (summaryText || '').slice(0, IMAGE_GEN_SUMMARY_MAX_LEN).replace(/[#*_\[\]()]/g, '');
-    const promptTemplate = CONFIG.imageGenPromptText || IMAGE_GEN_PROMPT_TEXT;
-    const imagePrompt = promptTemplate.includes('{summary}')
-      ? promptTemplate.replace('{summary}', summaryForImage)
-      : promptTemplate + '\n\n' + summaryForImage;
-
-    let imageApiUrl = apiUrl.trim().replace(/\/+$/, '');
-    if (/\/chat\/completions$/.test(imageApiUrl)) {
-      imageApiUrl = imageApiUrl.replace(/\/chat\/completions$/, '/images/generations');
-    } else if (/\/completions$/.test(imageApiUrl)) {
-      imageApiUrl = imageApiUrl.replace(/\/completions$/, '/images/generations');
-    } else {
-      imageApiUrl = imageApiUrl.replace(/\/v1\/.*$/, '/v1/images/generations');
-    }
-
-    console.log('[省流助手-手动生图] 调用:', imageApiUrl, '| 模型:', model);
-
-    let imageDataUrl = '';
+    const imagePrompt = buildImagePrompt(summaryText || '');
 
     try {
-      const imageRes = await fetch(imageApiUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + apiKey },
-        body: JSON.stringify({ model: model, prompt: imagePrompt, n: 1, size: CONFIG.imageGenSize || '1024x1024', response_format: 'b64_json' })
-      });
-
-      if (imageRes.ok) {
-        const imageData = await imageRes.json();
-        if (imageData.data && imageData.data.length > 0) {
-          const imgItem = imageData.data[0];
-          if (imgItem.b64_json) imageDataUrl = 'data:image/png;base64,' + imgItem.b64_json;
-          else if (imgItem.url) imageDataUrl = imgItem.url;
-        }
-      }
-
-      if (!imageDataUrl) {
-        const imageRes2 = await fetch(imageApiUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + apiKey },
-          body: JSON.stringify({ model: model, prompt: imagePrompt, n: 1, size: CONFIG.imageGenSize || '1024x1024' })
-        });
-        if (imageRes2.ok) {
-          const imageData2 = await imageRes2.json();
-          if (imageData2.data && imageData2.data.length > 0) {
-            const imgItem2 = imageData2.data[0];
-            if (imgItem2.url) imageDataUrl = imgItem2.url;
-            else if (imgItem2.b64_json) imageDataUrl = 'data:image/png;base64,' + imgItem2.b64_json;
-          }
-        }
-      }
-
-      if (!imageDataUrl) {
-        throw new Error('生图 API 未返回图片数据');
-      }
+      const imageDataUrl = await generateImageByApi(apiUrl, apiKey, model, imagePrompt);
 
       const resultContainer = contentDiv.querySelector('.tabbit-result');
       if (resultContainer) {
@@ -2945,7 +3182,8 @@
     if (!CONFIG.apiUrl || !CONFIG.apiKey || !currentModel) {
       throw new Error('请点击右上角 ⚙️ 设置按钮，填写 apiUrl、apiKey 和 model');
     }
-    const res = await fetch(CONFIG.apiUrl, {
+    const chatApiUrl = buildChatCompletionsUrl(CONFIG.apiUrl);
+    const res = await fetch(chatApiUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -2978,7 +3216,7 @@
    */
   async function callAIStream(messages, onDelta, options) {
     options = options || {};
-    const apiUrl = options.apiUrl || CONFIG.apiUrl;
+    const apiUrl = buildChatCompletionsUrl(options.apiUrl || CONFIG.apiUrl);
     const apiKey = options.apiKey || CONFIG.apiKey;
     const model = options.model || currentModel;
     const signal = options.signal; // 🆕 AbortSignal
@@ -3183,90 +3421,8 @@
       throw new Error('请在设置中配置生图模型的 API URL 和 API Key');
     }
 
-    const summaryForImage = textContent.slice(0, IMAGE_GEN_SUMMARY_MAX_LEN).replace(/[#*_\[\]()]/g, '');
-    const promptTemplate = CONFIG.imageGenPromptText || IMAGE_GEN_PROMPT_TEXT;
-    const imagePrompt = promptTemplate.includes('{summary}')
-      ? promptTemplate.replace('{summary}', summaryForImage)
-      : promptTemplate + '\n\n' + summaryForImage;
-
-    let imageApiUrl = apiUrl.trim().replace(/\/+$/, '');
-    if (/\/chat\/completions$/.test(imageApiUrl)) {
-      imageApiUrl = imageApiUrl.replace(/\/chat\/completions$/, '/images/generations');
-    } else if (/\/completions$/.test(imageApiUrl)) {
-      imageApiUrl = imageApiUrl.replace(/\/completions$/, '/images/generations');
-    } else {
-      imageApiUrl = imageApiUrl.replace(/\/v1\/.*$/, '/v1/images/generations');
-    }
-    console.log('[省流助手-生图] 第2步：调用生图端点:', imageApiUrl);
-
-    let imageDataUrl = '';
-    try {
-      const imageRes = await fetch(imageApiUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': 'Bearer ' + apiKey
-        },
-        body: JSON.stringify({
-          model: model,
-          prompt: imagePrompt,
-          n: 1,
-          size: CONFIG.imageGenSize || '1024x1024',
-          response_format: 'b64_json'
-        }),
-        signal: signal  // 🆕 加这一行
-      });
-
-      if (imageRes.ok) {
-        const imageData = await imageRes.json();
-        if (imageData.data && imageData.data.length > 0) {
-          const imgItem = imageData.data[0];
-          if (imgItem.b64_json) imageDataUrl = 'data:image/png;base64,' + imgItem.b64_json;
-          else if (imgItem.url) imageDataUrl = imgItem.url;
-        }
-      } else {
-        console.warn('[省流助手-生图] 生图端点返回错误:', imageRes.status);
-      }
-    } catch (imgErr) {
-      if (isAbortError(imgErr)) throw imgErr; // 🆕 打断直接抛出
-      console.warn('[省流助手-生图] 生图请求异常:', imgErr.message);
-    }
-
-    if (!imageDataUrl) {
-      try {
-        const imageRes2 = await fetch(imageApiUrl, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': 'Bearer ' + apiKey
-          },
-          body: JSON.stringify({
-            model: model,
-            prompt: imagePrompt,
-            n: 1,
-            size: CONFIG.imageGenSize || '1024x1024'
-          }),
-          signal: signal  // 🆕 加这一行
-        });
-        if (imageRes2.ok) {
-          const imageData2 = await imageRes2.json();
-          if (imageData2.data && imageData2.data.length > 0) {
-            const imgItem2 = imageData2.data[0];
-            if (imgItem2.url) imageDataUrl = imgItem2.url;
-            else if (imgItem2.b64_json) imageDataUrl = 'data:image/png;base64,' + imgItem2.b64_json;
-          }
-        }
-      } catch (e) {
-        if (isAbortError(e)) throw e; // 🆕 打断直接抛出
-        console.warn('[省流助手-生图] 第二次生图尝试也失败:', e.message);
-      }
-    }
-
-    if (!imageDataUrl) {
-      throw new Error('生图 API 未返回图片数据');
-    }
-    console.log('[省流助手-生图] ✅ 图片生成成功');
-    return imageDataUrl;
+    const imagePrompt = buildImagePrompt(textContent || '');
+    return await generateImageByApi(apiUrl, apiKey, model, imagePrompt, signal);
   }
 
   function isImageGenEnabled() {
@@ -3425,19 +3581,7 @@
 
   // ==================== 自动获取模型列表 ====================
   function deriveModelsUrl(apiUrl) {
-    if (!apiUrl) return '';
-    let url = apiUrl.trim();
-    url = url.replace(/\/+$/, '');
-    if (/\/chat\/completions$/.test(url)) {
-      return url.replace(/\/chat\/completions$/, '/models');
-    }
-    if (/\/completions$/.test(url)) {
-      return url.replace(/\/completions$/, '/models');
-    }
-    if (/\/v\d+$/.test(url)) {
-      return url + '/models';
-    }
-    return url + '/models';
+    return buildApiUrl(apiUrl, 'models');
   }
 
   async function fetchModelList(apiUrl, apiKey) {
@@ -3446,13 +3590,13 @@
     }
     const modelsUrl = deriveModelsUrl(apiUrl);
     console.log('[省流助手] 获取模型列表:', modelsUrl);
-    const res = await fetch(modelsUrl, {
+    const res = await fetchWithTimeout(modelsUrl, {
       method: 'GET',
       headers: {
         'Authorization': 'Bearer ' + apiKey,
         'Content-Type': 'application/json'
       }
-    });
+    }, AUX_REQUEST_TIMEOUT_MS);
     if (!res.ok) {
       const errText = await res.text();
       throw new Error('HTTP ' + res.status + ': ' + errText.slice(0, 200));
@@ -3473,11 +3617,23 @@
   }
 
   // ==================== 摘要主流程 ====================
+  function getCurrentPresetId() {
+    const presets = CONFIG.promptPresets || [];
+    if (presets.some(p => p.id === currentPresetId)) return currentPresetId;
+    if (presets.some(p => p.id === CONFIG.activePresetId)) {
+      currentPresetId = CONFIG.activePresetId;
+      return currentPresetId;
+    }
+    currentPresetId = presets[0]?.id || 'preset_default';
+    return currentPresetId;
+  }
+
   function renderPresetBarHtml() {
     const presets = CONFIG.promptPresets || [];
     if (presets.length === 0) return '';
+    const activePresetId = getCurrentPresetId();
     const chips = presets.map(p => {
-      const isActive = p.id === CONFIG.activePresetId;
+      const isActive = p.id === activePresetId;
       return '<div class="tabbit-preset-chip' + (isActive ? ' active' : '') + '" data-preset-id="' + escapeHtml(p.id) + '" title="' + escapeHtml(p.prompt.slice(0, 100)) + '...">' +
         '<span class="tabbit-preset-icon">' + escapeHtml(p.icon || '📄') + '</span>' +
         '<span>' + escapeHtml(p.name) + '</span>' +
@@ -3498,9 +3654,8 @@
         const newId = chip.dataset.presetId;
         const preset = (CONFIG.promptPresets || []).find(p => p.id === newId);
         if (!preset) return;
-        if (newId === CONFIG.activePresetId) return;
-        CONFIG.activePresetId = newId;
-        saveConfig(CONFIG);
+        if (newId === getCurrentPresetId()) return;
+        currentPresetId = newId;
         panel.querySelectorAll('.tabbit-preset-chip').forEach(c => c.classList.remove('active'));
         chip.classList.add('active');
         conversationHistory = [];
@@ -3649,7 +3804,8 @@
     sendBtn.disabled = true;
 
     const pageUrl = window.location.href;
-    const activePreset = (CONFIG.promptPresets || []).find(p => p.id === CONFIG.activePresetId);
+    const activePresetId = getCurrentPresetId();
+    const activePreset = (CONFIG.promptPresets || []).find(p => p.id === activePresetId);
     const activePrompt = (activePreset && activePreset.prompt) || CONFIG.promptText || PROMPT_TEXT;
     const videoDesc = limitText(videoInfo.desc || '', 1500);
     const fullPrompt = activePrompt
@@ -3661,7 +3817,7 @@
 
     const presetBarHtml = renderPresetBarHtml();
     const useImageGen = isImageGenEnabled();
-    const cacheKey = buildSummaryCacheKey(videoInfo, currentModel, CONFIG.activePresetId, activePrompt, transcript);
+    const cacheKey = buildSummaryCacheKey(videoInfo, currentModel, activePresetId, activePrompt, transcript);
 
     renderSummaryShell(panel, contentDiv, presetBarHtml, videoInfo, pageUrl);
 
@@ -3745,7 +3901,7 @@
         setCachedSummary(cacheKey, {
           summary: textContent,
           model: currentModel,
-          presetId: CONFIG.activePresetId,
+          presetId: activePresetId,
           title: videoInfo.title
         });
 
@@ -3775,7 +3931,7 @@
         setCachedSummary(cacheKey, {
           summary: reply,
           model: currentModel,
-          presetId: CONFIG.activePresetId,
+          presetId: activePresetId,
           title: videoInfo.title
         });
 
@@ -3846,6 +4002,13 @@
     currentAbortController = new AbortController();
     const localController = currentAbortController;
     let abortBtn = null;
+    const fetchAbortBtnWrap = document.createElement('div');
+    fetchAbortBtnWrap.style.cssText = 'text-align:center;';
+    abortBtn = insertInlineAbortBtn(fetchAbortBtnWrap, function() {
+      abortCurrentTask();
+    });
+    commentSection.appendChild(fetchAbortBtnWrap);
+    abortBtn._wrap = fetchAbortBtnWrap;
 
     try {
       const aid = getAid(videoInfo);
@@ -3853,7 +4016,7 @@
 
       const comments = await fetchAllComments(aid, (msg) => {
         if (statusEl) statusEl.textContent = msg;
-      });
+      }, localController.signal);
       if (comments.length === 0) throw new Error('该视频没有评论');
 
       // 🆕 检查是否已被打断（评论抓取阶段）
@@ -3864,6 +4027,10 @@
       }
 
       if (statusEl) statusEl.textContent = '已获取 ' + comments.length + ' 条评论，AI 正在流式总结...';
+      if (abortBtn && abortBtn._wrap && abortBtn._wrap.parentNode) {
+        abortBtn._wrap.remove();
+        abortBtn = null;
+      }
 
       const commentsText = formatCommentsText(comments);
       const activeCommentPrompt = CONFIG.commentPromptText || COMMENT_PROMPT_TEXT;
@@ -4080,8 +4247,8 @@
             <div class="tabbit-collapse-body">
               <div class="tabbit-settings-group">
                 <div class="tabbit-settings-label">API URL</div>
-                <input class="tabbit-settings-input" id="ts-apiUrl" type="text" value="${escapeHtml(CONFIG.apiUrl || '')}" placeholder="https://your-api/v1/chat/completions" />
-                <div class="tabbit-settings-hint">OpenAI 兼容接口地址</div>
+                <input class="tabbit-settings-input" id="ts-apiUrl" type="text" value="${escapeHtml(CONFIG.apiUrl || '')}" placeholder="https://your-api/v1" />
+                <div class="tabbit-settings-hint">可填 https://xxx/v1，脚本会自动补成 /chat/completions 和 /models；也兼容完整 /v1/chat/completions</div>
               </div>
               <div class="tabbit-settings-group">
                 <div class="tabbit-settings-label">API Key</div>
@@ -4124,11 +4291,19 @@
             </div>
           </div>
 
-          <div class="tabbit-settings-group">
-            <div class="tabbit-settings-label">🎨 视频摘要预设（多个总结风格，可在面板中切换）</div>
-            <div class="tabbit-preset-manage-list" id="ts-preset-list"></div>
-            <button class="tabbit-preset-add-btn" id="ts-preset-add">＋ 添加新预设</button>
-            <div class="tabbit-settings-hint">每个预设有独立的提示词，在主面板可一键切换并重新分析</div>
+          <div class="tabbit-collapse">
+            <div class="tabbit-collapse-header" data-collapse="preset-settings">
+              <div class="tabbit-collapse-title">🎨 视频摘要预设</div>
+              <span class="tabbit-collapse-arrow">▶</span>
+            </div>
+            <div class="tabbit-collapse-body">
+              <div class="tabbit-settings-group">
+                <div class="tabbit-settings-label">预设管理</div>
+                <div class="tabbit-preset-manage-list" id="ts-preset-list"></div>
+                <button class="tabbit-preset-add-btn" id="ts-preset-add">＋ 添加新预设</button>
+                <div class="tabbit-settings-hint">设置里的「默认」决定启动默认预设；主面板切换只临时重新总结，不会改默认。</div>
+              </div>
+            </div>
           </div>
 
           <div class="tabbit-collapse">
@@ -4184,8 +4359,8 @@
             <div id="ts-imageGen-fields" style="margin-top:12px;${CONFIG.enableImageGen ? '' : 'display:none;'}">
               <div style="margin-bottom:10px;">
                 <div class="tabbit-settings-label">生图模型 API URL</div>
-                <input class="tabbit-settings-input" id="ts-imageGenApiUrl" type="text" value="${escapeHtml(CONFIG.imageGenApiUrl || '')}" placeholder="留空则使用上方的 API URL" />
-                <div class="tabbit-settings-hint">生图模型的 API 地址（OpenAI 兼容格式），留空则复用上方的 API URL</div>
+                <input class="tabbit-settings-input" id="ts-imageGenApiUrl" type="text" value="${escapeHtml(CONFIG.imageGenApiUrl || '')}" placeholder="https://your-api/v1（留空复用上方 API URL）" />
+                <div class="tabbit-settings-hint">可填 /v1、/v1/images/generations、/v1/responses 或 /v1/chat/completions；脚本会自动尝试兼容格式</div>
               </div>
               <div style="margin-bottom:10px;">
                 <div class="tabbit-settings-label">生图模型 API Key</div>
@@ -4469,6 +4644,7 @@
       CONFIG.modelList = newModelList.length > 0 ? newModelList : DEFAULT_CONFIG.modelList;
       CONFIG.promptPresets = cleanedPresets;
       CONFIG.activePresetId = validActiveId;
+      currentPresetId = validActiveId;
       const activeP = cleanedPresets.find(function(p) { return p.id === validActiveId; });
       if (activeP) CONFIG.promptText = activeP.prompt;
       CONFIG.commentPromptText = newCommentPromptText || COMMENT_PROMPT_TEXT;
@@ -4677,6 +4853,7 @@
     commentConversationHistory = [];
     isCommentSummarizing = false;
     hasParsed = false;
+    currentPresetId = CONFIG.activePresetId || 'preset_default';
     const panel = document.querySelector('#tabbit-ai-summary-panel');
     if (panel) panel.remove();
     hideFloatBtn();
@@ -4724,88 +4901,102 @@
     if (hasParsed) return;
     hasParsed = true;
     const parsingGeneration = routeGeneration;
-    lastRouteKey = getRouteKey();
+    let panel = null;
+    let videoInfo = null;
+    try {
+      lastRouteKey = getRouteKey();
 
-    console.log('[省流助手] 开始解析...');
-    const videoInfo = getVideoInfo();
-    if (!videoInfo.bvid) {
-      console.log('[省流助手] 无法获取BVID，跳过');
-      hasParsed = false;
-      return;
-    }
-    currentVideoInfo = videoInfo;
-    console.log('[省流助手] 视频信息 - 标题: ' + videoInfo.title + ', BVID: ' + videoInfo.bvid + ', CID: ' + videoInfo.cid);
+      console.log('[省流助手] 开始解析...');
+      videoInfo = getVideoInfo();
+      if (!videoInfo.bvid) {
+        console.log('[省流助手] 无法获取BVID，跳过');
+        hasParsed = false;
+        return;
+      }
+      currentVideoInfo = videoInfo;
+      console.log('[省流助手] 视频信息 - 标题: ' + videoInfo.title + ', BVID: ' + videoInfo.bvid + ', CID: ' + videoInfo.cid);
 
-    createStyles();
-    const panel = createPanel(videoInfo);
+      createStyles();
+      panel = createPanel(videoInfo);
 
-    const skipSec = CONFIG.skipDuration || 60;
-    if (videoInfo.duration > 0 && videoInfo.duration < skipSec) {
-      console.log('[省流助手] 视频时长不足' + skipSec + '秒，跳过自动字幕获取');
-      showNoSubtitleState(panel, videoInfo, true);
-      return;
-    }
-
-    console.log('[省流助手] 检测字幕可用性...');
-    const loadingSpan = panel.querySelector('.tabbit-panel-content .tabbit-loading span');
-    if (loadingSpan) loadingSpan.textContent = '正在检测字幕可用性...';
-
-    const hasSubtitleButton = await waitForSubtitleButton(1000, 500);
-    if (isStaleRoute(parsingGeneration)) return;
-    if (!hasSubtitleButton) {
-      showNoSubtitleState(panel, videoInfo);
-      return;
-    }
-
-    if (loadingSpan) loadingSpan.textContent = '正在获取字幕并生成摘要...';
-
-    let subtitles = await fetchSubtitles(videoInfo.cid, videoInfo.bvid);
-    if (isStaleRoute(parsingGeneration)) return;
-
-    // ✅ 兜底：首次获取字幕为空时，等待 2 秒后重新获取视频信息并重试
-    // 解决 B 站 SPA 页面初始化时 __INITIAL_STATE__ 数据尚未就绪的问题
-    if (subtitles.length === 0) {
-      console.log('[省流助手] 首次获取字幕为空，2 秒后重试...');
-      if (loadingSpan) loadingSpan.textContent = '首次获取字幕为空，等待重试...';
-      await new Promise(function(r) { setTimeout(r, 2000); });
-      if (isStaleRoute(parsingGeneration)) return;
-
-      // 重新获取最新视频信息（此时 B 站数据可能已更新）
-      var freshInfo = getVideoInfo();
-      if (freshInfo.bvid) {
-        videoInfo = freshInfo;
-        currentVideoInfo = videoInfo;
-        console.log('[省流助手] 重试时刷新视频信息 - BVID: ' + videoInfo.bvid + ', CID: ' + videoInfo.cid);
+      const skipSec = CONFIG.skipDuration || 60;
+      if (videoInfo.duration > 0 && videoInfo.duration < skipSec) {
+        console.log('[省流助手] 视频时长不足' + skipSec + '秒，跳过自动字幕获取');
+        showNoSubtitleState(panel, videoInfo, true);
+        return;
       }
 
-      if (loadingSpan) loadingSpan.textContent = '正在重新获取字幕...';
-      subtitles = await fetchSubtitles(videoInfo.cid, videoInfo.bvid);
+      console.log('[省流助手] 检测字幕可用性...');
+      const loadingSpan = panel.querySelector('.tabbit-panel-content .tabbit-loading span');
+      if (loadingSpan) loadingSpan.textContent = '正在检测字幕可用性...';
+
+      const hasSubtitleButton = await waitForSubtitleButton(1000, 500);
       if (isStaleRoute(parsingGeneration)) return;
-    }
+      if (!hasSubtitleButton) {
+        showNoSubtitleState(panel, videoInfo);
+        return;
+      }
 
-    if (subtitles.length === 0) {
-      showNoSubtitleState(panel, videoInfo);
-      return;
-    }
+      if (loadingSpan) loadingSpan.textContent = '正在获取字幕并生成摘要...';
 
-    const targetSubtitle = subtitles.find(s => s.lan === 'zh-CN' || s.lan === 'ai-zh') || subtitles[0];
-    const content = await fetchSubtitleContent(targetSubtitle.subtitle_url);
-    if (isStaleRoute(parsingGeneration)) return;
-    if (content.length === 0) {
-      showNoSubtitleState(panel, videoInfo);
-      return;
-    }
+      let subtitles = await fetchSubtitles(videoInfo.cid, videoInfo.bvid);
+      if (isStaleRoute(parsingGeneration)) return;
 
-    const transcript = formatTranscript(content);
-    if (!transcript.trim()) {
-      showNoSubtitleState(panel, videoInfo);
-      return;
-    }
+      // ✅ 兜底：首次获取字幕为空时，等待 2 秒后重新获取视频信息并重试
+      // 解决 B 站 SPA 页面初始化时 __INITIAL_STATE__ 数据尚未就绪的问题
+      if (subtitles.length === 0) {
+        console.log('[省流助手] 首次获取字幕为空，2 秒后重试...');
+        if (loadingSpan) loadingSpan.textContent = '首次获取字幕为空，等待重试...';
+        await new Promise(function(r) { setTimeout(r, 2000); });
+        if (isStaleRoute(parsingGeneration)) return;
 
-    rawTranscript = transcript;
-    console.log('[省流助手] 字幕获取完成，共 ' + content.length + ' 条');
-    if (isStaleRoute(parsingGeneration)) return;
-    await runSummary(panel, transcript, videoInfo);
+        // 重新获取最新视频信息（此时 B 站数据可能已更新）
+        var freshInfo = getVideoInfo();
+        if (freshInfo.bvid) {
+          videoInfo = freshInfo;
+          currentVideoInfo = videoInfo;
+          console.log('[省流助手] 重试时刷新视频信息 - BVID: ' + videoInfo.bvid + ', CID: ' + videoInfo.cid);
+        }
+
+        if (loadingSpan) loadingSpan.textContent = '正在重新获取字幕...';
+        subtitles = await fetchSubtitles(videoInfo.cid, videoInfo.bvid);
+        if (isStaleRoute(parsingGeneration)) return;
+      }
+
+      if (subtitles.length === 0) {
+        showNoSubtitleState(panel, videoInfo);
+        return;
+      }
+
+      const targetSubtitle = subtitles.find(s => s.lan === 'zh-CN' || s.lan === 'ai-zh') || subtitles[0];
+      const content = await fetchSubtitleContent(targetSubtitle.subtitle_url);
+      if (isStaleRoute(parsingGeneration)) return;
+      if (content.length === 0) {
+        showNoSubtitleState(panel, videoInfo);
+        return;
+      }
+
+      const transcript = formatTranscript(content);
+      if (!transcript.trim()) {
+        showNoSubtitleState(panel, videoInfo);
+        return;
+      }
+
+      rawTranscript = transcript;
+      console.log('[省流助手] 字幕获取完成，共 ' + content.length + ' 条');
+      if (isStaleRoute(parsingGeneration)) return;
+      await runSummary(panel, transcript, videoInfo);
+    } catch (err) {
+      console.error('[省流助手] 自动解析失败:', err);
+      hasParsed = false;
+      if (panel && videoInfo && !isStaleRoute(parsingGeneration)) {
+        showNoSubtitleState(panel, videoInfo);
+        const stateEl = panel.querySelector('.tabbit-no-subtitle');
+        if (stateEl) {
+          stateEl.insertAdjacentHTML('beforeend', '<div style="font-size:12px;color:#c00;margin-top:8px;">自动获取失败：' + escapeHtml(err.message || String(err)) + '</div>');
+        }
+      }
+    }
   }
 
   function showFloatOnlyMode() {
