@@ -3,6 +3,7 @@
 // @namespace   https://github.com/moonjoin/tampermonkey-scripts
 // @version     1.2
 // @description  浏览记录自动存储 + 多渠道网页推送 + AI 浏览行为分析（多时间段），支持坚果云增量云同步（和饺子AI网页摘要助手+Folo网站增强工具数据互通）
+// @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
 // @match        *://*/*
 // @grant        GM_xmlhttpRequest
