@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name        网页浏览记录助手
 // @namespace   https://github.com/moonjoin/tampermonkey-scripts
-// @version     1.2
+// @version     1.3
 // @description  浏览记录自动存储 + 多渠道网页推送 + AI 浏览行为分析（多时间段），支持坚果云增量云同步（和饺子AI网页摘要助手+Folo网站增强工具数据互通）
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
@@ -74,6 +74,7 @@
       maxRecords: 50000,
       autoCleanDays: 180,
       excludeDomains: [...DEFAULT_EXCLUDE_DOMAINS],
+      blacklistedUrls: [],
     },
     cloudSync: {
       account: '',
@@ -409,12 +410,38 @@
   function getUnreadCount() { return historyStore.records.filter(r => isUnread(r)).length; }
   function markAllAsRead() { historyStore.lastReadAt = Date.now(); saveHistory(historyStore); }
   function isDomainExcluded(domain) { return (cfg.history?.excludeDomains || DEFAULT_EXCLUDE_DOMAINS).some(d => domain.includes(d)); }
+  function normalizeUrlForBlock(url) {
+    try { const u = new URL(url); u.hash = ''; return u.href; } catch { return String(url || '').trim(); }
+  }
+  function mergeBlacklistedUrls() {
+    const out = [];
+    Array.from(arguments).flat().forEach(url => {
+      const normalized = normalizeUrlForBlock(url);
+      if (normalized && !out.includes(normalized)) out.push(normalized);
+    });
+    return out.slice(-5000);
+  }
+  function getBlacklistedUrls() { return mergeBlacklistedUrls(cfg.history?.blacklistedUrls || []); }
+  function setBlacklistedUrls(urls) {
+    cfg.history = cfg.history || {};
+    cfg.history.blacklistedUrls = mergeBlacklistedUrls(urls);
+    saveConfig(cfg);
+  }
+  function isUrlBlacklisted(url) { return getBlacklistedUrls().includes(normalizeUrlForBlock(url)); }
+  function pruneBlacklistedRecords() {
+    const blocked = new Set(getBlacklistedUrls());
+    if (!blocked.size) return 0;
+    const before = historyStore.records.length;
+    historyStore.records = historyStore.records.filter(r => !blocked.has(normalizeUrlForBlock(r.url)));
+    return before - historyStore.records.length;
+  }
 
   // ── minDwellMs 待确认记录机制 ──
   const _pendingRecords = new Map(); // key: url, value: { timer, url, title, domain, ts }
 
   function addHistoryRecord(url, title, skipDwellCheck) {
     if (!cfg.history?.enabled) return;
+    if (isUrlBlacklisted(url)) return;
     const domain = extractDomain(url); if (isDomainExcluded(domain) || shouldFilterTitle(title)) return;
     const minDwell = Number(cfg.common?.minDwellMs || 0);
     const now = Date.now(); const records = historyStore.records;
@@ -448,6 +475,7 @@
   }
 
   function _confirmRecordToStore(url, title, domain, ts) {
+    if (isUrlBlacklisted(url)) return;
     const records = historyStore.records;
     const existing = records.find(r => r.url === url && (ts - r.ts) < 5 * 60 * 1000);
     if (existing) { existing.lastVisit = ts; existing.visits = (existing.visits || 1) + 1; saveHistory(historyStore); return; }
@@ -467,6 +495,7 @@
   async function triggerPendingPush(url, title) {
     cfg = loadConfig();
     if (!cfg.common.autoSendOnLoad) return;
+    if (isUrlBlacklisted(url)) return;
     if (shouldFilterTitle(title)) return;
     const cooldownMs = Number(cfg.common.cooldownMs || 0);
     if (cooldownMs > 0 && isUrlInCooldown(url, cooldownMs)) return;
@@ -483,7 +512,7 @@
   function getThisWeekRecords() { const now = new Date(); const day = now.getDay() || 7; const start = new Date(now.getFullYear(), now.getMonth(), now.getDate() - day + 1).getTime(); return getRecordsByTimeRange(start, start + 7 * 86400000); }
   function getThisMonthRecords() { const now = new Date(); const start = new Date(now.getFullYear(), now.getMonth(), 1).getTime(); return getRecordsByTimeRange(start, start + 32 * 86400000); }
   function prepareRecordsForAI(records) { return records.map(r => { const time = formatTime(r.ts); const visits = r.visits > 1 ? ` (×${r.visits})` : ''; return `[${time}] ${r.domain} — ${r.title}${visits}`; }).join('\n'); }
-  function exportRecordsAsJson() { downloadText(JSON.stringify(historyStore, null, 2), `browsing-history-${formatDate(Date.now())}.json`); toast('已导出'); }
+  function exportRecordsAsJson() { downloadText(JSON.stringify({ ...historyStore, blacklistedUrls: getBlacklistedUrls() }, null, 2), `browsing-history-${formatDate(Date.now())}.json`); toast('已导出'); }
   function importRecordsFromJson() {
     const input = document.createElement('input'); input.type = 'file'; input.accept = '.json,application/json';
     input.onchange = async () => {
@@ -494,7 +523,8 @@
           const before = historyStore.records.length;
           historyStore.records = mergeHistoryRecords(historyStore.records, data.records);
           if (data.lastReadAt > historyStore.lastReadAt) historyStore.lastReadAt = data.lastReadAt;
-          enforceMaxRecords(); saveHistory(historyStore);
+          if (data.blacklistedUrls) setBlacklistedUrls(mergeBlacklistedUrls(getBlacklistedUrls(), data.blacklistedUrls));
+          pruneBlacklistedRecords(); enforceMaxRecords(); saveHistory(historyStore);
           const added = historyStore.records.length - before;
           toast(`✅ 导入完成，新增 ${added} 条`);
           updateBadge(); if (historyTabEl) refreshHistoryTab();
@@ -707,12 +737,56 @@ ${lines}`;
   async function jgyDownloadJson(filePath) { const res = await jgyRequest('GET', jgyUrl(filePath), { allow404: true }); if (res.status === 404) return null; try { return JSON.parse(res.responseText); } catch { return null; } }
   async function jgyUploadJson(filePath, payload) { await jgyRequest('PUT', jgyUrl(filePath), { headers: { 'Content-Type': 'application/json' }, data: JSON.stringify(payload, null, 2) }); }
   function mergeProfiles(local, remote) { const map = new Map(); [...remote, ...local].forEach(p => map.set(p.id, p)); return Array.from(map.values()); }
-  function mergeHistoryRecords(local, remote) { const map = new Map(); [...remote, ...local].forEach(r => map.set(r.url + '|' + r.ts, r)); return Array.from(map.values()).sort((a, b) => b.ts - a.ts); }
+  async function jgyListJsonFiles(dirPath) {
+    const body = '<?xml version="1.0" encoding="utf-8"?><d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>';
+    try {
+      const res = await jgyRequest('PROPFIND', jgyUrl(dirPath), { headers: { Depth: '1', 'Content-Type': 'application/xml' }, data: body });
+      const doc = new DOMParser().parseFromString(res.responseText || '', 'application/xml');
+      const hrefNodes = [
+        ...Array.from(doc.getElementsByTagName('d:href')),
+        ...Array.from(doc.getElementsByTagName('href')),
+        ...Array.from(doc.getElementsByTagNameNS('*', 'href'))
+      ];
+      const files = [];
+      hrefNodes.forEach(node => {
+        const href = node.textContent || '';
+        let name = (href.split('/').filter(Boolean).pop() || '').trim();
+        try { name = decodeURIComponent(name); } catch (e) {}
+        if (name.endsWith('.json') && !files.includes(name)) files.push(name);
+      });
+      return files;
+    } catch (e) {
+      return [];
+    }
+  }
+  function mergeHistoryRecords(local, remote) {
+    const blocked = new Set(getBlacklistedUrls());
+    const map = new Map();
+    [...(remote || []), ...(local || [])].forEach(r => {
+      if (!r || !r.url || !r.ts) return;
+      if (blocked.has(normalizeUrlForBlock(r.url))) return;
+      map.set(r.url + '|' + r.ts, r);
+    });
+    return Array.from(map.values()).sort((a, b) => b.ts - a.ts);
+  }
+  function calcHistoryChecksum(records, blacklistedUrls) {
+    const payload = JSON.stringify({
+      records: (records || []).map(r => [r.url, r.ts, r.lastVisit || 0, r.visits || 1, r.title || '', r.domain || '']).sort((a, b) => String(a[0]).localeCompare(String(b[0])) || a[1] - b[1]),
+      blacklistedUrls: mergeBlacklistedUrls(blacklistedUrls || []).sort()
+    });
+    let hash = 2166136261;
+    for (let i = 0; i < payload.length; i++) {
+      hash ^= payload.charCodeAt(i);
+      hash = Math.imul(hash, 16777619);
+    }
+    return ('00000000' + (hash >>> 0).toString(16)).slice(-8);
+  }
   async function cloudPullAll() {
     const rp = await jgyDownloadJson(JGY_SHARED_DIR + JGY_PROFILES_FILE);
     if (rp?.profiles) { const m = mergeProfiles(normalizeProfiles(cfg.profiles), normalizeProfiles(rp.profiles)); cfg.profiles = m; if (rp.currentProfileId && m.some(p => p.id === rp.currentProfileId)) cfg.currentProfileId = rp.currentProfileId; }
     const rh = await jgyDownloadJson(JGY_HISTORY_DIR + JGY_HISTORY_FILE);
-    if (rh?.records) { historyStore.records = mergeHistoryRecords(historyStore.records, rh.records); if (rh.lastReadAt > historyStore.lastReadAt) historyStore.lastReadAt = rh.lastReadAt; }
+    if (rh?.blacklistedUrls) setBlacklistedUrls(mergeBlacklistedUrls(getBlacklistedUrls(), rh.blacklistedUrls));
+    if (rh?.records) { historyStore.records = mergeHistoryRecords(historyStore.records, rh.records); if (rh.lastReadAt > historyStore.lastReadAt) historyStore.lastReadAt = rh.lastReadAt; pruneBlacklistedRecords(); }
     cfg.cloudSync.lastSyncAt = Date.now(); cfg.cloudSync.lastSyncDirection = 'pull'; saveConfig(cfg); saveHistory(historyStore);
   }
   async function cloudPushAll() {
@@ -720,23 +794,26 @@ ${lines}`;
     let mp = normalizeProfiles(cfg.profiles); if (rp?.profiles) mp = mergeProfiles(mp, normalizeProfiles(rp.profiles));
     await jgyUploadJson(JGY_SHARED_DIR + JGY_PROFILES_FILE, { version: 1, schema: PROFILES_SCHEMA, updatedAt: Date.now(), profiles: mp, currentProfileId: cfg.currentProfileId }); cfg.profiles = mp;
     await jgyMkcolIfNeeded(JGY_HISTORY_DIR); let rh = null; try { rh = await jgyDownloadJson(JGY_HISTORY_DIR + JGY_HISTORY_FILE); } catch (e) {}
-    let mh = historyStore.records; if (rh?.records) mh = mergeHistoryRecords(mh, rh.records); historyStore.records = mh;
-    await jgyUploadJson(JGY_HISTORY_DIR + JGY_HISTORY_FILE, { version: 1, updatedAt: Date.now(), records: mh, lastReadAt: historyStore.lastReadAt });
+    if (rh?.blacklistedUrls) setBlacklistedUrls(mergeBlacklistedUrls(getBlacklistedUrls(), rh.blacklistedUrls));
+    let mh = historyStore.records; if (rh?.records) mh = mergeHistoryRecords(mh, rh.records); historyStore.records = mh; pruneBlacklistedRecords(); mh = historyStore.records;
+    await jgyUploadJson(JGY_HISTORY_DIR + JGY_HISTORY_FILE, { version: 2, updatedAt: Date.now(), records: mh, lastReadAt: historyStore.lastReadAt, blacklistedUrls: getBlacklistedUrls(), checksum: calcHistoryChecksum(mh, getBlacklistedUrls()) });
     cfg.cloudSync.lastSyncAt = Date.now(); cfg.cloudSync.lastSyncDirection = 'push'; saveConfig(cfg); saveHistory(historyStore);
   }
   async function cloudForcePushAll() {
     await jgyMkcolIfNeeded(JGY_SHARED_DIR); await jgyMkcolIfNeeded(JGY_HISTORY_DIR);
     await jgyUploadJson(JGY_SHARED_DIR + JGY_PROFILES_FILE, { version: 1, schema: PROFILES_SCHEMA, updatedAt: Date.now(), profiles: normalizeProfiles(cfg.profiles), currentProfileId: cfg.currentProfileId, forcePush: true });
-    await jgyUploadJson(JGY_HISTORY_DIR + JGY_HISTORY_FILE, { version: 1, updatedAt: Date.now(), forcePush: true, records: historyStore.records, lastReadAt: historyStore.lastReadAt });
-    cfg.cloudSync.lastSyncAt = Date.now(); cfg.cloudSync.lastSyncDirection = 'force-push'; saveConfig(cfg);
+    pruneBlacklistedRecords();
+    await jgyUploadJson(JGY_HISTORY_DIR + JGY_HISTORY_FILE, { version: 2, updatedAt: Date.now(), forcePush: true, records: historyStore.records, lastReadAt: historyStore.lastReadAt, blacklistedUrls: getBlacklistedUrls(), checksum: calcHistoryChecksum(historyStore.records, getBlacklistedUrls()) });
+    cfg.cloudSync.lastSyncAt = Date.now(); cfg.cloudSync.lastSyncDirection = 'force-push'; saveConfig(cfg); saveHistory(historyStore);
   }
 
   /******************************************************************
-   * 8.1 历史记录增量同步（独立通道）
+   * 8.1 历史记录对账同步（独立通道）
    ******************************************************************/
   const JGY_HISTORY_SYNC_DIR = 'tabbit-history-sync/';
   const JGY_HISTORY_SYNC_META = 'meta.json';
   const JGY_HISTORY_SYNC_BATCHES = 'batches/';
+  const JGY_HISTORY_SYNC_CLIENTS = 'clients/';
 
   function loadHistorySyncMeta() {
     try {
@@ -750,122 +827,194 @@ ${lines}`;
       if (typeof GM_setValue === 'function') GM_setValue('history_sync_meta', JSON.stringify(meta));
     } catch (e) {}
   }
+  function getHistorySyncClientId() {
+    try {
+      const key = 'history_sync_client_id';
+      let id = (typeof GM_getValue === 'function') ? GM_getValue(key, '') : '';
+      if (!id) {
+        id = makeId('client');
+        if (typeof GM_setValue === 'function') GM_setValue(key, id);
+      }
+      return id;
+    } catch (e) {
+      return 'client_' + Math.random().toString(36).slice(2, 10);
+    }
+  }
 
-  // 增量同步：双向
-  async function historySyncIncremental() {
-    const syncMeta = loadHistorySyncMeta();
+  async function historySyncReconcile() {
     const now = Date.now();
-    const batchId = 'batch_' + now.toString(36) + '_' + Math.random().toString(36).slice(2, 6);
+    const localBefore = historyStore.records.length;
+    const clientId = getHistorySyncClientId();
 
+    await jgyMkcolIfNeeded(JGY_HISTORY_DIR);
     await jgyMkcolIfNeeded(JGY_HISTORY_SYNC_DIR);
     await jgyMkcolIfNeeded(JGY_HISTORY_SYNC_DIR + JGY_HISTORY_SYNC_BATCHES);
+    await jgyMkcolIfNeeded(JGY_HISTORY_SYNC_DIR + JGY_HISTORY_SYNC_CLIENTS);
 
-    // 1. 读取远端 meta
-    let remoteMeta = await jgyDownloadJson(JGY_HISTORY_SYNC_DIR + JGY_HISTORY_SYNC_META);
-    const remoteLastTs = remoteMeta?.lastRecordTs || 0;
-    const remoteSyncedCount = remoteMeta?.syncedCount || 0;
+    let remoteRecords = [];
+    let remoteLastReadAt = 0;
+    let remoteBlockedUrls = [];
 
-    // 2. 拉取远端新 batch（ts > 本地 lastRecordTs 的批次）
-    let pulledRecords = [];
-    if (remoteMeta?.lastBatchId && remoteLastTs > syncMeta.lastRecordTs) {
-      // 需要拉取远端的新 batch 文件
-      // 简化方案：拉取 meta 中记录的所有新 batch
-      const remoteBatches = remoteMeta.pendingBatches || [];
-      for (const bid of remoteBatches) {
-        const batchData = await jgyDownloadJson(JGY_HISTORY_SYNC_DIR + JGY_HISTORY_SYNC_BATCHES + bid + '.json');
-        if (batchData?.records) {
-          pulledRecords.push(...batchData.records);
-        }
-      }
+    const remoteFull = await jgyDownloadJson(JGY_HISTORY_DIR + JGY_HISTORY_FILE);
+    if (remoteFull?.records) remoteRecords.push(...remoteFull.records);
+    if (remoteFull?.lastReadAt) remoteLastReadAt = Math.max(remoteLastReadAt, remoteFull.lastReadAt);
+    remoteBlockedUrls = mergeBlacklistedUrls(remoteBlockedUrls, remoteFull?.blacklistedUrls || []);
+
+    const remoteMeta = await jgyDownloadJson(JGY_HISTORY_SYNC_DIR + JGY_HISTORY_SYNC_META);
+    if (remoteMeta?.lastReadAt) remoteLastReadAt = Math.max(remoteLastReadAt, remoteMeta.lastReadAt);
+    remoteBlockedUrls = mergeBlacklistedUrls(remoteBlockedUrls, remoteMeta?.blacklistedUrls || []);
+
+    const batchFiles = await jgyListJsonFiles(JGY_HISTORY_SYNC_DIR + JGY_HISTORY_SYNC_BATCHES);
+    for (const name of batchFiles) {
+      const batchData = await jgyDownloadJson(JGY_HISTORY_SYNC_DIR + JGY_HISTORY_SYNC_BATCHES + name);
+      if (batchData?.records) remoteRecords.push(...batchData.records);
+      if (batchData?.lastReadAt) remoteLastReadAt = Math.max(remoteLastReadAt, batchData.lastReadAt);
+      remoteBlockedUrls = mergeBlacklistedUrls(remoteBlockedUrls, batchData?.blacklistedUrls || []);
     }
 
-    // 3. 合并拉取的记录到本地
-    if (pulledRecords.length) {
-      historyStore.records = mergeHistoryRecords(historyStore.records, pulledRecords);
-      if (remoteMeta?.lastReadAt > historyStore.lastReadAt) {
-        historyStore.lastReadAt = remoteMeta.lastReadAt;
-      }
-    }
+    const clientFiles = await jgyListJsonFiles(JGY_HISTORY_SYNC_DIR + JGY_HISTORY_SYNC_CLIENTS);
 
-    // 4. 打包本地新记录（ts > 远端 lastRecordTs）
-    const newRecords = historyStore.records.filter(r => r.ts > remoteLastTs);
+    setBlacklistedUrls(mergeBlacklistedUrls(getBlacklistedUrls(), remoteBlockedUrls));
+    historyStore.records = mergeHistoryRecords(historyStore.records, remoteRecords);
+    if (remoteLastReadAt > historyStore.lastReadAt) historyStore.lastReadAt = remoteLastReadAt;
+    pruneBlacklistedRecords();
+    enforceMaxRecords();
 
-    // 5. 上传新 batch（如果有新记录）
-    let uploadedBatchId = '';
-    if (newRecords.length) {
-      uploadedBatchId = batchId;
-      await jgyUploadJson(JGY_HISTORY_SYNC_DIR + JGY_HISTORY_SYNC_BATCHES + batchId + '.json', {
-        batchId, createdAt: now, count: newRecords.length, records: newRecords
-      });
-    }
-
-    // 6. 更新远端 meta
+    const blacklistedUrls = getBlacklistedUrls();
     const latestRecordTs = historyStore.records.length ? Math.max(...historyStore.records.map(r => r.ts)) : 0;
-    const existingPending = remoteMeta?.pendingBatches || [];
-    if (uploadedBatchId) existingPending.push(uploadedBatchId);
-    // 只保留最近 50 个 batch 引用，防止 meta 过大
-    const pendingBatches = existingPending.slice(-50);
+    const checksum = calcHistoryChecksum(historyStore.records, blacklistedUrls);
+    const payload = {
+      version: 2,
+      updatedAt: now,
+      records: historyStore.records,
+      lastReadAt: historyStore.lastReadAt,
+      blacklistedUrls,
+      count: historyStore.records.length,
+      checksum
+    };
+
+    await jgyUploadJson(JGY_HISTORY_DIR + JGY_HISTORY_FILE, payload);
+    await jgyUploadJson(JGY_HISTORY_SYNC_DIR + JGY_HISTORY_SYNC_CLIENTS + clientId + '.json', {
+      version: 2,
+      clientId,
+      updatedAt: now,
+      summaryOnly: true,
+      recordCount: historyStore.records.length,
+      latestRecordTs,
+      lastReadAt: historyStore.lastReadAt,
+      blacklistedCount: blacklistedUrls.length,
+      checksum
+    });
+
     await jgyUploadJson(JGY_HISTORY_SYNC_DIR + JGY_HISTORY_SYNC_META, {
       lastSyncAt: now,
-      lastBatchId: uploadedBatchId || remoteMeta?.lastBatchId || '',
+      lastBatchId: remoteMeta?.lastBatchId || '',
       lastRecordTs: latestRecordTs,
       syncedCount: historyStore.records.length,
       lastReadAt: historyStore.lastReadAt,
-      pendingBatches
+      pendingBatches: Array.isArray(remoteMeta?.pendingBatches) ? remoteMeta.pendingBatches.slice(-100) : [],
+      blacklistedUrls,
+      checksum,
+      reconcile: true,
+      mode: 'single-full-with-client-summaries',
+      clientId,
+      clientCount: clientFiles.length + (clientFiles.includes(clientId + '.json') ? 0 : 1)
     });
 
-    // 7. 更新本地 sync meta
     saveHistorySyncMeta({
       lastSyncAt: now,
-      lastBatchId: uploadedBatchId || batchId,
+      lastBatchId: clientId,
       lastRecordTs: latestRecordTs,
-      syncedCount: historyStore.records.length
+      syncedCount: historyStore.records.length,
+      checksum
     });
-
     saveHistory(historyStore);
     cfg.cloudSync.lastSyncAt = now;
-    cfg.cloudSync.lastSyncDirection = 'incremental';
+    cfg.cloudSync.lastSyncDirection = 'reconcile';
     saveConfig(cfg);
 
-    return { pulled: pulledRecords.length, pushed: newRecords.length };
+    return {
+      localBefore,
+      pulled: Math.max(0, historyStore.records.length - localBefore),
+      pushed: Math.max(0, historyStore.records.length - remoteRecords.length),
+      remoteSeen: remoteRecords.length,
+      batchFiles: batchFiles.length,
+      clientFiles: clientFiles.length,
+      finalCount: historyStore.records.length,
+      blacklistedCount: blacklistedUrls.length,
+      checksum
+    };
+  }
+
+  // 旧入口保留给自动同步调用，实际执行安全对账同步。
+  async function historySyncIncremental() {
+    return historySyncReconcile();
   }
 
   // 强制覆盖：本地全量覆盖远端
   async function historySyncForcePush() {
     const now = Date.now();
-    const batchId = 'force_' + now.toString(36);
+    const clientId = getHistorySyncClientId();
 
+    await jgyMkcolIfNeeded(JGY_HISTORY_DIR);
     await jgyMkcolIfNeeded(JGY_HISTORY_SYNC_DIR);
-    await jgyMkcolIfNeeded(JGY_HISTORY_SYNC_DIR + JGY_HISTORY_SYNC_BATCHES);
+    await jgyMkcolIfNeeded(JGY_HISTORY_SYNC_DIR + JGY_HISTORY_SYNC_CLIENTS);
+    pruneBlacklistedRecords();
+    const blacklistedUrls = getBlacklistedUrls();
+    const checksum = calcHistoryChecksum(historyStore.records, blacklistedUrls);
 
-    // 上传全量记录为一个 batch
-    await jgyUploadJson(JGY_HISTORY_SYNC_DIR + JGY_HISTORY_SYNC_BATCHES + batchId + '.json', {
-      batchId, createdAt: now, count: historyStore.records.length, records: historyStore.records, forcePush: true
+    await jgyUploadJson(JGY_HISTORY_DIR + JGY_HISTORY_FILE, {
+      version: 2,
+      updatedAt: now,
+      records: historyStore.records,
+      lastReadAt: historyStore.lastReadAt,
+      blacklistedUrls,
+      count: historyStore.records.length,
+      checksum,
+      forcePush: true
+    });
+    await jgyUploadJson(JGY_HISTORY_SYNC_DIR + JGY_HISTORY_SYNC_CLIENTS + clientId + '.json', {
+      version: 2,
+      updatedAt: now,
+      clientId,
+      summaryOnly: true,
+      recordCount: historyStore.records.length,
+      latestRecordTs: historyStore.records.length ? Math.max(...historyStore.records.map(r => r.ts)) : 0,
+      lastReadAt: historyStore.lastReadAt,
+      blacklistedCount: blacklistedUrls.length,
+      checksum,
+      forcePush: true
     });
 
-    // 更新远端 meta（清除旧 pending，只保留本次）
+    // 更新远端 meta（强制覆盖后不再新建全量 batch）
     const latestRecordTs = historyStore.records.length ? Math.max(...historyStore.records.map(r => r.ts)) : 0;
     await jgyUploadJson(JGY_HISTORY_SYNC_DIR + JGY_HISTORY_SYNC_META, {
       lastSyncAt: now,
-      lastBatchId: batchId,
+      lastBatchId: '',
       lastRecordTs: latestRecordTs,
       syncedCount: historyStore.records.length,
       lastReadAt: historyStore.lastReadAt,
-      pendingBatches: [batchId],
+      blacklistedUrls,
+      checksum,
+      pendingBatches: [],
+      mode: 'single-full-with-client-summaries',
+      clientId,
       forcePush: true
     });
 
     // 更新本地 sync meta
     saveHistorySyncMeta({
       lastSyncAt: now,
-      lastBatchId: batchId,
+      lastBatchId: clientId,
       lastRecordTs: latestRecordTs,
-      syncedCount: historyStore.records.length
+      syncedCount: historyStore.records.length,
+      checksum
     });
 
     cfg.cloudSync.lastSyncAt = now;
     cfg.cloudSync.lastSyncDirection = 'force-push';
     saveConfig(cfg);
+    saveHistory(historyStore);
   }
 
   /******************************************************************
@@ -940,9 +1089,10 @@ ${lines}`;
     .mpush-history-url-path { color:#aaa; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     .mpush-history-meta { display:flex; align-items:center; gap:4px; flex-shrink:0; padding-top:1px; }
     .mpush-history-visits { color:#999; font-size:10px; flex-shrink:0; }
-    .mpush-history-del { color:#ccc; font-size:11px; cursor:pointer; padding:0 2px; flex-shrink:0; opacity:0; transition:opacity .15s; }
-    .mpush-history-item:hover .mpush-history-del { opacity:1; }
+    .mpush-history-del,.mpush-history-block { color:#ccc; font-size:11px; cursor:pointer; padding:0 2px; flex-shrink:0; opacity:0; transition:opacity .15s; }
+    .mpush-history-item:hover .mpush-history-del,.mpush-history-item:hover .mpush-history-block { opacity:1; }
     .mpush-history-del:hover { color:#ef4444; }
+    .mpush-history-block:hover { color:#f59e0b; }
     /* ── 分析对话 ── */
     .mpush-msg { margin:12px 0; }
     .mpush-msg-role { font-size:12px; font-weight:600; color:#6b7280; margin-bottom:4px; }
@@ -1189,7 +1339,7 @@ ${lines}`;
         <button class="mpush-btn danger" id="history-clear">🗑️ 清理</button>
       </div>
       <div class="mpush-btns">
-        <button class="mpush-btn" id="history-sync-incr">⬆️ 增量同步</button>
+        <button class="mpush-btn primary" id="history-sync-incr">🔁 对账同步</button>
         <button class="mpush-btn danger" id="history-sync-force">⚠️ 强制覆盖</button>
       </div>`;
     pane.querySelector('#history-filters').addEventListener('click', e => { const btn = e.target.closest('[data-filter]'); if (!btn) return; currentHistoryFilter = btn.dataset.filter; pane.querySelectorAll('#history-filters button').forEach(b => b.classList.remove('active')); btn.classList.add('active'); refreshHistoryTab(); });
@@ -1206,8 +1356,8 @@ ${lines}`;
     pane.querySelector('#history-clear').addEventListener('click', () => { if (!confirm('确定要清理全部浏览记录吗？')) return; clearAllRecords(); updateBadge(); refreshHistoryTab(); toast('已清理全部记录'); });
     pane.querySelector('#history-sync-incr').addEventListener('click', async () => {
       if (!cfg.cloudSync?.account || !cfg.cloudSync?.appPassword) { alert('请先在设置中配置坚果云账号和密码。'); return; }
-      const btn = pane.querySelector('#history-sync-incr'); btn.disabled = true; btn.textContent = '同步中…';
-      try { const result = await historySyncIncremental(); toast(`✅ 增量同步完成（拉取 ${result.pulled}，推送 ${result.pushed}）`); updateSyncStatus(); refreshHistoryTab(); } catch (err) { alert('❌ 同步失败：' + (err.message || err)); } finally { btn.disabled = false; btn.textContent = '⬆️ 增量同步'; }
+      const btn = pane.querySelector('#history-sync-incr'); btn.disabled = true; btn.textContent = '对账中…';
+      try { const result = await historySyncIncremental(); toast(`✅ 对账完成：${result.finalCount} 条，校验 ${result.checksum}`); updateSyncStatus(); refreshHistoryTab(); } catch (err) { alert('❌ 同步失败：' + (err.message || err)); } finally { btn.disabled = false; btn.textContent = '🔁 对账同步'; }
     });
     pane.querySelector('#history-sync-force').addEventListener('click', async () => {
       if (!cfg.cloudSync?.account || !cfg.cloudSync?.appPassword) { alert('请先在设置中配置坚果云账号和密码。'); return; }
@@ -1245,14 +1395,15 @@ ${lines}`;
           `<span class="mpush-history-title">${escapeAttr(r.title)}</span>` +
           `<span class="mpush-history-url"><span class="mpush-history-url-domain">${escapeAttr(domain)}</span><span class="mpush-history-url-path">${escapeAttr(path)}</span></span>` +
         `</span>` +
-        `<span class="mpush-history-meta">${visits}<span class="mpush-history-del" data-url="${escapeAttr(r.url)}" data-ts="${r.ts}" title="删除">✕</span></span>` +
+        `<span class="mpush-history-meta">${visits}<span class="mpush-history-block" data-url="${escapeAttr(r.url)}" data-ts="${r.ts}" title="拉黑此网址，不再记录">🚫</span><span class="mpush-history-del" data-url="${escapeAttr(r.url)}" data-ts="${r.ts}" title="删除">✕</span></span>` +
       `</div>`;
     }).join('');
     if (filtered.length > _historyDisplayCount) list.innerHTML += `<div class="mpush-placeholder" id="history-load-more" style="cursor:pointer;">📄 点击加载更多（${filtered.length - _historyDisplayCount} 条剩余）</div>`;
     const loadMoreBtn = list.querySelector('#history-load-more');
     if (loadMoreBtn) loadMoreBtn.addEventListener('click', loadMoreHistory);
     if (!displayRecords.length) list.innerHTML = `<div class="mpush-placeholder">暂无记录</div>`;
-    list.querySelectorAll('.mpush-history-item').forEach(item => { item.addEventListener('click', e => { if (e.target.closest('.mpush-history-del')) return; const url = item.dataset.url; if (url) window.open(url, '_blank'); }); });
+    list.querySelectorAll('.mpush-history-item').forEach(item => { item.addEventListener('click', e => { if (e.target.closest('.mpush-history-del,.mpush-history-block')) return; const url = item.dataset.url; if (url) window.open(url, '_blank'); }); });
+    list.querySelectorAll('.mpush-history-block').forEach(btn => { btn.addEventListener('click', e => { e.stopPropagation(); blacklistHistoryUrl(btn.dataset.url); }); });
     list.querySelectorAll('.mpush-history-del').forEach(btn => { btn.addEventListener('click', e => { e.stopPropagation(); deleteHistoryRecord(btn.dataset.url, Number(btn.dataset.ts)); }); });
     updateSyncStatus();
   }
@@ -1261,9 +1412,9 @@ ${lines}`;
     if (!statusEl) return;
     const syncMeta = loadHistorySyncMeta();
     if (syncMeta.lastSyncAt) {
-      const dirMap = { incremental: '增量同步', 'force-push': '强制覆盖', pull: '拉取', push: '上传' };
+      const dirMap = { reconcile: '对账同步', incremental: '对账同步', 'force-push': '强制覆盖', pull: '拉取', push: '上传' };
       const dir = dirMap[cfg.cloudSync?.lastSyncDirection] || '';
-      statusEl.textContent = `☁️ 上次同步：${formatDate(syncMeta.lastSyncAt)} ${formatTime(syncMeta.lastSyncAt)}（${dir}，${syncMeta.syncedCount || 0} 条）`;
+      statusEl.textContent = `☁️ 上次同步：${formatDate(syncMeta.lastSyncAt)} ${formatTime(syncMeta.lastSyncAt)}（${dir}，${syncMeta.syncedCount || 0} 条${syncMeta.checksum ? `，校验 ${syncMeta.checksum}` : ''}）`;
     } else {
       statusEl.textContent = '☁️ 尚未同步历史记录';
     }
@@ -1684,6 +1835,7 @@ ${lines}`;
         <div class="mpush-field"><div class="mpush-field-label">自动清理（天）</div><input type="number" data-path="history.autoCleanDays" min="0" max="3650" value="180"><small>0=不清理</small></div>
       </div>
       <div class="mpush-field"><div class="mpush-field-label">排除域名（每行一个）</div><textarea id="set-exclude-domains" rows="3"></textarea></div>
+      <div class="mpush-field"><div class="mpush-field-label">拉黑网址（每行一个，精确匹配）</div><textarea id="set-blacklisted-urls" rows="3"></textarea><small>列表里的完整网址不会再写入浏览记录；历史列表点 🚫 会自动加入这里。</small></div>
       <div class="mpush-btns">
         <button class="mpush-btn danger" id="set-history-clear">🗑️ 清理全部</button>
         <button class="mpush-btn" id="set-history-export">📦 导出</button>
@@ -1703,6 +1855,7 @@ ${lines}`;
       <div class="mpush-cloud-status" id="set-cloud-status">尚未同步</div>
       <div class="mpush-btns">
         <button class="mpush-btn" id="set-cloud-test">🔌 测试</button>
+        <button class="mpush-btn primary" id="set-cloud-reconcile">🔁 对账同步</button>
         <button class="mpush-btn" id="set-cloud-pull">⬇️ 拉取</button>
         <button class="mpush-btn" id="set-cloud-push">⬆️ 上传</button>
         <button class="mpush-btn danger" id="set-cloud-force">⚠️ 覆盖</button>
@@ -1720,7 +1873,7 @@ ${lines}`;
     // ── 保存按钮（统一保存所有设置）──
     const saveBar = el('div', { class: 'mpush-save-bar' });
     const saveBtn = el('button', { class: 'mpush-btn primary', style: 'flex:1;padding:10px;' }, '💾 保存所有设置');
-    saveBtn.addEventListener('click', () => { readAllSettingsToConfig(); saveConfig(cfg); toast('✅ 已保存所有设置'); });
+    saveBtn.addEventListener('click', () => { readAllSettingsToConfig(); const removed = pruneBlacklistedRecords(); saveConfig(cfg); if (removed) { saveHistory(historyStore); updateBadge(); refreshHistoryTab(); } toast(removed ? `✅ 已保存，已移除 ${removed} 条拉黑记录` : '✅ 已保存所有设置'); });
     saveBar.appendChild(saveBtn);
     pane.appendChild(saveBar);
 
@@ -1742,7 +1895,8 @@ ${lines}`;
     });
     pane.querySelector('#set-history-clear').addEventListener('click', () => { if (!confirm('清理全部记录？')) return; clearAllRecords(); updateBadge(); refreshHistoryTab(); toast('已清理'); });
     pane.querySelector('#set-history-export').addEventListener('click', exportRecordsAsJson);
-    pane.querySelector('#set-cloud-test').addEventListener('click', async () => { readAllSettingsToConfig(); saveConfig(cfg); if (!cfg.cloudSync.account || !cfg.cloudSync.appPassword) { alert('请先填写账号和密码。'); return; } try { await jgyMkcolIfNeeded(JGY_SHARED_DIR); await jgyMkcolIfNeeded(JGY_HISTORY_DIR); toast('✅ 连接成功'); } catch (err) { alert('❌ ' + (err.message || err)); } });
+    pane.querySelector('#set-cloud-test').addEventListener('click', async () => { readAllSettingsToConfig(); saveConfig(cfg); if (!cfg.cloudSync.account || !cfg.cloudSync.appPassword) { alert('请先填写账号和密码。'); return; } try { await jgyMkcolIfNeeded(JGY_SHARED_DIR); await jgyMkcolIfNeeded(JGY_HISTORY_DIR); await jgyMkcolIfNeeded(JGY_HISTORY_SYNC_DIR); await jgyMkcolIfNeeded(JGY_HISTORY_SYNC_DIR + JGY_HISTORY_SYNC_CLIENTS); toast('✅ 连接成功'); } catch (err) { alert('❌ ' + (err.message || err)); } });
+    pane.querySelector('#set-cloud-reconcile').addEventListener('click', async () => { readAllSettingsToConfig(); saveConfig(cfg); if (!cfg.cloudSync.account || !cfg.cloudSync.appPassword) { alert('请先填写账号和密码。'); return; } const btn = pane.querySelector('#set-cloud-reconcile'); btn.disabled = true; btn.textContent = '对账中…'; try { const result = await historySyncReconcile(); toast(`✅ 对账完成：${result.finalCount} 条，校验 ${result.checksum}`); fillSettingsTab(); refreshHistoryTab(); } catch (err) { alert('❌ ' + (err.message || err)); } finally { btn.disabled = false; btn.textContent = '🔁 对账同步'; } });
     pane.querySelector('#set-cloud-pull').addEventListener('click', async () => { readAllSettingsToConfig(); saveConfig(cfg); if (!cfg.cloudSync.account || !cfg.cloudSync.appPassword) { alert('请先填写账号和密码。'); return; } if (!confirm('从云端拉取？')) return; try { await cloudPullAll(); toast('✅ 拉取完成'); fillSettingsTab(); refreshHistoryTab(); } catch (err) { alert('❌ ' + (err.message || err)); } });
     pane.querySelector('#set-cloud-push').addEventListener('click', async () => { readAllSettingsToConfig(); saveConfig(cfg); if (!cfg.cloudSync.account || !cfg.cloudSync.appPassword) { alert('请先填写账号和密码。'); return; } try { await cloudPushAll(); toast('✅ 上传完成'); } catch (err) { alert('❌ ' + (err.message || err)); } });
     pane.querySelector('#set-cloud-force').addEventListener('click', async () => { readAllSettingsToConfig(); saveConfig(cfg); if (!cfg.cloudSync.account || !cfg.cloudSync.appPassword) { alert('请先填写账号和密码。'); return; } if (!confirm('⚠️ 强制覆盖？')) return; if (!confirm('不可恢复，继续？')) return; try { await cloudForcePushAll(); toast('✅ 覆盖完成'); } catch (err) { alert('❌ ' + (err.message || err)); } });
@@ -1787,6 +1941,8 @@ ${lines}`;
     // 排除域名
     const ed = pane.querySelector('#set-exclude-domains');
     if (ed && cfg.history) cfg.history.excludeDomains = ed.value.split('\n').map(s => s.trim()).filter(Boolean);
+    const bu = pane.querySelector('#set-blacklisted-urls');
+    if (bu && cfg.history) cfg.history.blacklistedUrls = mergeBlacklistedUrls(bu.value.split('\n').map(s => s.trim()).filter(Boolean));
   }
 
   function fillSettingsTab() {
@@ -1812,8 +1968,10 @@ ${lines}`;
     if (ms) { ms.innerHTML = ''; normalizeModels(profile.models).forEach(m => { const opt = document.createElement('option'); opt.value = m.value; opt.textContent = m.name || m.value; if (m.value === profile.currentModel) opt.selected = true; ms.appendChild(opt); }); ms.onchange = function () { profile.currentModel = this.value; saveConfig(cfg); }; }
     const ed = pane.querySelector('#set-exclude-domains');
     if (ed) ed.value = (cfg.history?.excludeDomains || DEFAULT_EXCLUDE_DOMAINS).join('\n');
+    const bu = pane.querySelector('#set-blacklisted-urls');
+    if (bu) bu.value = getBlacklistedUrls().join('\n');
     const cs = pane.querySelector('#set-cloud-status');
-    if (cs) { const t = cfg.cloudSync?.lastSyncAt; if (t) { const dirMap = { pull: '拉取', push: '上传', 'force-push': '覆盖' }; cs.textContent = `上次：${formatDate(t)}（${dirMap[cfg.cloudSync.lastSyncDirection] || ''}）`; } else cs.textContent = '尚未同步'; }
+    if (cs) { const t = cfg.cloudSync?.lastSyncAt; if (t) { const dirMap = { reconcile: '对账同步', incremental: '对账同步', pull: '拉取', push: '上传', 'force-push': '覆盖' }; cs.textContent = `上次：${formatDate(t)}（${dirMap[cfg.cloudSync.lastSyncDirection] || ''}）`; } else cs.textContent = '尚未同步'; }
   }
 
   /******************************************************************
@@ -1822,6 +1980,19 @@ ${lines}`;
   function deleteHistoryRecord(url, ts) {
     historyStore.records = historyStore.records.filter(r => !(r.url === url && r.ts === ts));
     saveHistory(historyStore); updateBadge(); refreshHistoryTab(); toast('已删除');
+  }
+  function blacklistHistoryUrl(url) {
+    const normalized = normalizeUrlForBlock(url);
+    if (!normalized) return;
+    const title = getDisplayPath(normalized);
+    if (!confirm(`拉黑这个网址？\n\n${title}\n\n之后不会再记录，并会移除已有同网址记录。`)) return;
+    setBlacklistedUrls(mergeBlacklistedUrls(getBlacklistedUrls(), [normalized]));
+    removePendingRecord(url);
+    const removed = pruneBlacklistedRecords();
+    saveHistory(historyStore);
+    updateBadge();
+    refreshHistoryTab();
+    toast(`已拉黑${removed ? `，移除 ${removed} 条` : ''}`);
   }
   function exportAnalysisAsMarkdown() {
     const lines = conversation.filter(m => m.role !== 'system' && !m.meta?.hidden).map(m => {
