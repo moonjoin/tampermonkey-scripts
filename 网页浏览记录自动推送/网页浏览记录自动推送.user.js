@@ -1233,6 +1233,20 @@ ${lines}`;
     _panelResize.active = false;
   });
 
+  // 窗口大小变化时，确保悬浮按钮始终在可视区域内
+  window.addEventListener('resize', () => {
+    const btn = document.getElementById(UI.btnId);
+    if (!btn || !btn.style.left) return; // 未拖拽过，用 right/bottom 定位，无需修正
+    const rect = btn.getBoundingClientRect();
+    const maxLeft = window.innerWidth - 44;
+    const maxTop = window.innerHeight - 44;
+    let changed = false;
+    if (rect.left > maxLeft) { btn.style.left = Math.max(0, maxLeft) + 'px'; changed = true; }
+    if (rect.top > maxTop) { btn.style.top = Math.max(0, maxTop) + 'px'; changed = true; }
+    if (rect.left < 0) { btn.style.left = '0px'; changed = true; }
+    if (rect.top < 0) { btn.style.top = '0px'; changed = true; }
+  });
+
   function enableFloatBtnDrag(btn) {
     btn.addEventListener('mousedown', e => {
       _floatDrag.moved = false;

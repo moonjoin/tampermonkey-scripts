@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         饺子 AI 网页摘要助手
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      2.7.2
+// @version      2.7.3
 // @description  指定网站自动弹出 AI 网页摘要，支持连续对话、多预设、多模板、SPA路由，flomo、坚果云双文件云同步。
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
@@ -74,8 +74,8 @@
     ],
     rulePromptBindings: [],
     autoRun: true,
-    floatButton: { side: 'right', y: null, opacity: 0.55 },
-    panel: { width: 460, height: null, heightRatio: 0.82, left: null, top: null },
+    floatButton: { side: 'right', x: null, y: null, offsetX: null, offsetY: null, opacity: 0.55 },
+    panel: { width: 420, height: null, heightRatio: 0.8, left: null, top: null },
     extractMaxChars: 16000,
     cloudSync: { account: '', appPassword: '', lastSyncAt: 0, lastSyncDirection: '' },
     autoCopy: { enabled: true, withSource: false },
@@ -1167,7 +1167,7 @@
     const css = `
       #${FLOAT_BTN_ID} {
         position: fixed; z-index: 2147483646;
-        width: 44px; height: 44px; border-radius: 50%;
+        width: 44px; height: 44px; border-radius: 22px;
         background: linear-gradient(135deg, #8b5cf6, #3b82f6);
         color: white; font-size: 20px;
         display: flex; align-items: center; justify-content: center;
@@ -1175,12 +1175,13 @@
         user-select: none; transition: opacity .2s, transform .2s;
       }
       #${FLOAT_BTN_ID}:hover { opacity: 1 !important; transform: scale(1.08); }
+      #${FLOAT_BTN_ID}.dragging { transition: none !important; transform: scale(1.08); }
 
       #${PANEL_ID} {
-        position: fixed; top: 5vh; right: 16px;
-        width: 460px; height: 82vh;
-        min-width: 340px; min-height: 360px;
-        max-width: 96vw; max-height: 96vh;
+        position: fixed; right: 16px; bottom: 70px;
+        width: 420px; height: 80vh;
+        min-width: 340px; min-height: 400px;
+        max-width: calc(100vw - 32px); max-height: calc(100vh - 100px);
         background: #fff; color: #222;
         border-radius: 14px; box-shadow: 0 20px 60px rgba(0,0,0,.25);
         display: flex; flex-direction: column;
@@ -1645,25 +1646,41 @@
     document.body.appendChild(floatBtn);
     applyFloatButtonPosition();
 
-    let dragging = false, startY = 0, startTop = 0, moved = false;
+    let dragging = false, startX = 0, startY = 0, startLeft = 0, startTop = 0, moved = false;
     floatBtn.addEventListener('mousedown', e => {
       dragging = true; moved = false;
-      startY = e.clientY;
-      startTop = floatBtn.getBoundingClientRect().top;
+      startX = e.clientX; startY = e.clientY;
+      const rect = floatBtn.getBoundingClientRect();
+      startLeft = rect.left; startTop = rect.top;
+      floatBtn.classList.add('dragging');
       e.preventDefault();
     });
     document.addEventListener('mousemove', e => {
       if (!dragging) return;
-      const dy = e.clientY - startY;
-      if (Math.abs(dy) > 5) moved = true;
-      const newTop = Math.max(0, Math.min(window.innerHeight - 44, startTop + dy));
-      floatBtn.style.top = newTop + 'px';
+      const dx = e.clientX - startX, dy = e.clientY - startY;
+      if (Math.abs(dx) > 3 || Math.abs(dy) > 3) moved = true;
+      floatBtn.style.left = Math.max(0, Math.min(innerWidth - 44, startLeft + dx)) + 'px';
+      floatBtn.style.top = Math.max(0, Math.min(innerHeight - 44, startTop + dy)) + 'px';
+      floatBtn.style.right = 'auto';
       floatBtn.style.bottom = 'auto';
     });
     document.addEventListener('mouseup', () => {
       if (dragging) {
         dragging = false;
-        if (moved) { config.floatButton.y = floatBtn.getBoundingClientRect().top; saveConfig(); }
+        floatBtn.classList.remove('dragging');
+        if (moved) {
+          const rect = floatBtn.getBoundingClientRect();
+          // 保存相对于窗口右下角的偏移量，保证不同页面位置一致
+          config.floatButton.offsetX = window.innerWidth - rect.right;
+          config.floatButton.offsetY = window.innerHeight - rect.bottom;
+          // 清除旧的绝对坐标，确保下次用 offset 定位
+          config.floatButton.x = null;
+          config.floatButton.y = null;
+          saveConfig();
+          // 阻止拖拽后的 click 事件
+          const blocker = ev => { ev.stopPropagation(); ev.preventDefault(); floatBtn.removeEventListener('click', blocker, true); };
+          floatBtn.addEventListener('click', blocker, true);
+        }
       }
     });
     floatBtn.addEventListener('click', () => {
@@ -1679,15 +1696,33 @@
 
   function applyFloatButtonPosition() {
     if (!floatBtn) return;
-    floatBtn.style.right = '12px';
-    if (config.floatButton.y != null) {
-      floatBtn.style.top = config.floatButton.y + 'px';
-      floatBtn.style.bottom = 'auto';
+    if (config.floatButton.offsetX != null && config.floatButton.offsetY != null) {
+      // 使用右下角偏移量定位，保证不同窗口大小下位置一致
+      floatBtn.style.right = config.floatButton.offsetX + 'px';
+      floatBtn.style.bottom = config.floatButton.offsetY + 'px';
+      floatBtn.style.left = 'auto';
+      floatBtn.style.top = 'auto';
     } else {
+      // 默认位置：右下角
+      floatBtn.style.right = '12px';
       floatBtn.style.bottom = '80px';
+      floatBtn.style.left = 'auto';
       floatBtn.style.top = 'auto';
     }
   }
+
+  // 窗口大小变化时，确保悬浮按钮始终在可视区域内
+  window.addEventListener('resize', () => {
+    const btn = document.getElementById(FLOAT_BTN_ID);
+    if (!btn || !btn.style.left) return; // 未拖拽过，用 right/bottom 定位，无需修正
+    const rect = btn.getBoundingClientRect();
+    const maxLeft = window.innerWidth - 44;
+    const maxTop = window.innerHeight - 44;
+    if (rect.left > maxLeft) btn.style.left = Math.max(0, maxLeft) + 'px';
+    if (rect.top > maxTop) btn.style.top = Math.max(0, maxTop) + 'px';
+    if (rect.left < 0) btn.style.left = '0px';
+    if (rect.top < 0) btn.style.top = '0px';
+  });
 
   /******************************************************************
    * 11.5 📋 自动复制模块
@@ -1871,7 +1906,7 @@
     document.body.appendChild(panelEl);
 
     // 应用持久化的尺寸/位置
-    panelEl.style.width = (config.panel?.width || 460) + 'px';
+    panelEl.style.width = (config.panel?.width || 420) + 'px';
     if (config.panel?.height) {
       panelEl.style.height = config.panel.height + 'px';
     } else {
