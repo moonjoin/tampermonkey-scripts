@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站省流助手 - 字幕AI摘要 Pro
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      3.8.6
+// @version      3.8.7
 // @description  自动提取B站视频字幕，通过自定义AI API生成极简摘要，支持模型切换、持续对话和评论区总结；支持自动解析开关、自动获取模型列表、flomo自动加标签，新增总结生图功能；v3.8.5 优化 API URL 自动补全，并兼容 images/responses/chat 多类生图接口
 // @author       次元饺子
 // @match        https://www.bilibili.com/video/*
@@ -275,6 +275,7 @@
   let routeGeneration = 0;
   // 🆕 当前正在进行的 AI 任务的 AbortController（用于打断流式输出）
   let currentAbortController = null;
+  let currentSubtitleManualFallback = null;
 
   // ==================== 视频信息获取 ====================
   function cleanVideoDescription(text) {
@@ -630,45 +631,51 @@
   }
 
   // ==================== 字幕获取部分 ====================
-  async function fetchSubtitles(cid, bvid) {
+  async function fetchSubtitles(cid, bvid, signal) {
     if (!cid || !bvid) {
       console.warn('[省流助手] 缺少 cid 或 bvid，跳过字幕接口请求:', { cid: cid, bvid: bvid });
       return [];
     }
+    throwIfAborted(signal);
     try {
       const url = 'https://api.bilibili.com/x/player/wbi/v2?cid=' + cid + '&bvid=' + bvid;
-      const res = await fetchWithTimeout(url, { credentials: 'include' }, BILI_API_TIMEOUT_MS);
+      const res = await fetchWithTimeout(url, { credentials: 'include', signal: signal }, BILI_API_TIMEOUT_MS);
       if (!res.ok) throw new Error('HTTP ' + res.status);
       const data = await res.json();
       if (data?.data?.subtitle?.subtitles?.length > 0) {
         return data.data.subtitle.subtitles;
       }
     } catch(e) {
+      if (isAbortError(e)) throw e;
       console.log('[省流助手] wbi API 失败:', e.message);
     }
+    throwIfAborted(signal);
     try {
       const url = 'https://api.bilibili.com/x/player/v2?cid=' + cid + '&bvid=' + bvid;
-      const res = await fetchWithTimeout(url, { credentials: 'include' }, BILI_API_TIMEOUT_MS);
+      const res = await fetchWithTimeout(url, { credentials: 'include', signal: signal }, BILI_API_TIMEOUT_MS);
       if (!res.ok) throw new Error('HTTP ' + res.status);
       const data = await res.json();
       if (data?.data?.subtitle?.subtitles?.length > 0) {
         return data.data.subtitle.subtitles;
       }
     } catch(e) {
+      if (isAbortError(e)) throw e;
       console.log('[省流助手] v2 API 失败:', e.message);
     }
     return [];
   }
 
-  async function fetchSubtitleContent(subtitleUrl) {
+  async function fetchSubtitleContent(subtitleUrl, signal) {
     if (!subtitleUrl) return [];
+    throwIfAborted(signal);
     try {
       const url = subtitleUrl.startsWith('http') ? subtitleUrl : 'https:' + subtitleUrl;
-      const res = await fetchWithTimeout(url, {}, BILI_SUBTITLE_TIMEOUT_MS);
+      const res = await fetchWithTimeout(url, { signal: signal }, BILI_SUBTITLE_TIMEOUT_MS);
       if (!res.ok) throw new Error('HTTP ' + res.status);
       const data = await res.json();
       return data.body || [];
     } catch(e) {
+      if (isAbortError(e)) throw e;
       console.log('[省流助手] 字幕内容获取失败:', e.message);
       return [];
     }
@@ -1518,6 +1525,33 @@
         gap: 16px;
         padding: 40px 20px;
         color: #666;
+      }
+      .tabbit-loading .tabbit-auto-subtitle-stop {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 6px;
+        padding: 8px 14px;
+        background: linear-gradient(135deg, #ff6b6b 0%, #ee5253 100%);
+        color: white;
+        border: none;
+        border-radius: 18px;
+        font-size: 12px;
+        font-weight: 700;
+        cursor: pointer;
+        box-shadow: 0 2px 10px rgba(238,82,83,0.35);
+        position: relative;
+        z-index: 2;
+        pointer-events: auto;
+      }
+      .tabbit-loading .tabbit-auto-subtitle-stop:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 4px 14px rgba(238,82,83,0.5);
+      }
+      .tabbit-loading .tabbit-auto-subtitle-stop:disabled {
+        opacity: 0.65;
+        cursor: not-allowed;
+        transform: none;
       }
       .tabbit-spinner {
         width: 36px;
@@ -2563,6 +2597,7 @@
           <div class="tabbit-loading">
             <div class="tabbit-spinner"></div>
             <span>准备中...</span>
+            <button type="button" class="tabbit-auto-subtitle-stop" id="tabbit-auto-subtitle-stop">⏹ 停止自动获取，手动处理</button>
           </div>
         </div>
         <div class="tabbit-result-actions"></div>
@@ -2628,6 +2663,30 @@
       settingsBtn.addEventListener('click', () => openSettingsPanel(panel));
     }
 
+    const autoSubtitleStopBtn = panel.querySelector('#tabbit-auto-subtitle-stop');
+    if (autoSubtitleStopBtn) {
+      const stopAutoSubtitle = function(e) {
+        if (e) {
+          e.preventDefault();
+          e.stopPropagation();
+        }
+        autoSubtitleStopBtn.disabled = true;
+        autoSubtitleStopBtn.textContent = '⏳ 正在切换...';
+        if (typeof currentSubtitleManualFallback === 'function') {
+          currentSubtitleManualFallback();
+          return;
+        }
+        try { abortCurrentTask(); } catch(err) {}
+        showNoSubtitleState(panel, currentVideoInfo || videoInfo || getVideoInfo(), false, {
+          icon: '⏹',
+          title: '已停止自动获取',
+          desc: '自动字幕获取已停止。现在可以手动获取字幕，或直接上传 srt/txt/粘贴字幕内容。'
+        });
+      };
+      autoSubtitleStopBtn.addEventListener('pointerdown', stopAutoSubtitle, true);
+      autoSubtitleStopBtn.addEventListener('click', stopAutoSubtitle, true);
+    }
+
     return panel;
   }
 
@@ -2684,15 +2743,24 @@
   }
 
   // 🆕 在指定容器内插入"打断"按钮，返回按钮元素
-  function insertInlineAbortBtn(container, onAbort) {
+  function insertInlineAbortBtn(container, onAbort, label) {
     const btn = document.createElement('button');
     btn.className = 'tabbit-inline-abort-btn';
-    btn.innerHTML = '⏹ 打断生成';
-    btn.addEventListener('click', function() {
+    btn.innerHTML = label || '⏹ 打断生成';
+    let handled = false;
+    function handleAbortClick(e) {
+      if (e) {
+        e.preventDefault();
+        e.stopPropagation();
+      }
+      if (handled) return;
+      handled = true;
       btn.disabled = true;
       btn.innerHTML = '⏳ 打断中...';
       if (typeof onAbort === 'function') onAbort();
-    });
+    }
+    btn.addEventListener('pointerdown', handleAbortClick, true);
+    btn.addEventListener('click', handleAbortClick, true);
     container.appendChild(btn);
     return btn;
   }
@@ -2978,7 +3046,8 @@
   }
 
   // ==================== 无字幕状态展示 ====================
-  function showNoSubtitleState(panel, videoInfo, isShortVideo) {
+  function showNoSubtitleState(panel, videoInfo, isShortVideo, options) {
+    options = options || {};
     const contentDiv = panel.querySelector('.tabbit-panel-content');
     const input = panel.querySelector('.tabbit-chat-input');
     const sendBtn = panel.querySelector('.tabbit-chat-send');
@@ -2986,11 +3055,11 @@
     panel.querySelectorAll('.tabbit-model-chip').forEach(c => c.classList.add('disabled'));
 
     const skipSec = CONFIG.skipDuration || 60;
-    const noSubIcon = isShortVideo ? '⏱️' : '🔇';
-    const noSubTitle = isShortVideo ? '视频时长不足' + skipSec + '秒，已跳过自动获取' : '未检测到字幕';
-    const noSubDesc = isShortVideo
+    const noSubIcon = options.icon || (isShortVideo ? '⏱️' : '🔇');
+    const noSubTitle = options.title || (isShortVideo ? '视频时长不足' + skipSec + '秒，已跳过自动获取' : '未检测到字幕');
+    const noSubDesc = options.desc || (isShortVideo
       ? '短视频已自动跳过字幕获取（阈值' + skipSec + '秒，可在设置中修改）。如仍需摘要，可点击下方按钮手动获取，或总结评论区！'
-      : '该视频暂无可用字幕，无法生成视频摘要。可尝试手动获取，或使用下方按钮总结评论区！';
+      : '该视频暂无可用字幕，无法生成视频摘要。可尝试手动获取，或使用下方按钮总结评论区！');
 
     contentDiv.innerHTML = `
       ${renderVideoMetaBottomHtml(videoInfo, window.location.href)}
@@ -4895,23 +4964,41 @@
     return aiSubtitleButton !== null || subtitleButtons.length > 0 || subtitleToggle !== null;
   }
 
-  function waitForSubtitleButton(maxWait, interval) {
+  function waitForSubtitleButton(maxWait, interval, signal) {
     maxWait = maxWait || 2000;
     interval = interval || 200;
-    return new Promise(function(resolve) {
+    return new Promise(function(resolve, reject) {
       const startTime = Date.now();
+      let timer = null;
+      function cleanup() {
+        if (timer) clearTimeout(timer);
+        if (signal) signal.removeEventListener('abort', onAbort);
+      }
+      function onAbort() {
+        cleanup();
+        const abortErr = new Error('用户已打断');
+        abortErr.name = 'AbortError';
+        reject(abortErr);
+      }
+      if (signal && signal.aborted) {
+        onAbort();
+        return;
+      }
+      if (signal) signal.addEventListener('abort', onAbort);
       function check() {
         if (checkAnySubtitleAvailable()) {
           console.log('[省流助手] 检测到字幕按钮，耗时 ' + (Date.now() - startTime) + 'ms');
+          cleanup();
           resolve(true);
           return;
         }
         if (Date.now() - startTime >= maxWait) {
           console.log('[省流助手] 等待字幕按钮超时（' + maxWait + 'ms），判定为无字幕');
+          cleanup();
           resolve(false);
           return;
         }
-        setTimeout(check, interval);
+        timer = setTimeout(check, interval);
       }
       check();
     });
@@ -4923,6 +5010,7 @@
 
   function resetRuntimeForRouteChange() {
     abortCurrentTask();
+    currentSubtitleManualFallback = null;
     rawMarkdownResult = '';
     rawTranscript = '';
     currentVideoInfo = null;
@@ -4983,6 +5071,59 @@
     const parsingGeneration = routeGeneration;
     let panel = null;
     let videoInfo = null;
+    let subtitleAbortController = null;
+    let subtitleAbortBtnWrap = null;
+    let subtitleManualFallbackShown = false;
+    let subtitleForceStopped = false;
+    let overallTimer = null;
+    function cleanupSubtitleAbortUi() {
+      if (subtitleAbortBtnWrap && subtitleAbortBtnWrap.parentNode) {
+        subtitleAbortBtnWrap.remove();
+      }
+      subtitleAbortBtnWrap = null;
+      if (currentAbortController === subtitleAbortController) {
+        currentAbortController = null;
+      }
+      if (currentSubtitleManualFallback === forceStopAutoSubtitleFetch) {
+        currentSubtitleManualFallback = null;
+      }
+    }
+    function showInterruptedSubtitleManualState() {
+      if (subtitleManualFallbackShown) return;
+      subtitleManualFallbackShown = true;
+      if (overallTimer) {
+        clearTimeout(overallTimer);
+        overallTimer = null;
+      }
+      cleanupSubtitleAbortUi();
+      if (panel && videoInfo && !isStaleRoute(parsingGeneration)) {
+        showNoSubtitleState(panel, videoInfo, false, {
+          icon: '⏹',
+          title: '已停止自动获取',
+          desc: '自动字幕获取已打断。现在可以手动获取字幕，或直接上传 srt/txt/粘贴字幕内容。'
+        });
+      }
+    }
+    function forceStopAutoSubtitleFetch() {
+      if (subtitleForceStopped) return;
+      subtitleForceStopped = true;
+      console.log('[省流助手] 强制停止自动字幕获取，切换到手动处理');
+      showInterruptedSubtitleManualState();
+      if (subtitleAbortController && !subtitleAbortController.signal.aborted) {
+        try { subtitleAbortController.abort(); } catch(e) {}
+      }
+      if (currentAbortController === subtitleAbortController) {
+        currentAbortController = null;
+      }
+    }
+    function throwIfSubtitleForceStopped() {
+      if (subtitleForceStopped) {
+        const abortErr = new Error('用户已打断');
+        abortErr.name = 'AbortError';
+        throw abortErr;
+      }
+      throwIfAborted(subtitleAbortController && subtitleAbortController.signal);
+    }
     try {
       lastRouteKey = getRouteKey();
 
@@ -5006,10 +5147,17 @@
         return;
       }
 
+      abortCurrentTask();
+      subtitleAbortController = new AbortController();
+      currentAbortController = subtitleAbortController;
+      currentSubtitleManualFallback = forceStopAutoSubtitleFetch;
+
       // 🆕 用 Promise.race 包裹整个字幕获取流程，防止永久卡住
-      var overallTimer = null;
       var overallTimeout = new Promise(function(_, reject) {
         overallTimer = setTimeout(function() {
+          if (subtitleAbortController && !subtitleAbortController.signal.aborted) {
+            try { subtitleAbortController.abort(); } catch(e) {}
+          }
           reject(new Error('字幕获取超时（' + Math.round(SUBTITLE_FETCH_OVERALL_TIMEOUT_MS / 1000) + '秒）'));
         }, SUBTITLE_FETCH_OVERALL_TIMEOUT_MS);
       });
@@ -5019,7 +5167,9 @@
         const loadingSpan = panel.querySelector('.tabbit-panel-content .tabbit-loading span');
         if (loadingSpan) loadingSpan.textContent = '正在检测字幕可用性...';
 
-        const hasSubtitleButton = await waitForSubtitleButton(2000, 200);
+        throwIfSubtitleForceStopped();
+        const hasSubtitleButton = await waitForSubtitleButton(2000, 200, subtitleAbortController.signal);
+        throwIfSubtitleForceStopped();
         if (isStaleRoute(parsingGeneration)) return 'stale';
         if (!hasSubtitleButton) {
           return 'no_subtitle';
@@ -5027,14 +5177,16 @@
 
         if (loadingSpan) loadingSpan.textContent = '正在获取字幕并生成摘要...';
 
-        let subtitles = await fetchSubtitles(videoInfo.cid, videoInfo.bvid);
+        let subtitles = await fetchSubtitles(videoInfo.cid, videoInfo.bvid, subtitleAbortController.signal);
+        throwIfSubtitleForceStopped();
         if (isStaleRoute(parsingGeneration)) return 'stale';
 
         // ✅ 兜底：首次获取字幕为空时，等待 2 秒后重新获取视频信息并重试
         if (subtitles.length === 0) {
           console.log('[省流助手] 首次获取字幕为空，2 秒后重试...');
           if (loadingSpan) loadingSpan.textContent = '首次获取字幕为空，等待重试...';
-          await new Promise(function(r) { setTimeout(r, 2000); });
+          await randomDelay(2000, 2000, subtitleAbortController.signal);
+          throwIfSubtitleForceStopped();
           if (isStaleRoute(parsingGeneration)) return 'stale';
 
           var freshInfo = getVideoInfo();
@@ -5045,7 +5197,8 @@
           }
 
           if (loadingSpan) loadingSpan.textContent = '正在重新获取字幕...';
-          subtitles = await fetchSubtitles(videoInfo.cid, videoInfo.bvid);
+          subtitles = await fetchSubtitles(videoInfo.cid, videoInfo.bvid, subtitleAbortController.signal);
+          throwIfSubtitleForceStopped();
           if (isStaleRoute(parsingGeneration)) return 'stale';
         }
 
@@ -5054,7 +5207,8 @@
         }
 
         const targetSubtitle = subtitles.find(s => s.lan === 'zh-CN' || s.lan === 'ai-zh') || subtitles[0];
-        const content = await fetchSubtitleContent(targetSubtitle.subtitle_url);
+        const content = await fetchSubtitleContent(targetSubtitle.subtitle_url, subtitleAbortController.signal);
+        throwIfSubtitleForceStopped();
         if (isStaleRoute(parsingGeneration)) return 'stale';
         if (content.length === 0) {
           return 'no_subtitle';
@@ -5069,7 +5223,12 @@
       })();
 
       var fetchResult = await Promise.race([fetchFlow, overallTimeout]);
-      if (overallTimer) clearTimeout(overallTimer);
+      if (overallTimer) {
+        clearTimeout(overallTimer);
+        overallTimer = null;
+      }
+      throwIfSubtitleForceStopped();
+      cleanupSubtitleAbortUi();
 
       if (fetchResult === 'stale') return;
       if (fetchResult === 'no_subtitle') {
@@ -5083,7 +5242,17 @@
       if (isStaleRoute(parsingGeneration)) return;
       await runSummary(panel, fetchResult, videoInfo);
     } catch (err) {
-      if (overallTimer) clearTimeout(overallTimer);
+      if (overallTimer) {
+        clearTimeout(overallTimer);
+        overallTimer = null;
+      }
+      cleanupSubtitleAbortUi();
+      if (subtitleManualFallbackShown) return;
+      if (isAbortError(err)) {
+        console.log('[省流助手] 自动字幕获取已被用户打断');
+        showInterruptedSubtitleManualState();
+        return;
+      }
       console.error('[省流助手] 自动解析失败:', err);
       hasParsed = false;
       if (panel && videoInfo && !isStaleRoute(parsingGeneration)) {
