@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name        网页浏览记录助手
 // @namespace   https://github.com/moonjoin/tampermonkey-scripts
-// @version     1.3
+// @version     1.4
 // @description  浏览记录自动存储 + 多渠道网页推送 + AI 浏览行为分析（多时间段），支持坚果云增量云同步（和饺子AI网页摘要助手+Folo网站增强工具数据互通）
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
@@ -436,19 +436,105 @@
     return before - historyStore.records.length;
   }
 
+  function getRecordDwellSec(record) {
+    return Math.max(0, Math.floor(Number(record?.dwellSec || 0)));
+  }
+  function formatDuration(sec) {
+    sec = Math.max(0, Math.floor(Number(sec || 0)));
+    if (!sec) return '';
+    const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+    if (h > 0) return `${h}小时${m ? `${m}分` : ''}`;
+    if (m > 0) return `${m}分${s && m < 10 ? `${s}秒` : ''}`;
+    return `${s}秒`;
+  }
+  function isDwellActive() {
+    return document.visibilityState !== 'hidden';
+  }
+  function shouldBindDwellRecord(url, ts) {
+    return _dwellSession.url === url && Math.abs(Number(ts || 0) - Number(_dwellSession.ts || 0)) < 30000;
+  }
+  function bindDwellRecord(record, url, ts) {
+    if (record && shouldBindDwellRecord(url, ts)) _dwellSession.record = record;
+  }
+
+  // ── 停留时间统计：事件驱动，按秒落库，不做高频定时写入 ──
+  const _dwellSession = { url: '', title: '', ts: 0, activeSince: 0, pendingMs: 0, record: null };
+  let _historySaveTimer = null;
+  function saveHistoryDeferred() {
+    if (_historySaveTimer) return;
+    _historySaveTimer = setTimeout(() => {
+      _historySaveTimer = null;
+      saveHistory(historyStore);
+    }, 1200);
+  }
+  function startDwellSession(url, title, ts) {
+    finishDwellSession(true);
+    _dwellSession.url = url;
+    _dwellSession.title = title || '';
+    _dwellSession.ts = ts || Date.now();
+    _dwellSession.pendingMs = 0;
+    _dwellSession.record = null;
+    _dwellSession.activeSince = isDwellActive() ? Date.now() : 0;
+  }
+  function pauseDwellSession() {
+    if (!_dwellSession.activeSince) return;
+    const now = Date.now();
+    if (now > _dwellSession.activeSince) _dwellSession.pendingMs += now - _dwellSession.activeSince;
+    _dwellSession.activeSince = 0;
+  }
+  function resumeDwellSession() {
+    if (!_dwellSession.url || _dwellSession.activeSince || !isDwellActive()) return;
+    _dwellSession.activeSince = Date.now();
+  }
+  function findDwellRecord() {
+    if (_dwellSession.record) return _dwellSession.record;
+    const records = historyStore.records;
+    for (let i = records.length - 1; i >= 0; i--) {
+      const r = records[i];
+      if (r.url === _dwellSession.url && Math.abs(Number(r.ts || 0) - _dwellSession.ts) < 30000) {
+        _dwellSession.record = r;
+        return r;
+      }
+    }
+    return null;
+  }
+  function commitDwellSession(forceSave) {
+    if (!_dwellSession.url) return;
+    pauseDwellSession();
+    const addSec = Math.floor(_dwellSession.pendingMs / 1000);
+    if (addSec > 0) {
+      const record = findDwellRecord();
+      if (record) {
+        record.dwellSec = getRecordDwellSec(record) + addSec;
+        _dwellSession.pendingMs -= addSec * 1000;
+        if (forceSave) saveHistory(historyStore); else saveHistoryDeferred();
+      }
+    }
+    resumeDwellSession();
+  }
+  function finishDwellSession(forceSave) {
+    commitDwellSession(forceSave);
+    _dwellSession.url = '';
+    _dwellSession.title = '';
+    _dwellSession.ts = 0;
+    _dwellSession.activeSince = 0;
+    _dwellSession.pendingMs = 0;
+    _dwellSession.record = null;
+  }
+
   // ── minDwellMs 待确认记录机制 ──
   const _pendingRecords = new Map(); // key: url, value: { timer, url, title, domain, ts }
 
-  function addHistoryRecord(url, title, skipDwellCheck) {
+  function addHistoryRecord(url, title, skipDwellCheck, visitTs) {
     if (!cfg.history?.enabled) return;
     if (isUrlBlacklisted(url)) return;
     const domain = extractDomain(url); if (isDomainExcluded(domain) || shouldFilterTitle(title)) return;
     const minDwell = Number(cfg.common?.minDwellMs || 0);
-    const now = Date.now(); const records = historyStore.records;
+    const now = visitTs || Date.now(); const records = historyStore.records;
 
     // 冷却内同 URL 不重复记录（5分钟）
     const existing = records.find(r => r.url === url && (now - r.ts) < 5 * 60 * 1000);
-    if (existing) { existing.lastVisit = now; existing.visits = (existing.visits || 1) + 1; saveHistory(historyStore); return; }
+    if (existing) { existing.lastVisit = now; existing.visits = (existing.visits || 1) + 1; bindDwellRecord(existing, url, now); saveHistory(historyStore); return; }
 
     // 如果需要停留检测且不是跳过检测的情况
     if (minDwell > 0 && !skipDwellCheck) {
@@ -478,9 +564,12 @@
     if (isUrlBlacklisted(url)) return;
     const records = historyStore.records;
     const existing = records.find(r => r.url === url && (ts - r.ts) < 5 * 60 * 1000);
-    if (existing) { existing.lastVisit = ts; existing.visits = (existing.visits || 1) + 1; saveHistory(historyStore); return; }
-    records.push({ url, title, domain, ts, lastVisit: ts, visits: 1 });
+    if (existing) { existing.lastVisit = ts; existing.visits = (existing.visits || 1) + 1; bindDwellRecord(existing, url, ts); saveHistory(historyStore); return existing; }
+    const record = { url, title, domain, ts, lastVisit: ts, visits: 1 };
+    records.push(record);
+    bindDwellRecord(record, url, ts);
     enforceMaxRecords(); saveHistory(historyStore);
+    return record;
   }
 
   // 移除页面离开前未达阈值的待确认记录
@@ -511,7 +600,7 @@
   function getTodayRecords() { const now = new Date(); const start = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime(); return getRecordsByTimeRange(start, start + 86400000); }
   function getThisWeekRecords() { const now = new Date(); const day = now.getDay() || 7; const start = new Date(now.getFullYear(), now.getMonth(), now.getDate() - day + 1).getTime(); return getRecordsByTimeRange(start, start + 7 * 86400000); }
   function getThisMonthRecords() { const now = new Date(); const start = new Date(now.getFullYear(), now.getMonth(), 1).getTime(); return getRecordsByTimeRange(start, start + 32 * 86400000); }
-  function prepareRecordsForAI(records) { return records.map(r => { const time = formatTime(r.ts); const visits = r.visits > 1 ? ` (×${r.visits})` : ''; return `[${time}] ${r.domain} — ${r.title}${visits}`; }).join('\n'); }
+  function prepareRecordsForAI(records) { return records.map(r => { const time = formatTime(r.ts); const visits = r.visits > 1 ? ` (×${r.visits})` : ''; const dwell = formatDuration(getRecordDwellSec(r)); const dwellText = dwell ? ` · 停留${dwell}` : ''; return `[${time}] ${r.domain} — ${r.title}${visits}${dwellText}`; }).join('\n'); }
   function exportRecordsAsJson() { downloadText(JSON.stringify({ ...historyStore, blacklistedUrls: getBlacklistedUrls() }, null, 2), `browsing-history-${formatDate(Date.now())}.json`); toast('已导出'); }
   function importRecordsFromJson() {
     const input = document.createElement('input'); input.type = 'file'; input.accept = '.json,application/json';
@@ -536,8 +625,8 @@
   function clearAllRecords() { historyStore = { records: [], lastReadAt: 0 }; saveHistory(historyStore); }
   function getDomainStats(records) {
     const map = {};
-    records.forEach(r => { if (!map[r.domain]) map[r.domain] = { count: 0, visits: 0 }; map[r.domain].count++; map[r.domain].visits += (r.visits || 1); });
-    return Object.entries(map).map(([domain, s]) => ({ domain, count: s.count, visits: s.visits })).sort((a, b) => b.visits - a.visits);
+    records.forEach(r => { if (!map[r.domain]) map[r.domain] = { count: 0, visits: 0, dwellSec: 0 }; map[r.domain].count++; map[r.domain].visits += (r.visits || 1); map[r.domain].dwellSec += getRecordDwellSec(r); });
+    return Object.entries(map).map(([domain, s]) => ({ domain, count: s.count, visits: s.visits, dwellSec: s.dwellSec })).sort((a, b) => (b.dwellSec - a.dwellSec) || (b.visits - a.visits));
   }
   function checkStorageQuota() {
     try {
@@ -595,10 +684,10 @@
   // 分析模板
   const ANALYSIS_TEMPLATES = [
     { id: 'summary', icon: '📊', name: '时段浏览总结', desc: '归纳一段时间看了什么',
-      prompt: `你是用户的浏览行为分析师。以下是用户在「{timeRangeDesc}」的浏览记录数据（共 {count} 条），请分析：
+      prompt: `你是用户的浏览行为分析师。以下是用户在「{timeRangeDesc}」的浏览记录数据（共 {count} 条，可能包含停留时长），请分析：
 
 1. **关注主题**：归纳用户最近关注了哪些主题领域
-2. **浏览模式**：什么时间段活跃？偏好什么类型的网站？
+2. **浏览模式**：什么时间段活跃？偏好什么类型的网站？哪些内容停留更久？
 3. **高关注度内容**：哪些网站/主题被多次访问，说明特别感兴趣
 4. **信息获取路径**：从域名分布看，用户的信息来源偏好
 5. **总结与建议**：给出一段有价值的洞察` },
@@ -759,19 +848,29 @@ ${lines}`;
       return [];
     }
   }
+  function mergeHistoryRecordFields(a, b) {
+    const out = { ...a, ...b };
+    out.title = b.title || a.title || '';
+    out.domain = b.domain || a.domain || extractDomain(out.url);
+    out.lastVisit = Math.max(Number(a.lastVisit || a.ts || 0), Number(b.lastVisit || b.ts || 0));
+    out.visits = Math.max(Number(a.visits || 1), Number(b.visits || 1));
+    out.dwellSec = Math.max(getRecordDwellSec(a), getRecordDwellSec(b));
+    return out;
+  }
   function mergeHistoryRecords(local, remote) {
     const blocked = new Set(getBlacklistedUrls());
     const map = new Map();
     [...(remote || []), ...(local || [])].forEach(r => {
       if (!r || !r.url || !r.ts) return;
       if (blocked.has(normalizeUrlForBlock(r.url))) return;
-      map.set(r.url + '|' + r.ts, r);
+      const key = r.url + '|' + r.ts;
+      map.set(key, map.has(key) ? mergeHistoryRecordFields(map.get(key), r) : r);
     });
     return Array.from(map.values()).sort((a, b) => b.ts - a.ts);
   }
   function calcHistoryChecksum(records, blacklistedUrls) {
     const payload = JSON.stringify({
-      records: (records || []).map(r => [r.url, r.ts, r.lastVisit || 0, r.visits || 1, r.title || '', r.domain || '']).sort((a, b) => String(a[0]).localeCompare(String(b[0])) || a[1] - b[1]),
+      records: (records || []).map(r => [r.url, r.ts, r.lastVisit || 0, r.visits || 1, getRecordDwellSec(r), r.title || '', r.domain || '']).sort((a, b) => String(a[0]).localeCompare(String(b[0])) || a[1] - b[1]),
       blacklistedUrls: mergeBlacklistedUrls(blacklistedUrls || []).sort()
     });
     let hash = 2166136261;
@@ -1364,7 +1463,7 @@ ${lines}`;
     pane.querySelector('#history-domain-stats').addEventListener('click', () => {
       const stats = getDomainStats(historyStore.records).slice(0, 10);
       if (!stats.length) { toast('暂无记录'); return; }
-      const msg = stats.map((s, i) => `${i+1}. ${s.domain} — ${s.count}次访问, ${s.visits}总浏览`).join('\n');
+      const msg = stats.map((s, i) => `${i+1}. ${s.domain} — ${s.count}条, ${s.visits}次浏览${s.dwellSec ? `, 停留${formatDuration(s.dwellSec)}` : ''}`).join('\n');
       alert('📊 Top 10 域名统计\n\n' + msg);
     });
     pane.querySelector('#history-clear').addEventListener('click', () => { if (!confirm('确定要清理全部浏览记录吗？')) return; clearAllRecords(); updateBadge(); refreshHistoryTab(); toast('已清理全部记录'); });
@@ -1385,7 +1484,7 @@ ${lines}`;
     if (!historyTabEl) return;
     const stats = historyTabEl.querySelector('#history-stats'), list = historyTabEl.querySelector('#history-list');
     if (!stats || !list) return;
-    const total = historyStore.records.length, unread = getUnreadCount(), todayCount = getTodayRecords().length;
+    const total = historyStore.records.length, unread = getUnreadCount(), todayRecords = getTodayRecords(), todayCount = todayRecords.length;
     let filtered = historyStore.records;
     if (currentHistoryFilter === 'today') filtered = getTodayRecords();
     else if (currentHistoryFilter === 'week') filtered = getThisWeekRecords();
@@ -1393,11 +1492,15 @@ ${lines}`;
     else if (currentHistoryFilter === 'unread') filtered = historyStore.records.filter(r => isUnread(r));
     if (currentHistorySearch) { const q = currentHistorySearch; filtered = filtered.filter(r => (r.title && r.title.toLowerCase().includes(q)) || (r.domain && r.domain.toLowerCase().includes(q))); }
     filtered = [...filtered].sort((a, b) => b.ts - a.ts);
-    stats.innerHTML = `<div>📋 总计 ${total.toLocaleString()} 条 · 今日新增 ${todayCount} 条</div>${unread > 0 ? `<div style="color:#ef4444;font-weight:600;">📢 ${unread} 条新记录</div>` : '<div style="color:#16a34a;">✅ 全部已查阅</div>'}`;
+    const totalDwell = historyStore.records.reduce((sum, r) => sum + getRecordDwellSec(r), 0);
+    const todayDwell = todayRecords.reduce((sum, r) => sum + getRecordDwellSec(r), 0);
+    stats.innerHTML = `<div>📋 总计 ${total.toLocaleString()} 条 · 今日新增 ${todayCount} 条${totalDwell ? ` · 总停留 ${formatDuration(totalDwell)}` : ''}${todayDwell ? ` · 今日 ${formatDuration(todayDwell)}` : ''}</div>${unread > 0 ? `<div style="color:#ef4444;font-weight:600;">📢 ${unread} 条新记录</div>` : '<div style="color:#16a34a;">✅ 全部已查阅</div>'}`;
     const displayRecords = filtered.slice(0, _historyDisplayCount);
     list.innerHTML = displayRecords.map(r => {
       const unreadCls = isUnread(r) ? ' unread' : '';
       const visits = r.visits > 1 ? `<span class="mpush-history-visits">×${r.visits}</span>` : '';
+      const dwell = getRecordDwellSec(r);
+      const dwellText = dwell ? `<span class="mpush-history-visits" title="累计停留时间">⏱ ${formatDuration(dwell)}</span>` : '';
       const displayPath = getDisplayPath(r.url);
       const dotIdx = displayPath.indexOf('.');
       const domainEnd = displayPath.indexOf('/', dotIdx > 0 ? dotIdx : 0);
@@ -1409,7 +1512,7 @@ ${lines}`;
           `<span class="mpush-history-title">${escapeAttr(r.title)}</span>` +
           `<span class="mpush-history-url"><span class="mpush-history-url-domain">${escapeAttr(domain)}</span><span class="mpush-history-url-path">${escapeAttr(path)}</span></span>` +
         `</span>` +
-        `<span class="mpush-history-meta">${visits}<span class="mpush-history-block" data-url="${escapeAttr(r.url)}" data-ts="${r.ts}" title="拉黑此网址，不再记录">🚫</span><span class="mpush-history-del" data-url="${escapeAttr(r.url)}" data-ts="${r.ts}" title="删除">✕</span></span>` +
+        `<span class="mpush-history-meta">${visits}${dwellText}<span class="mpush-history-block" data-url="${escapeAttr(r.url)}" data-ts="${r.ts}" title="拉黑此网址，不再记录">🚫</span><span class="mpush-history-del" data-url="${escapeAttr(r.url)}" data-ts="${r.ts}" title="删除">✕</span></span>` +
       `</div>`;
     }).join('');
     if (filtered.length > _historyDisplayCount) list.innerHTML += `<div class="mpush-placeholder" id="history-load-more" style="cursor:pointer;">📄 点击加载更多（${filtered.length - _historyDisplayCount} 条剩余）</div>`;
@@ -2023,7 +2126,11 @@ ${lines}`;
   function init() {
     buildUI();
     // 先记录当前页面，再更新角标
-    if (cfg.history?.enabled && !shouldFilterTitle(document.title)) addHistoryRecord(window.location.href, document.title);
+    if (cfg.history?.enabled && !shouldFilterTitle(document.title)) {
+      const visitTs = Date.now();
+      startDwellSession(window.location.href, document.title, visitTs);
+      addHistoryRecord(window.location.href, document.title, false, visitTs);
+    }
     updateBadge();
     // 恢复上次分析结果
     restoreAnalysisHistory();
@@ -2052,8 +2159,14 @@ ${lines}`;
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init); else init();
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') commitDwellSession(true);
+    else resumeDwellSession();
+  });
+  window.addEventListener('pagehide', () => finishDwellSession(true));
   // 页面离开时，清理未达停留阈值的待确认记录
   window.addEventListener('beforeunload', () => {
+    finishDwellSession(true);
     const currentUrl = window.location.href;
     removePendingRecord(currentUrl);
   });
@@ -2063,12 +2176,16 @@ ${lines}`;
   function handleUrlChanged() {
     const newUrl = location.href;
     if (newUrl === __lastUrl) return;
+    finishDwellSession(true);
     __lastUrl = newUrl;
     const title = document.title;
     if (cfg.history?.enabled && !shouldFilterTitle(title)) {
       // 等待页面标题更新后再记录
       setTimeout(() => {
-        addHistoryRecord(window.location.href, document.title);
+        if (window.location.href !== newUrl) return;
+        const visitTs = Date.now();
+        startDwellSession(window.location.href, document.title, visitTs);
+        addHistoryRecord(window.location.href, document.title, false, visitTs);
         updateBadge();
       }, 500);
     }
