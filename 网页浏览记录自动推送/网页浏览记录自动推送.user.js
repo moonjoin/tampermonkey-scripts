@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name        网页浏览记录助手
 // @namespace   https://github.com/moonjoin/tampermonkey-scripts
-// @version     1.4
+// @version     1.5
 // @description  浏览记录自动存储 + 多渠道网页推送 + AI 浏览行为分析（多时间段），支持坚果云增量云同步（和饺子AI网页摘要助手+Folo网站增强工具数据互通）
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
@@ -1120,7 +1120,7 @@ ${lines}`;
    * 9. UI 常量与样式
    ******************************************************************/
   function addStyle(css) { if (typeof GM_addStyle === 'function') return GM_addStyle(css); const style = document.createElement('style'); style.textContent = css; document.head.appendChild(style); }
-  const UI = { rootId: 'mpush-root', btnId: 'mpush-float-btn', panelId: 'mpush-panel', toastId: 'mpush-toast', chatInputId: 'mpush-chat-input', sendBtnId: 'mpush-send-btn', analysisBodyId: 'mpush-analysis-body', badgeId: 'mpush-badge' };
+  const UI = { rootId: 'mpush-root', btnId: 'mpush-float-btn', panelId: 'mpush-panel', toastId: 'mpush-toast', chatInputId: 'mpush-chat-input', sendBtnId: 'mpush-send-btn', analysisBodyId: 'mpush-analysis-body', badgeId: 'mpush-badge', contextMenuId: 'mpush-context-menu' };
   let historyTabEl = null;
 
   addStyle(`
@@ -1129,6 +1129,15 @@ ${lines}`;
     #${UI.btnId}.dragging { transition:none!important; transform:scale(1.08); }
     #${UI.badgeId} { position:absolute; top:-4px; right:-4px; min-width:18px; height:18px; border-radius:9px; background:#ef4444; color:#fff; font-size:10px; font-weight:700; display:flex; align-items:center; justify-content:center; padding:0 4px; pointer-events:none; }
     #${UI.badgeId}:empty { display:none; }
+    #${UI.contextMenuId} { position:fixed; z-index:2147483647; width:230px; padding:8px; border:1px solid rgba(124,58,237,.18); border-radius:10px; background:#fff; color:#222; box-shadow:0 16px 42px rgba(0,0,0,.22); font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif; display:none; }
+    #${UI.contextMenuId}.show { display:block; }
+    .mpush-context-title { padding:4px 6px 8px; font-size:12px; font-weight:700; color:#5a43c8; border-bottom:1px solid #f0f0f0; margin-bottom:6px; }
+    .mpush-context-action { width:100%; display:flex; align-items:center; justify-content:space-between; gap:8px; padding:9px 10px; border:none; border-radius:8px; background:#f5f5f7; color:#333; cursor:pointer; font-size:12px; font-weight:600; text-align:left; }
+    .mpush-context-action:hover { background:#ede9fe; color:#5a43c8; }
+    .mpush-context-action:disabled { opacity:.55; cursor:not-allowed; }
+    .mpush-context-status { margin-top:8px; padding:8px 6px 2px; border-top:1px solid #f0f0f0; color:#777; font-size:11px; line-height:1.5; word-break:break-word; }
+    .mpush-context-status.ok { color:#15803d; }
+    .mpush-context-status.error { color:#b91c1c; }
     #${UI.panelId} { position:fixed; right:16px; bottom:70px; width:420px; max-width:calc(100vw - 32px); height:80vh; max-height:calc(100vh - 100px); min-height:400px; z-index:2147483647; background:#fff; color:#222; border:none; border-radius:14px; box-shadow:0 20px 60px rgba(0,0,0,.25); display:none; flex-direction:column; font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif; overflow:hidden; }
     #${UI.panelId}.show { display:flex; }
     .mpush-panel-header { display:flex; align-items:center; justify-content:space-between; padding:10px 14px; background:linear-gradient(135deg,#8b5cf6,#3b82f6); color:#fff; cursor:move; flex-shrink:0; }
@@ -1245,6 +1254,13 @@ ${lines}`;
     const floatBtn = el('button', { id: UI.btnId, title: '网页浏览记录助手' });
     floatBtn.innerHTML = '📊<span id="' + UI.badgeId + '"></span>';
     const panel = el('div', { id: UI.panelId });
+    const contextMenu = el('div', { id: UI.contextMenuId });
+    contextMenu.innerHTML = `
+      <div class="mpush-context-title">网页浏览记录助手</div>
+      <button class="mpush-context-action" id="mpush-context-sync" type="button">
+        <span>🔁 对账同步</span><span>›</span>
+      </button>
+      <div class="mpush-context-status" id="mpush-context-status">读取同步状态中…</div>`;
     const toastNode = el('div', { id: UI.toastId }, '');
 
     const header = el('div', { class: 'mpush-panel-header' });
@@ -1287,12 +1303,98 @@ ${lines}`;
       }
     });
 
-    root.appendChild(floatBtn); root.appendChild(panel);
+    root.appendChild(floatBtn); root.appendChild(contextMenu); root.appendChild(panel);
     document.body.appendChild(root); document.body.appendChild(toastNode);
 
     enablePanelDrag(header, panel, resizeHandle);
     enableFloatBtnDrag(floatBtn);
+    enableFloatContextMenu(floatBtn, contextMenu);
     updateBadge();
+  }
+
+  function setContextMenuStatus(message, state) {
+    const status = document.getElementById('mpush-context-status');
+    if (!status) return;
+    status.textContent = message;
+    status.classList.toggle('ok', state === 'ok');
+    status.classList.toggle('error', state === 'error');
+  }
+
+  function refreshContextMenuStatus() {
+    cfg = loadConfig();
+    const syncMeta = loadHistorySyncMeta();
+    if (!cfg.cloudSync?.account || !cfg.cloudSync?.appPassword) {
+      setContextMenuStatus('未配置坚果云账号/应用密码，无法同步。', 'error');
+      return;
+    }
+    if (!syncMeta.lastSyncAt) {
+      setContextMenuStatus('尚未同步历史记录。', '');
+      return;
+    }
+    const checksum = syncMeta.checksum ? `，校验 ${syncMeta.checksum}` : '';
+    setContextMenuStatus(`上次同步：${formatDate(syncMeta.lastSyncAt)} ${formatTime(syncMeta.lastSyncAt)}，${syncMeta.syncedCount || 0} 条${checksum}`, 'ok');
+  }
+
+  function positionContextMenu(menu, x, y) {
+    menu.classList.add('show');
+    const rect = menu.getBoundingClientRect();
+    const left = Math.max(8, Math.min(x, window.innerWidth - rect.width - 8));
+    const top = Math.max(8, Math.min(y, window.innerHeight - rect.height - 8));
+    menu.style.left = left + 'px';
+    menu.style.top = top + 'px';
+  }
+
+  function hideContextMenu() {
+    const menu = document.getElementById(UI.contextMenuId);
+    if (menu) menu.classList.remove('show');
+  }
+
+  async function runContextReconcile(btn) {
+    cfg = loadConfig();
+    if (!cfg.cloudSync?.account || !cfg.cloudSync?.appPassword) {
+      setContextMenuStatus('请先在设置中配置坚果云账号和应用密码。', 'error');
+      return;
+    }
+    btn.disabled = true;
+    btn.querySelector('span:first-child').textContent = '🔁 对账中…';
+    setContextMenuStatus('正在对账同步，请稍等…', '');
+    try {
+      const result = await historySyncReconcile();
+      const checksum = result.checksum ? `，校验 ${result.checksum}` : '';
+      setContextMenuStatus(`完成：本地 ${result.localBefore} 条，云端看到 ${result.remoteSeen} 条，最终 ${result.finalCount} 条${checksum}`, 'ok');
+      toast(`✅ 对账完成：${result.finalCount} 条`);
+      updateSyncStatus();
+      refreshHistoryTab();
+      fillSettingsTab();
+    } catch (err) {
+      setContextMenuStatus('同步失败：' + (err.message || err), 'error');
+      toast('❌ 同步失败');
+    } finally {
+      btn.disabled = false;
+      btn.querySelector('span:first-child').textContent = '🔁 对账同步';
+    }
+  }
+
+  function enableFloatContextMenu(floatBtn, menu) {
+    const syncBtn = menu.querySelector('#mpush-context-sync');
+    menu.addEventListener('click', e => e.stopPropagation());
+    menu.addEventListener('contextmenu', e => { e.preventDefault(); e.stopPropagation(); });
+    syncBtn.addEventListener('click', () => runContextReconcile(syncBtn));
+    floatBtn.addEventListener('contextmenu', e => {
+      e.preventDefault();
+      e.stopPropagation();
+      refreshContextMenuStatus();
+      positionContextMenu(menu, e.clientX, e.clientY);
+    });
+    document.addEventListener('click', e => {
+      if (e.target.closest(`#${UI.contextMenuId}`) || e.target.closest(`#${UI.btnId}`)) return;
+      hideContextMenu();
+    });
+    document.addEventListener('contextmenu', e => {
+      if (e.target.closest(`#${UI.contextMenuId}`) || e.target.closest(`#${UI.btnId}`)) return;
+      hideContextMenu();
+    });
+    document.addEventListener('keydown', e => { if (e.key === 'Escape') hideContextMenu(); });
   }
 
   /* ── 全局拖拽状态（document 监听器只注册一次）── */
@@ -1348,6 +1450,8 @@ ${lines}`;
 
   function enableFloatBtnDrag(btn) {
     btn.addEventListener('mousedown', e => {
+      if (e.button !== 0) return;
+      hideContextMenu();
       _floatDrag.moved = false;
       _floatDrag.sx = e.clientX; _floatDrag.sy = e.clientY;
       const r = btn.getBoundingClientRect();
