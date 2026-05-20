@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         饺子 AI 网页摘要助手
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      2.7.3
+// @version      2.7.4
 // @description  指定网站自动弹出 AI 网页摘要，支持连续对话、多预设、多模板、SPA路由，flomo、坚果云双文件云同步。
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
@@ -1407,6 +1407,66 @@
         display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px;
         padding-top: 12px; border-top: 1px solid #eee;
       }
+
+      /* 📦 折叠菜单样式 */
+      .tabbit-collapse {
+        border: 1px solid #e5e5ea;
+        border-radius: 10px;
+        margin-bottom: 10px;
+        overflow: hidden;
+        background: #fff;
+      }
+      .tabbit-collapse-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 10px 12px;
+        background: linear-gradient(135deg, rgba(139, 92, 246, .06), rgba(59, 130, 246, .04));
+        cursor: pointer;
+        user-select: none;
+        transition: background .2s;
+        border-bottom: 1px solid transparent;
+      }
+      .tabbit-collapse-header:hover {
+        background: linear-gradient(135deg, rgba(139, 92, 246, .1), rgba(59, 130, 246, .08));
+      }
+      .tabbit-collapse-header .tabbit-collapse-title {
+        font-weight: 700;
+        font-size: 13px;
+        color: #5a43c8;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .tabbit-collapse-header .tabbit-collapse-arrow {
+        width: 20px;
+        height: 20px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        transition: transform .25s ease;
+        color: #8b5cf6;
+        font-size: 12px;
+      }
+      .tabbit-collapse.open > .tabbit-collapse-header {
+        border-bottom-color: #e5e5ea;
+      }
+      .tabbit-collapse.open > .tabbit-collapse-header .tabbit-collapse-arrow {
+        transform: rotate(90deg);
+      }
+      .tabbit-collapse-content {
+        padding: 0;
+        max-height: 0;
+        overflow: hidden;
+        transition: max-height .3s ease, padding .3s ease;
+      }
+      .tabbit-collapse.open > .tabbit-collapse-content {
+        padding: 10px 12px;
+        max-height: 5000px;
+      }
+      .tabbit-collapse.open > .tabbit-collapse-header {
+        background: linear-gradient(135deg, rgba(139, 92, 246, .12), rgba(59, 130, 246, .08));
+      }
             /* 📌 加规则小卡片 */
       #tabbit-addrule-card {
         position: fixed; inset: 0; z-index: 2147483647;
@@ -2520,116 +2580,160 @@
           <button id="tabbit-set-close" class="tabbit-icon-btn" style="background:#eee;color:#333;">×</button>
         </div>
 
-        <div class="tabbit-section-title" style="margin-top:0;border-top:none;padding-top:0;">📦 API 配置预设</div>
-        <small class="tabbit-help">不同 API 服务商可建多个预设，一键切换。提示词模板和网址规则跨预设共用。</small>
-        <div class="tabbit-profile-row">
-          <select id="tabbit-set-profile-select" class="tabbit-profile-select-wide"></select>
-          <button id="tabbit-profile-add" class="tabbit-secondary-btn" type="button">➕ 新建</button>
-          <button id="tabbit-profile-clone" class="tabbit-secondary-btn" type="button">📋 复制</button>
-          <button id="tabbit-profile-rename" class="tabbit-secondary-btn" type="button">✏️ 改名</button>
-          <button id="tabbit-profile-delete" class="tabbit-danger-btn" type="button">🗑️</button>
+        <div class="tabbit-collapse">
+          <div class="tabbit-collapse-header" data-collapse="toggle">
+            <span class="tabbit-collapse-title">📦 API 配置预设</span>
+            <span class="tabbit-collapse-arrow">▶</span>
+          </div>
+          <div class="tabbit-collapse-content">
+            <small class="tabbit-help">不同 API 服务商可建多个预设，一键切换。提示词模板和网址规则跨预设共用。</small>
+            <div class="tabbit-profile-row">
+              <select id="tabbit-set-profile-select" class="tabbit-profile-select-wide"></select>
+              <button id="tabbit-profile-add" class="tabbit-secondary-btn" type="button">➕ 新建</button>
+              <button id="tabbit-profile-clone" class="tabbit-secondary-btn" type="button">📋 复制</button>
+              <button id="tabbit-profile-rename" class="tabbit-secondary-btn" type="button">✏️ 改名</button>
+              <button id="tabbit-profile-delete" class="tabbit-danger-btn" type="button">🗑️</button>
+            </div>
+            <label class="tabbit-field"><span>预设名称</span>
+              <input id="tabbit-set-profile-name" type="text" placeholder="如：DeepSeek、OpenAI">
+            </label>
+            <label class="tabbit-field"><span>API 地址</span>
+              <input id="tabbit-set-api-url" type="text" placeholder="https://api.openai.com/v1/chat/completions">
+            </label>
+            <label class="tabbit-field"><span>API Key</span>
+              <input id="tabbit-set-api-key" type="password" placeholder="sk-xxxx">
+            </label>
+            <div class="tabbit-settings-actions">
+              <button id="tabbit-test-api" class="tabbit-secondary-btn" type="button">⚡ 测试 API</button>
+              <button id="tabbit-fetch-models" class="tabbit-secondary-btn" type="button">🔄 获取模型列表</button>
+            </div>
+            <div class="tabbit-row-2">
+              <label class="tabbit-field"><span>默认 temperature</span>
+                <input id="tabbit-set-temperature" type="number" step="0.1" min="0" max="2">
+              </label>
+              <label class="tabbit-field"><span>默认 max_tokens</span>
+                <input id="tabbit-set-max-tokens" type="number" min="100">
+              </label>
+            </div>
+          </div>
         </div>
 
-        <label class="tabbit-field"><span>预设名称</span>
-          <input id="tabbit-set-profile-name" type="text" placeholder="如：DeepSeek、OpenAI">
-        </label>
-        <label class="tabbit-field"><span>API 地址</span>
-          <input id="tabbit-set-api-url" type="text" placeholder="https://api.openai.com/v1/chat/completions">
-        </label>
-        <label class="tabbit-field"><span>API Key</span>
-          <input id="tabbit-set-api-key" type="password" placeholder="sk-xxxx">
-        </label>
-
-        <div class="tabbit-settings-actions">
-          <button id="tabbit-test-api" class="tabbit-secondary-btn" type="button">⚡ 测试 API</button>
-          <button id="tabbit-fetch-models" class="tabbit-secondary-btn" type="button">🔄 获取模型列表</button>
+        <div class="tabbit-collapse">
+          <div class="tabbit-collapse-header" data-collapse="toggle">
+            <span class="tabbit-collapse-title">🤖 模型预设</span>
+            <span class="tabbit-collapse-arrow">▶</span>
+          </div>
+          <div class="tabbit-collapse-content">
+            <div id="tabbit-model-list"></div>
+            <div class="tabbit-settings-actions">
+              <button id="tabbit-add-model" class="tabbit-secondary-btn" type="button">➕ 添加模型</button>
+            </div>
+          </div>
         </div>
 
-        <div class="tabbit-row-2">
-          <label class="tabbit-field"><span>默认 temperature</span>
-            <input id="tabbit-set-temperature" type="number" step="0.1" min="0" max="2">
-          </label>
-          <label class="tabbit-field"><span>默认 max_tokens</span>
-            <input id="tabbit-set-max-tokens" type="number" min="100">
-          </label>
+        <div class="tabbit-collapse">
+          <div class="tabbit-collapse-header" data-collapse="toggle">
+            <span class="tabbit-collapse-title">📝 提示词模板（全局共用）</span>
+            <span class="tabbit-collapse-arrow">▶</span>
+          </div>
+          <div class="tabbit-collapse-content">
+            <div id="tabbit-tpl-list"></div>
+            <div class="tabbit-settings-actions">
+              <button id="tabbit-add-tpl" class="tabbit-secondary-btn" type="button">➕ 添加模板</button>
+            </div>
+          </div>
         </div>
 
-        <div class="tabbit-section-title">🤖 模型预设</div>
-        <div id="tabbit-model-list"></div>
-        <div class="tabbit-settings-actions">
-          <button id="tabbit-add-model" class="tabbit-secondary-btn" type="button">➕ 添加模型</button>
+        <div class="tabbit-collapse">
+          <div class="tabbit-collapse-header" data-collapse="toggle">
+            <span class="tabbit-collapse-title">🌐 网址规则（自动弹出 + 模板绑定）</span>
+            <span class="tabbit-collapse-arrow">▶</span>
+          </div>
+          <div class="tabbit-collapse-content">
+            <small class="tabbit-help">支持通配符 *。匹配的页面打开时自动弹出面板（需勾选自动弹出）。每条规则可绑定一个提示词模板。</small>
+            <div id="tabbit-rule-list"></div>
+            <div class="tabbit-settings-actions">
+              <button id="tabbit-add-rule" class="tabbit-secondary-btn" type="button">➕ 添加规则</button>
+              <button id="tabbit-add-current-url" class="tabbit-secondary-btn" type="button">📌 加入当前网址</button>
+            </div>
+          </div>
         </div>
 
-        <div class="tabbit-section-title">📝 提示词模板（全局共用）</div>
-        <div id="tabbit-tpl-list"></div>
-        <div class="tabbit-settings-actions">
-          <button id="tabbit-add-tpl" class="tabbit-secondary-btn" type="button">➕ 添加模板</button>
+        <div class="tabbit-collapse">
+          <div class="tabbit-collapse-header" data-collapse="toggle">
+            <span class="tabbit-collapse-title">🔧 通用</span>
+            <span class="tabbit-collapse-arrow">▶</span>
+          </div>
+          <div class="tabbit-collapse-content">
+            <div class="tabbit-row-2">
+              <label class="tabbit-field"><span>面板宽度（px）</span>
+                <input id="tabbit-set-panel-width" type="number" min="320">
+              </label>
+              <label class="tabbit-field"><span>正文最大字符数</span>
+                <input id="tabbit-set-extract-max" type="number" min="2000">
+              </label>
+            </div>
+            <label class="tabbit-field">
+              <span><input id="tabbit-set-auto-run" type="checkbox"> 命中网址规则时自动弹出并总结</span>
+            </label>
+            <label class="tabbit-field"><span>flomo API（可选，PRO 会员功能）</span>
+              <input id="tabbit-set-flomo-api" type="text" placeholder="https://flomoapp.com/iwh/...">
+            </label>
+            <label class="tabbit-field"><span>🏷️ flomo 标签</span>
+              <input id="tabbit-set-flomo-tags" type="text" placeholder="#饺子AI摘要">
+              <small>发送到 flomo 时自动追加在内容末尾，多个标签用空格分隔</small>
+            </label>
+          </div>
         </div>
 
-        <div class="tabbit-section-title">🌐 网址规则（自动弹出 + 模板绑定）</div>
-        <small class="tabbit-help">支持通配符 *。匹配的页面打开时自动弹出面板（需勾选自动弹出）。每条规则可绑定一个提示词模板。</small>
-        <div id="tabbit-rule-list"></div>
-        <div class="tabbit-settings-actions">
-          <button id="tabbit-add-rule" class="tabbit-secondary-btn" type="button">➕ 添加规则</button>
-          <button id="tabbit-add-current-url" class="tabbit-secondary-btn" type="button">📌 加入当前网址</button>
+        <div class="tabbit-collapse">
+          <div class="tabbit-collapse-header" data-collapse="toggle">
+            <span class="tabbit-collapse-title">📋 自动复制</span>
+            <span class="tabbit-collapse-arrow">▶</span>
+          </div>
+          <div class="tabbit-collapse-content">
+            <small class="tabbit-help">选中文本后自动复制到剪贴板，可选择是否附带页面标题和链接作为出处。也可右键点击浮动按钮快速切换。</small>
+            <label class="tabbit-field">
+              <span><input id="tabbit-set-auto-copy" type="checkbox"> 开启自动复制（选中文本自动复制）</span>
+            </label>
+            <label class="tabbit-field">
+              <span><input id="tabbit-set-auto-copy-source" type="checkbox"> 复制时附带出处信息（页面标题 + 链接）</span>
+            </label>
+          </div>
         </div>
 
-        <div class="tabbit-section-title">🔧 通用</div>
-        <div class="tabbit-row-2">
-          <label class="tabbit-field"><span>面板宽度（px）</span>
-            <input id="tabbit-set-panel-width" type="number" min="320">
-          </label>
-          <label class="tabbit-field"><span>正文最大字符数</span>
-            <input id="tabbit-set-extract-max" type="number" min="2000">
-          </label>
-        </div>
-        <label class="tabbit-field">
-          <span><input id="tabbit-set-auto-run" type="checkbox"> 命中网址规则时自动弹出并总结</span>
-        </label>
-        <label class="tabbit-field"><span>flomo API（可选，PRO 会员功能）</span>
-          <input id="tabbit-set-flomo-api" type="text" placeholder="https://flomoapp.com/iwh/...">
-        </label>
-        <label class="tabbit-field"><span>🏷️ flomo 标签</span>
-          <input id="tabbit-set-flomo-tags" type="text" placeholder="#饺子AI摘要">
-          <small>发送到 flomo 时自动追加在内容末尾，多个标签用空格分隔</small>
-        </label>
-
-        <div class="tabbit-section-title">📋 自动复制</div>
-        <small class="tabbit-help">选中文本后自动复制到剪贴板，可选择是否附带页面标题和链接作为出处。也可右键点击浮动按钮快速切换。</small>
-        <label class="tabbit-field">
-          <span><input id="tabbit-set-auto-copy" type="checkbox"> 开启自动复制（选中文本自动复制）</span>
-        </label>
-        <label class="tabbit-field">
-          <span><input id="tabbit-set-auto-copy-source" type="checkbox"> 复制时附带出处信息（页面标题 + 链接）</span>
-        </label>
-
-        <div class="tabbit-section-title">☁️ 坚果云 WebDAV 云同步</div>
-        <small class="tabbit-help">
-          • <code>tabbit-shared/ai-profiles.json</code> — API 预设（多脚本共享）<br>
-          • <code>tabbit-ai-summary/config.json</code> — 模板 + 网址规则（本脚本专属）<br>
-          ⚠️ <b>API Key 会上传到云端</b>，请确保账号安全。
-        </small>
-        <div class="tabbit-row-2">
-          <label class="tabbit-field"><span>坚果云账号（邮箱）</span>
-            <input id="tabbit-set-jgy-account" type="text" placeholder="you@example.com">
-          </label>
-          <label class="tabbit-field"><span>应用密码</span>
-            <input id="tabbit-set-jgy-password" type="password" placeholder="坚果云应用密码">
-          </label>
-        </div>
-
-        <div class="tabbit-sync-scope">
-          <span class="tabbit-sync-scope-title">同步范围：</span>
-          <label><input type="checkbox" id="tabbit-sync-profiles" checked> 📦 API 预设（含 Key）</label>
-          <label><input type="checkbox" id="tabbit-sync-app" checked> 📝 模板 + 网址规则</label>
-        </div>
-
-        <div id="tabbit-cloud-status" style="font-size:12px;color:#888;margin:4px 0 6px;"></div>
-        <div class="tabbit-settings-actions">
-          <button id="tabbit-cloud-test" class="tabbit-secondary-btn" type="button">🔌 测试连接</button>
-          <button id="tabbit-cloud-pull" class="tabbit-secondary-btn" type="button">⬇️ 从云端拉取</button>
-          <button id="tabbit-cloud-push" class="tabbit-secondary-btn" type="button">⬆️ 增量上传</button>
-          <button id="tabbit-cloud-force-push" class="tabbit-danger-btn" type="button">⚠️ 强制覆盖上传</button>
+        <div class="tabbit-collapse">
+          <div class="tabbit-collapse-header" data-collapse="toggle">
+            <span class="tabbit-collapse-title">☁️ 坚果云 WebDAV 云同步</span>
+            <span class="tabbit-collapse-arrow">▶</span>
+          </div>
+          <div class="tabbit-collapse-content">
+            <small class="tabbit-help">
+              • <code>tabbit-shared/ai-profiles.json</code> — API 预设（多脚本共享）<br>
+              • <code>tabbit-ai-summary/config.json</code> — 模板 + 网址规则（本脚本专属）<br>
+              ⚠️ <b>API Key 会上传到云端</b>，请确保账号安全。
+            </small>
+            <div class="tabbit-row-2">
+              <label class="tabbit-field"><span>坚果云账号（邮箱）</span>
+                <input id="tabbit-set-jgy-account" type="text" placeholder="you@example.com">
+              </label>
+              <label class="tabbit-field"><span>应用密码</span>
+                <input id="tabbit-set-jgy-password" type="password" placeholder="坚果云应用密码">
+              </label>
+            </div>
+            <div class="tabbit-sync-scope">
+              <span class="tabbit-sync-scope-title">同步范围：</span>
+              <label><input type="checkbox" id="tabbit-sync-profiles" checked> 📦 API 预设（含 Key）</label>
+              <label><input type="checkbox" id="tabbit-sync-app" checked> 📝 模板 + 网址规则</label>
+            </div>
+            <div id="tabbit-cloud-status" style="font-size:12px;color:#888;margin:4px 0 6px;"></div>
+            <div class="tabbit-settings-actions">
+              <button id="tabbit-cloud-test" class="tabbit-secondary-btn" type="button">🔌 测试连接</button>
+              <button id="tabbit-cloud-pull" class="tabbit-secondary-btn" type="button">⬇️ 从云端拉取</button>
+              <button id="tabbit-cloud-push" class="tabbit-secondary-btn" type="button">⬆️ 增量上传</button>
+              <button id="tabbit-cloud-force-push" class="tabbit-danger-btn" type="button">⚠️ 强制覆盖上传</button>
+            </div>
+          </div>
         </div>
 
         <div class="tabbit-modal-footer">
@@ -2675,6 +2779,16 @@
     settingsEl.querySelector('#tabbit-cloud-pull').addEventListener('click', handleCloudPull);
     settingsEl.querySelector('#tabbit-cloud-push').addEventListener('click', handleCloudPush);
     settingsEl.querySelector('#tabbit-cloud-force-push').addEventListener('click', handleCloudForcePush);
+
+    // 📦 折叠菜单交互
+    settingsEl.querySelectorAll('.tabbit-collapse-header[data-collapse="toggle"]').forEach(header => {
+      header.addEventListener('click', (e) => {
+        // 避免点击 header 内的按钮/输入框时触发展开
+        if (e.target.tagName === 'BUTTON' || e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+        const collapse = header.closest('.tabbit-collapse');
+        if (collapse) collapse.classList.toggle('open');
+      });
+    });
   }
 
   function openSettings() {
