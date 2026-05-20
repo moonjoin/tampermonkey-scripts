@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站省流助手 - 字幕AI摘要 Pro
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      3.9.0
+// @version      3.9.1
 // @description  自动提取B站视频字幕，通过自定义AI API生成极简摘要，支持模型切换、持续对话和评论区总结；支持自动解析开关、自动获取模型列表、flomo自动加标签，新增总结生图功能；v3.9.0 新增html PPT模式，可以作为生图模式平替
 // @author       次元饺子
 // @match        https://www.bilibili.com/video/*
@@ -1707,6 +1707,7 @@
         align-items: center;
         gap: 8px;
         margin-top: 10px;
+        margin-bottom: 12px;
         flex-wrap: wrap;
       }
       .tabbit-copy-btn, .tabbit-download-btn {
@@ -3533,9 +3534,9 @@
       editStatus.className = 'tabbit-summary-edit-status';
       actionsDiv.appendChild(copyBtn);
       actionsDiv.appendChild(editBtn);
-      actionsDiv.appendChild(flomoBtn);
-      actionsDiv.appendChild(genImgBtn);
       actionsDiv.appendChild(htmlPptBtn);
+      actionsDiv.appendChild(genImgBtn);
+      actionsDiv.appendChild(flomoBtn);
       actionsDiv.appendChild(downloadBtn);
       actionsDiv.appendChild(editStatus);
       actionsDiv.appendChild(modelTag);
@@ -4183,13 +4184,13 @@
         editBtn.addEventListener('click', function() { startSummaryEdit(contentDiv, textContent); });
         actionsDiv.appendChild(editBtn);
 
-        const flomoBtn = document.createElement('button');
-        flomoBtn.className = 'tabbit-copy-btn';
-        flomoBtn.textContent = '🌱 flomo';
-        flomoBtn.addEventListener('click', function() {
-          sendToFlomo(getCurrentSummaryText(contentDiv, textContent), this);
+        const htmlPptBtn = document.createElement('button');
+        htmlPptBtn.className = 'tabbit-copy-btn';
+        htmlPptBtn.textContent = '📊 HTML PPT';
+        htmlPptBtn.addEventListener('click', function() {
+          triggerHtmlPptGen(contentDiv, getCurrentSummaryText(contentDiv, textContent), videoInfo, htmlPptBtn);
         });
-        actionsDiv.appendChild(flomoBtn);
+        actionsDiv.appendChild(htmlPptBtn);
 
         const genImgBtn = document.createElement('button');
         genImgBtn.className = 'tabbit-copy-btn';
@@ -4199,13 +4200,13 @@
         });
         actionsDiv.appendChild(genImgBtn);
 
-        const htmlPptBtn = document.createElement('button');
-        htmlPptBtn.className = 'tabbit-copy-btn';
-        htmlPptBtn.textContent = '📊 HTML PPT';
-        htmlPptBtn.addEventListener('click', function() {
-          triggerHtmlPptGen(contentDiv, getCurrentSummaryText(contentDiv, textContent), videoInfo, htmlPptBtn);
+        const flomoBtn = document.createElement('button');
+        flomoBtn.className = 'tabbit-copy-btn';
+        flomoBtn.textContent = '🌱 flomo';
+        flomoBtn.addEventListener('click', function() {
+          sendToFlomo(getCurrentSummaryText(contentDiv, textContent), this);
         });
-        actionsDiv.appendChild(htmlPptBtn);
+        actionsDiv.appendChild(flomoBtn);
       }
       const downloadBtn = document.createElement('button');
       downloadBtn.className = 'tabbit-download-btn';
