@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         饺子 AI 网页摘要助手
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      2.7.4
-// @description  指定网站自动弹出 AI 网页摘要，支持连续对话、多预设、多模板、SPA路由，flomo、坚果云双文件云同步。
+// @version      2.8.0
+// @description  指定网站自动弹出 AI 网页摘要，支持连续对话、多预设、多模板、SPA路由，flomo、坚果云双文件云同步。Shadow DOM 隔离样式，对话本地缓存。
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
 // @match        *://*/*
@@ -23,13 +23,21 @@
   'use strict';
 
   /******************************************************************
-   * 0. 常量
+   * 0. 常量 & Shadow DOM 容器
    ******************************************************************/
   const STORAGE_KEY = 'tabbit_ai_summary_config_v2';
   const PANEL_ID = 'tabbit-ai-panel';
   const FLOAT_BTN_ID = 'tabbit-ai-float-btn';
   const SETTINGS_ID = 'tabbit-ai-settings';
   const STYLE_ID = 'tabbit-ai-style';
+
+  // 💬 对话缓存
+  const CONVO_CACHE_KEY = 'tabbit_ai_conversation_cache';
+
+  // Shadow DOM 宿主 & 根
+  let shadowHost = null;
+  let shadowRoot = null;
+  let shadowContainer = null;
 
   const DEFAULT_PROMPT_TEXT =
     '请阅读这个网页，并为我提供一份结构化的中文摘要。' +
@@ -79,7 +87,13 @@
     extractMaxChars: 16000,
     cloudSync: { account: '', appPassword: '', lastSyncAt: 0, lastSyncDirection: '' },
     autoCopy: { enabled: true, withSource: false },
-    flomoTags: '#饺子AI摘要'
+    flomoTags: '#饺子AI摘要',
+    // 🆕 可调参数
+    apiTimeout: 120000,
+    acCooldown: 2000,
+    acMinLen: 2,
+    acTempMinutes: 10,
+    convoCacheMaxEntries: 20
   };
 
   function clone(obj) { return JSON.parse(JSON.stringify(obj)); }
@@ -89,9 +103,10 @@
    ******************************************************************/
   const _md = (function () {
     function escapeHtml(str) {
+      var _amp = '&' + 'amp;', _lt = '&' + 'lt;', _gt = '&' + 'gt;', _qt = '&' + 'quot;', _39 = '&' + '#39;';
       return String(str)
-        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+        .replace(/&/g, _amp).replace(/</g, _lt).replace(/>/g, _gt)
+        .replace(/"/g, _qt).replace(/'/g, _39);
     }
     function renderInline(text) {
       let s = escapeHtml(text);
@@ -107,8 +122,6 @@
       s = s.replace(/~~([^~]+?)~~/g, '<s>$1</s>');
       return s;
     }
-
-    // ★ 新增:解析表格行 "| a | b | c |" -> ["a","b","c"]
     function parseTableRow(line) {
       let s = line.trim();
       if (s.startsWith('|')) s = s.slice(1);
@@ -124,14 +137,12 @@
       cells.push(buf.trim());
       return cells;
     }
-    // ★ 新增:判断是否是分隔行 |---|:--:|---:|
     function isTableSeparator(line) {
       if (!/\|/.test(line)) return false;
       const cells = parseTableRow(line);
       if (cells.length === 0) return false;
       return cells.every(c => /^:?-{1,}:?$/.test(c.trim()));
     }
-    // ★ 新增:从分隔行解析每列对齐方式
     function parseAligns(sepLine) {
       return parseTableRow(sepLine).map(c => {
         const t = c.trim();
@@ -162,7 +173,6 @@
         if (inCode) { codeBuf.push(line); i++; continue; }
         if (/^\s*$/.test(line)) { closeAllLists(); i++; continue; }
 
-        // ★ 新增:GFM 表格识别
         if (/\|/.test(line) && i + 1 < lines.length && isTableSeparator(lines[i + 1])) {
           closeAllLists();
           const headers = parseTableRow(line);
@@ -222,7 +232,6 @@
         let pBuf = [line];
         i++;
         while (i < lines.length && !/^\s*$/.test(lines[i]) && !/^```/.test(lines[i]) && !/^#{1,6}\s+/.test(lines[i]) && !/^\s*>\s?/.test(lines[i]) && !/^(\s*)[-*+]\s+/.test(lines[i]) && !/^(\s*)\d+\.\s+/.test(lines[i])) {
-          // ★ 段落收集时也要避让表格
           if (/\|/.test(lines[i]) && i + 1 < lines.length && isTableSeparator(lines[i + 1])) break;
           pBuf.push(lines[i]); i++;
         }
@@ -241,7 +250,8 @@
     return (prefix || 'id') + '_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 7);
   }
   function escapeAttr(v) {
-    return String(v ?? '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    var _amp = '&' + 'amp;', _lt = '&' + 'lt;', _gt = '&' + 'gt;', _qt = '&' + 'quot;';
+    return String(v ?? '').replace(/&/g, _amp).replace(/"/g, _qt).replace(/</g, _lt).replace(/>/g, _gt);
   }
   function buildModelsUrl(apiUrl) {
     if (apiUrl.includes('/chat/completions')) return apiUrl.replace(/\/chat\/completions.*$/, '/models');
@@ -394,6 +404,14 @@
     }
     result.extractMaxChars = Number(result.extractMaxChars || 16000);
     result.autoCopy = { ...base.autoCopy, ...(saved.autoCopy || {}) };
+
+    // 🆕 可调参数归一化
+    result.apiTimeout = Number(result.apiTimeout || 120000);
+    result.acCooldown = Number(result.acCooldown || 2000);
+    result.acMinLen = Number(result.acMinLen || 2);
+    result.acTempMinutes = Number(result.acTempMinutes || 10);
+    result.convoCacheMaxEntries = Number(result.convoCacheMaxEntries || 20);
+
     return result;
   }
 
@@ -554,7 +572,6 @@
     return new Promise((resolve, reject) => {
       currentReject = reject;
 
-      // ============ 非流式：保留原逻辑 ============
       if (!useStream) {
         currentRequest = GM_xmlhttpRequest({
           method: 'POST',
@@ -564,7 +581,7 @@
             Authorization: `Bearer ${apiKey}`
           },
           data: JSON.stringify(body),
-          timeout: 120000,
+          timeout: config.apiTimeout || 120000,
           onload(res) {
             currentRequest = null; currentReject = null;
             try {
@@ -589,12 +606,10 @@
         return;
       }
 
-      // ============ 流式：优先 fetch + ReadableStream ============
       let fullText = '';
 
       const doFetchStream = async () => {
         const controller = new AbortController();
-        // 暴露 abort 句柄,让 abortCurrentRequest 能停掉
         currentRequest = { abort: () => controller.abort() };
 
         let buffer = '';
@@ -602,7 +617,7 @@
         const processLine = (line) => {
           line = line.replace(/\r$/, '').trim();
           if (!line) return true;
-          if (line.startsWith(':')) return true;          // SSE 注释行
+          if (line.startsWith(':')) return true;
           if (!line.startsWith('data:')) return true;
           const payload = line.slice(5).trim();
           if (payload === '[DONE]') return false;
@@ -621,7 +636,6 @@
             }
           } catch (e) {
             if (e.message && e.message.indexOf('JSON') === -1) throw e;
-            // 非合法 JSON 行,忽略
           }
           return true;
         };
@@ -644,7 +658,6 @@
           }
 
           const ctype = resp.headers.get('content-type') || '';
-          // 服务端没返回 SSE → 一次性 JSON 兜底
           if (!ctype.includes('text/event-stream') && !resp.body) {
             const text = await resp.text();
             try {
@@ -677,7 +690,6 @@
               }
             }
           }
-          // flush 残余
           if (buffer.trim()) processLine(buffer);
 
           currentRequest = null; currentReject = null;
@@ -698,7 +710,6 @@
         }
       };
 
-      // ============ 兜底：GM_xmlhttpRequest 流式（多数环境不真流式,但能拿结果）============
       const doGMFallback = () => {
         let receivedLen = 0;
         let buffer = '';
@@ -743,7 +754,7 @@
           },
           data: JSON.stringify({ ...body, stream: true }),
           responseType: 'stream',
-          timeout: 180000,
+          timeout: Math.max(config.apiTimeout || 120000, 180000),
           onprogress: (e) => {
             if (aborted) return;
             const text = e.responseText || '';
@@ -763,7 +774,6 @@
               flushBuffer();
             }
             if (fullText) { resolve(fullText); return; }
-            // 全部失败 → 试试当成普通 JSON
             if (text.trim().startsWith('<')) {
               reject(new Error('URL 错误（返回了 HTML）')); return;
             }
@@ -792,7 +802,6 @@
         });
       };
 
-      // 先 fetch,失败再降级
       doFetchStream().then(result => {
         if (result && result.fallback) {
           doGMFallback();
@@ -809,21 +818,89 @@
   }
 
   /******************************************************************
-   * 7. 💬 对话状态管理（新核心）
+   * 7. 💬 对话状态管理 + 对话缓存
    ******************************************************************/
-  // 对话历史：[{role:'system'|'user'|'assistant', content:'...', meta?}]
   let conversation = [];
-  let pageContextLoaded = false;  // 是否已经把页面正文塞到 system 中
+  let pageContextLoaded = false;
 
+  // —— 对话缓存 ——
+  function getConvoCacheKey() {
+    return location.origin + location.pathname;
+  }
+
+  function saveConversationToCache() {
+    try {
+      if (typeof GM_setValue !== 'function') return;
+      const visibleMsgs = conversation.filter(m => m.role !== 'system' && !m.meta?.hidden && !m.meta?.streaming);
+      if (!visibleMsgs.length) return;
+      const key = getConvoCacheKey();
+      let cache = {};
+      try { cache = JSON.parse(GM_getValue(CONVO_CACHE_KEY, '{}')); } catch (e) { cache = {}; }
+      const entry = {
+        messages: visibleMsgs.map(m => ({ role: m.role, content: m.content, meta: { model: m.meta?.model } })),
+        title: document.title,
+        url: location.href,
+        updatedAt: Date.now()
+      };
+      // 太大就跳过
+      if (JSON.stringify(entry).length > 80000) return;
+      cache[key] = entry;
+      // 淘汰超限条目
+      const maxEntries = Number(config.convoCacheMaxEntries || 20);
+      const keys = Object.keys(cache);
+      if (keys.length > maxEntries) {
+        keys.sort((a, b) => (cache[b].updatedAt || 0) - (cache[a].updatedAt || 0));
+        keys.slice(maxEntries).forEach(k => delete cache[k]);
+      }
+      GM_setValue(CONVO_CACHE_KEY, JSON.stringify(cache));
+    } catch (e) {
+      console.warn('[饺子 AI] 对话缓存保存失败：', e);
+    }
+  }
+
+  function loadConversationFromCache() {
+    try {
+      if (typeof GM_getValue !== 'function') return null;
+      const key = getConvoCacheKey();
+      let cache = {};
+      try { cache = JSON.parse(GM_getValue(CONVO_CACHE_KEY, '{}')); } catch (e) { return null; }
+      return cache[key] || null;
+    } catch (e) { return null; }
+  }
+
+  function clearConversationCacheForCurrentUrl() {
+    try {
+      if (typeof GM_setValue !== 'function') return;
+      const key = getConvoCacheKey();
+      let cache = {};
+      try { cache = JSON.parse(GM_getValue(CONVO_CACHE_KEY, '{}')); } catch (e) { return; }
+      delete cache[key];
+      GM_setValue(CONVO_CACHE_KEY, JSON.stringify(cache));
+    } catch (e) {}
+  }
+
+  function restoreConversationFromCache(cached) {
+    if (!cached || !Array.isArray(cached.messages) || !cached.messages.length) return false;
+    conversation = [];
+    pageContextLoaded = false;
+    ensurePageContext();
+    cached.messages.forEach(m => {
+      conversation.push({ role: m.role, content: m.content, meta: m.meta || {} });
+    });
+    renderConversation();
+    return true;
+  }
+
+  // —— 对话核心 ——
   function resetConversation(reason) {
     conversation = [];
     pageContextLoaded = false;
-    if (panelEl) {
-      const body = panelEl.querySelector('#tabbit-body');
+    if (shadowRoot) {
+      const body = shadowRoot.querySelector('#tabbit-body');
       if (body) {
         body.innerHTML = `<p class="tabbit-placeholder">${reason || '点击「✨ 总结当前页面」开始，或在下方输入框直接提问。'}</p>`;
       }
-      const input = panelEl.querySelector('#tabbit-chat-input');
+      const input = shadowRoot.querySelector('#tabbit-chat-input');
       if (input) input.value = '';
     }
   }
@@ -849,12 +926,13 @@
   }
 
   function renderConversation() {
-    if (!panelEl) return;
-    const body = panelEl.querySelector('#tabbit-body');
+    const root = shadowRoot;
+    if (!root) return;
+    const body = root.querySelector('#tabbit-body');
     if (!body) return;
     const visibleMsgs = conversation.filter(m => m.role !== 'system' && !m.meta?.hidden);
     if (!visibleMsgs.length) {
-      body.innerHTML = `<p class="tabbit-placeholder">点击「✨ 总结当前页面」开始，或在下方输入框直接提问。</p>`;
+      body.innerHTML = `<p class="tabbit-placeholder">点击「✨ 总结」开始，或在下方输入框直接提问。</p>`;
       return;
     }
     body.innerHTML = visibleMsgs.map(m => {
@@ -874,7 +952,7 @@
   }
 
   /******************************************************************
-   * 8. ☁️ 坚果云同步（保留原逻辑，省略相同部分）
+   * 8. ☁️ 坚果云同步
    ******************************************************************/
   const JGY_BASE = 'https://dav.jianguoyun.com/dav/';
   const JGY_SHARED_DIR = 'tabbit-shared/';
@@ -939,18 +1017,20 @@
   }
 
   function pickCloudCredsFromForm() {
-    if (!settingsEl) return;
+    const el = settingsEl;
+    if (!el) return;
     config.cloudSync = {
       ...(config.cloudSync || {}),
-      account: settingsEl.querySelector('#tabbit-set-jgy-account').value.trim(),
-      appPassword: settingsEl.querySelector('#tabbit-set-jgy-password').value.trim()
+      account: el.querySelector('#tabbit-set-jgy-account').value.trim(),
+      appPassword: el.querySelector('#tabbit-set-jgy-password').value.trim()
     };
   }
   function readSyncScopeFromForm() {
-    if (!settingsEl) return { profiles: true, app: true };
+    const el = settingsEl;
+    if (!el) return { profiles: true, app: true };
     return {
-      profiles: settingsEl.querySelector('#tabbit-sync-profiles')?.checked !== false,
-      app: settingsEl.querySelector('#tabbit-sync-app')?.checked !== false
+      profiles: el.querySelector('#tabbit-sync-profiles')?.checked !== false,
+      app: el.querySelector('#tabbit-sync-app')?.checked !== false
     };
   }
   function mergeTemplates(local, remote, prefer) {
@@ -1148,8 +1228,9 @@
    ******************************************************************/
   let statusTimer = null;
   function setStatus(msg, level, duration) {
-    if (!panelEl) return;
-    const el = panelEl.querySelector('#tabbit-status');
+    const root = shadowRoot;
+    if (!root) return;
+    const el = root.querySelector('#tabbit-status');
     if (!el) return;
     el.textContent = msg || '';
     el.className = 'tabbit-status ' + (level || '');
@@ -1160,24 +1241,29 @@
   }
 
   /******************************************************************
-   * 10. 样式
+   * 10. 样式（Shadow DOM 内面板样式 + 主文档外部 UI 样式）
    ******************************************************************/
-  function createStyles() {
-    if (document.getElementById(STYLE_ID)) return;
-    const css = `
-      #${FLOAT_BTN_ID} {
-        position: fixed; z-index: 2147483646;
-        width: 44px; height: 44px; border-radius: 22px;
-        background: linear-gradient(135deg, #8b5cf6, #3b82f6);
-        color: white; font-size: 20px;
-        display: flex; align-items: center; justify-content: center;
-        cursor: pointer; box-shadow: 0 6px 20px rgba(0,0,0,.25);
-        user-select: none; transition: opacity .2s, transform .2s;
+  function createPanelStyles() {
+    // 面板、消息、输入区、表格等 → 注入 Shadow DOM
+    return `
+      :host {
+        all: initial;
+        position: fixed;
+        top: 0; left: 0;
+        width: 0; height: 0;
+        overflow: visible;
+        pointer-events: none;
+        z-index: 2147483646;
+        font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+        font-size: 14px;
+        line-height: 1.5;
+        color: #222;
       }
-      #${FLOAT_BTN_ID}:hover { opacity: 1 !important; transform: scale(1.08); }
-      #${FLOAT_BTN_ID}.dragging { transition: none !important; transform: scale(1.08); }
+
+      *, *::before, *::after { box-sizing: border-box; }
 
       #${PANEL_ID} {
+        pointer-events: auto;
         position: fixed; right: 16px; bottom: 70px;
         width: 420px; height: 80vh;
         min-width: 340px; min-height: 400px;
@@ -1202,12 +1288,14 @@
       .tabbit-icon-btn {
         background: rgba(255,255,255,.18); color: #fff; border: none;
         width: 28px; height: 28px; border-radius: 6px; cursor: pointer; font-size: 16px;
+        pointer-events: auto;
       }
       .tabbit-icon-btn:hover { background: rgba(255,255,255,.32); }
       .tabbit-model-select, .tabbit-prompt-select, .tabbit-profile-select {
         max-width: 130px; border: none; border-radius: 8px;
         padding: 5px 8px; font-size: 12px;
         background: rgba(255,255,255,.92); color: #333; cursor: pointer;
+        pointer-events: auto;
       }
       .tabbit-profile-select { font-weight: 600; }
 
@@ -1219,16 +1307,19 @@
       .tabbit-primary-btn {
         background: linear-gradient(135deg, #8b5cf6, #3b82f6); color: #fff; border: none;
         padding: 7px 14px; border-radius: 8px; cursor: pointer; font-size: 13px; font-weight: 600;
+        pointer-events: auto;
       }
       .tabbit-primary-btn:disabled { opacity: .55; cursor: not-allowed; }
       .tabbit-secondary-btn {
         background: #f5f5f7; color: #333; border: 1px solid #e5e5ea;
         padding: 6px 12px; border-radius: 8px; cursor: pointer; font-size: 12px;
+        pointer-events: auto;
       }
       .tabbit-secondary-btn:hover { background: #ececf0; }
       .tabbit-danger-btn {
         background: #fee2e2; color: #b91c1c; border: 1px solid #fca5a5;
         padding: 6px 12px; border-radius: 8px; cursor: pointer; font-size: 12px; font-weight: 600;
+        pointer-events: auto;
       }
       .tabbit-danger-btn:hover { background: #fecaca; }
 
@@ -1247,7 +1338,6 @@
       }
       .tabbit-placeholder { color: #888; }
 
-      /* 💬 消息气泡 */
       .tabbit-msg { margin: 12px 0; }
       .tabbit-msg-role {
         font-size: 12px; font-weight: 600; color: #6b7280; margin-bottom: 4px;
@@ -1279,7 +1369,6 @@
       .tabbit-body blockquote { border-left: 3px solid #7c3aed; padding: .3em .8em; background: rgba(139,92,246,.08); margin: .5em 0; border-radius: 0 6px 6px 0; }
       .tabbit-body a { color: #2563eb; text-decoration: underline; }
 
-      /* 💬 输入区 */
       .tabbit-input-area {
         flex-shrink: 0;
         border-top: 1px solid #eee;
@@ -1298,6 +1387,7 @@
         line-height: 1.5;
         outline: none;
         transition: border-color .15s;
+        pointer-events: auto;
       }
       #tabbit-chat-input:focus { border-color: #8b5cf6; }
       .tabbit-send-btn {
@@ -1306,13 +1396,13 @@
         width: 60px; height: 38px; border-radius: 10px;
         cursor: pointer; font-size: 13px; font-weight: 600;
         flex-shrink: 0;
+        pointer-events: auto;
       }
       .tabbit-send-btn:disabled { opacity: .5; cursor: not-allowed; }
       .tabbit-input-hint {
         font-size: 11px; color: #999; margin-top: 4px; text-align: right;
       }
 
-      /* 🪟 调整大小手柄 */
       .tabbit-resize-handle {
         position: absolute; right: 0; bottom: 0;
         width: 16px; height: 16px;
@@ -1320,155 +1410,147 @@
         background: linear-gradient(135deg, transparent 50%, rgba(139,92,246,0.4) 50%);
         border-bottom-right-radius: 14px;
         z-index: 10;
+        pointer-events: auto;
       }
       .tabbit-resize-handle:hover {
         background: linear-gradient(135deg, transparent 50%, rgba(139,92,246,0.7) 50%);
       }
 
-      /* 设置弹窗 */
-      #${SETTINGS_ID} {
-        position: fixed; inset: 0; z-index: 2147483647;
-        background: rgba(0,0,0,.45); backdrop-filter: blur(4px);
-        display: flex; align-items: center; justify-content: center;
+      .tabbit-body .md-table-wrap,
+      .tabbit-msg-content .md-table-wrap {
+        overflow-x: auto;
+        margin: .8em 0;
+        border-radius: 8px;
+        border: 1px solid rgba(139, 92, 246, .25);
+        background: rgba(255, 255, 255, .6);
       }
-      .tabbit-settings-content {
-        background: #fff; color: #222;
-        width: 600px; max-width: 96vw; max-height: 90vh; overflow-y: auto;
-        border-radius: 14px; padding: 18px 20px;
+      .tabbit-body .md-table,
+      .tabbit-msg-content .md-table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: .88em;
+        line-height: 1.55;
       }
-      .tabbit-settings-header {
-        display: flex; justify-content: space-between; align-items: center;
-        font-weight: 700; font-size: 16px;
-        border-bottom: 1px solid #eee; padding-bottom: 10px; margin-bottom: 12px;
+      .tabbit-body .md-table th,
+      .tabbit-body .md-table td,
+      .tabbit-msg-content .md-table th,
+      .tabbit-msg-content .md-table td {
+        padding: 8px 12px;
+        border-bottom: 1px solid rgba(139, 92, 246, .15);
+        border-right: 1px solid rgba(139, 92, 246, .10);
+        vertical-align: top;
+        text-align: left;
+        word-break: break-word;
       }
-      .tabbit-section-title {
-        font-weight: 700; margin: 14px 0 6px; color: #5a43c8;
-        border-top: 1px dashed #e5e5ea; padding-top: 12px;
-      }
-      .tabbit-help { display:block; color: #888; font-size: 12px; margin-bottom: 8px; line-height: 1.6; }
-      .tabbit-help code {
-        background: rgba(139,92,246,.12); padding: 1px 5px;
-        border-radius: 3px; font-size: 11px; color: #be185d;
-      }
-      .tabbit-field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px; font-size: 13px; }
-      .tabbit-field span { color: #555; font-weight: 600; }
-      .tabbit-field input, .tabbit-field textarea, .tabbit-field select {
-        border: 1px solid #ddd; border-radius: 8px; padding: 7px 9px; font-size: 13px;
-        font-family: inherit;
-      }
-      .tabbit-field small { color: #888; font-size: 11px; }
-      .tabbit-row-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-      .tabbit-profile-row {
-        display: flex; gap: 6px; margin-bottom: 12px; flex-wrap: wrap; align-items: center;
-      }
-      .tabbit-profile-select-wide {
-        flex: 1; min-width: 180px;
-        border: 1px solid #ddd; border-radius: 10px;
-        padding: 8px 9px; font-size: 13px; background: #fff;
-        font-weight: 600; color: #5a43c8;
-      }
-      .tabbit-sync-scope {
-        display: flex; flex-direction: column; gap: 4px;
-        padding: 8px 10px; background: #f9fafb;
-        border: 1px solid #e5e5ea; border-radius: 8px;
-        margin: 8px 0; font-size: 12px;
-      }
-      .tabbit-sync-scope-title { font-weight: 600; color: #5a43c8; margin-bottom: 2px; }
-      .tabbit-sync-scope label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
-
-      .tabbit-settings-actions { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0; }
-      .tabbit-model-row {
-        display: grid;
-        grid-template-columns: 1.6fr .7fr .8fr auto auto;
-        gap: 6px; margin-bottom: 6px; align-items: center;
-      }
-      .tabbit-model-row input { padding: 5px 7px; font-size: 12px; border: 1px solid #ddd; border-radius: 6px; }
-      .tabbit-current-model { font-size: 11px; display: flex; align-items: center; gap: 3px; }
-      .tabbit-remove-model { background: #fee2e2; color: #b91c1c; border: none; border-radius: 6px; cursor: pointer; padding: 4px 8px; }
-      .tabbit-tpl-row {
-        display: grid;
-        grid-template-columns: 1.2fr 3fr auto auto;
-        gap: 6px; margin-bottom: 8px; align-items: start;
-      }
-      .tabbit-tpl-row input, .tabbit-tpl-row textarea {
-        border: 1px solid #ddd; border-radius: 6px; padding: 6px 8px; font-size: 12px; font-family: inherit;
-      }
-      .tabbit-tpl-row textarea { min-height: 60px; resize: vertical; }
-      .tabbit-tpl-default { font-size: 11px; display: flex; align-items: center; gap: 3px; }
-      .tabbit-rule-row {
-        display: grid;
-        grid-template-columns: 2fr 1.3fr auto;
-        gap: 6px; margin-bottom: 6px; align-items: center;
-      }
-      .tabbit-rule-row input, .tabbit-rule-row select {
-        padding: 5px 7px; font-size: 12px; border: 1px solid #ddd; border-radius: 6px;
-      }
-      .tabbit-modal-footer {
-        display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px;
-        padding-top: 12px; border-top: 1px solid #eee;
-      }
-
-      /* 📦 折叠菜单样式 */
-      .tabbit-collapse {
-        border: 1px solid #e5e5ea;
-        border-radius: 10px;
-        margin-bottom: 10px;
-        overflow: hidden;
-        background: #fff;
-      }
-      .tabbit-collapse-header {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        padding: 10px 12px;
-        background: linear-gradient(135deg, rgba(139, 92, 246, .06), rgba(59, 130, 246, .04));
-        cursor: pointer;
-        user-select: none;
-        transition: background .2s;
-        border-bottom: 1px solid transparent;
-      }
-      .tabbit-collapse-header:hover {
-        background: linear-gradient(135deg, rgba(139, 92, 246, .1), rgba(59, 130, 246, .08));
-      }
-      .tabbit-collapse-header .tabbit-collapse-title {
-        font-weight: 700;
-        font-size: 13px;
+      .tabbit-body .md-table th:last-child,
+      .tabbit-body .md-table td:last-child,
+      .tabbit-msg-content .md-table th:last-child,
+      .tabbit-msg-content .md-table td:last-child { border-right: none; }
+      .tabbit-body .md-table thead th,
+      .tabbit-msg-content .md-table thead th {
+        background: linear-gradient(135deg, rgba(124, 58, 237, .12), rgba(59, 130, 246, .10));
         color: #5a43c8;
-        display: flex;
-        align-items: center;
-        gap: 6px;
+        font-weight: 700;
+        white-space: nowrap;
+        border-bottom: 2px solid rgba(124, 58, 237, .35);
       }
-      .tabbit-collapse-header .tabbit-collapse-arrow {
-        width: 20px;
-        height: 20px;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        transition: transform .25s ease;
-        color: #8b5cf6;
-        font-size: 12px;
+      .tabbit-body .md-table tbody tr:nth-child(even),
+      .tabbit-msg-content .md-table tbody tr:nth-child(even) {
+        background: rgba(139, 92, 246, .04);
       }
-      .tabbit-collapse.open > .tabbit-collapse-header {
-        border-bottom-color: #e5e5ea;
+      .tabbit-body .md-table tbody tr:hover,
+      .tabbit-msg-content .md-table tbody tr:hover {
+        background: rgba(124, 58, 237, .08);
       }
-      .tabbit-collapse.open > .tabbit-collapse-header .tabbit-collapse-arrow {
-        transform: rotate(90deg);
+      .tabbit-body .md-table tbody tr:last-child td,
+      .tabbit-msg-content .md-table tbody tr:last-child td {
+        border-bottom: none;
       }
-      .tabbit-collapse-content {
-        padding: 0;
-        max-height: 0;
-        overflow: hidden;
-        transition: max-height .3s ease, padding .3s ease;
+      .tabbit-body .md-table code,
+      .tabbit-msg-content .md-table code {
+        font-size: .85em;
+        padding: 1px 5px;
       }
-      .tabbit-collapse.open > .tabbit-collapse-content {
-        padding: 10px 12px;
-        max-height: 5000px;
+
+      .tabbit-cursor {
+        display: inline-block;
+        width: 6px; margin-left: 2px;
+        animation: tabbitBlink 1s steps(2, start) infinite;
+        color: #8b5cf6; font-weight: bold;
       }
-      .tabbit-collapse.open > .tabbit-collapse-header {
-        background: linear-gradient(135deg, rgba(139, 92, 246, .12), rgba(59, 130, 246, .08));
+      @keyframes tabbitBlink { to { visibility: hidden; } }
+
+      /* 📋 自动复制 toast（Shadow DOM 内） */
+      .tabbit-copy-toast {
+        pointer-events: none;
+        position: fixed;
+        bottom: 90px; right: 16px;
+        background: rgba(0, 0, 0, 0.82);
+        color: #fff;
+        padding: 8px 18px;
+        border-radius: 8px;
+        font-size: 13px;
+        z-index: 2147483647;
+        opacity: 0;
+        transform: translateY(8px);
+        transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        backdrop-filter: blur(4px);
+        font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
       }
-            /* 📌 加规则小卡片 */
+      .tabbit-copy-toast.show {
+        opacity: 1;
+        transform: translateY(0);
+      }
+      .tabbit-copy-ctx {
+        pointer-events: auto;
+        position: fixed;
+        z-index: 2147483647;
+        background: rgba(30, 30, 30, 0.95);
+        backdrop-filter: blur(8px);
+        border-radius: 10px;
+        padding: 10px 14px;
+        box-shadow: 0 4px 16px rgba(0,0,0,0.3);
+        font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+        min-width: 160px;
+        animation: tabbitCtxIn 0.15s ease-out;
+      }
+      @keyframes tabbitCtxIn {
+        from { opacity: 0; transform: scale(0.95); }
+        to   { opacity: 1; transform: scale(1); }
+      }
+      .tabbit-copy-ctx-row {
+        display: flex; align-items: center; gap: 8px;
+        color: #eee; font-size: 13px;
+        cursor: pointer; padding: 4px 0;
+        transition: color 0.15s;
+      }
+      .tabbit-copy-ctx-row:hover { color: #fff; }
+      .tabbit-copy-ctx-chk {
+        width: 14px; height: 14px;
+        border: 1.5px solid #888; border-radius: 3px;
+        display: flex; align-items: center; justify-content: center;
+        flex-shrink: 0; transition: all 0.15s ease;
+      }
+      .tabbit-copy-ctx-chk.on {
+        background: #4fc3f7; border-color: #4fc3f7;
+      }
+      .tabbit-copy-ctx-chk.on::after {
+        content: '';
+        display: block;
+        width: 4px; height: 7px;
+        border: solid #fff;
+        border-width: 0 1.5px 1.5px 0;
+        transform: rotate(45deg) translateY(-1px);
+      }
+      .tabbit-copy-ctx-hint {
+        margin-top: 6px; padding-top: 6px;
+        border-top: 1px solid rgba(255,255,255,0.1);
+        color: #888; font-size: 11px;
+      }
+
+      /* 📌 加规则小卡片 */
       #tabbit-addrule-card {
+        pointer-events: auto;
         position: fixed; inset: 0; z-index: 2147483647;
         display: flex; align-items: center; justify-content: center;
         font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
@@ -1551,159 +1633,202 @@
         padding: 1px 5px; border-radius: 3px;
         font-size: 11px; color: #be185d;
       }
-            /* ★ Markdown 表格样式（适配饺子 AI 面板配色） */
-      .tabbit-body .md-table-wrap,
-      .tabbit-msg-content .md-table-wrap {
-        overflow-x: auto;
-        margin: .8em 0;
-        border-radius: 8px;
-        border: 1px solid rgba(139, 92, 246, .25);
-        background: rgba(255, 255, 255, .6);
-      }
-      .tabbit-body .md-table,
-      .tabbit-msg-content .md-table {
-        width: 100%;
-        border-collapse: collapse;
-        font-size: .88em;
-        line-height: 1.55;
-      }
-      .tabbit-body .md-table th,
-      .tabbit-body .md-table td,
-      .tabbit-msg-content .md-table th,
-      .tabbit-msg-content .md-table td {
-        padding: 8px 12px;
-        border-bottom: 1px solid rgba(139, 92, 246, .15);
-        border-right: 1px solid rgba(139, 92, 246, .10);
-        vertical-align: top;
-        text-align: left;
-        word-break: break-word;
-      }
-      .tabbit-body .md-table th:last-child,
-      .tabbit-body .md-table td:last-child,
-      .tabbit-msg-content .md-table th:last-child,
-      .tabbit-msg-content .md-table td:last-child { border-right: none; }
-      .tabbit-body .md-table thead th,
-      .tabbit-msg-content .md-table thead th {
-        background: linear-gradient(135deg, rgba(124, 58, 237, .12), rgba(59, 130, 246, .10));
-        color: #5a43c8;
-        font-weight: 700;
-        white-space: nowrap;
-        border-bottom: 2px solid rgba(124, 58, 237, .35);
-      }
-      .tabbit-body .md-table tbody tr:nth-child(even),
-      .tabbit-msg-content .md-table tbody tr:nth-child(even) {
-        background: rgba(139, 92, 246, .04);
-      }
-      .tabbit-body .md-table tbody tr:hover,
-      .tabbit-msg-content .md-table tbody tr:hover {
-        background: rgba(124, 58, 237, .08);
-      }
-      .tabbit-body .md-table tbody tr:last-child td,
-      .tabbit-msg-content .md-table tbody tr:last-child td {
-        border-bottom: none;
-      }
-      .tabbit-body .md-table code,
-      .tabbit-msg-content .md-table code {
-        font-size: .85em;
-        padding: 1px 5px;
-      }
-              /* 🌊 流式光标 */
-      .tabbit-cursor {
-        display: inline-block;
-        width: 6px; margin-left: 2px;
-        animation: tabbitBlink 1s steps(2, start) infinite;
-        color: #8b5cf6; font-weight: bold;
-      }
-      @keyframes tabbitBlink { to { visibility: hidden; } }
 
-      .tabbit-copy-toast {
-        position: fixed;
-        bottom: 90px; right: 16px;
-        background: rgba(0, 0, 0, 0.82);
-        color: #fff;
-        padding: 8px 18px;
-        border-radius: 8px;
-        font-size: 13px;
-        z-index: 2147483647;
-        pointer-events: none;
-        opacity: 0;
-        transform: translateY(8px);
-        transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-        backdrop-filter: blur(4px);
-        font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
-      }
-      .tabbit-copy-toast.show {
-        opacity: 1;
-        transform: translateY(0);
-      }
-      .tabbit-copy-ctx {
-        position: fixed;
-        z-index: 2147483647;
-        background: rgba(30, 30, 30, 0.95);
-        backdrop-filter: blur(8px);
-        border-radius: 10px;
-        padding: 10px 14px;
-        box-shadow: 0 4px 16px rgba(0,0,0,0.3);
-        font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
-        min-width: 160px;
-        animation: tabbitCtxIn 0.15s ease-out;
-      }
-      @keyframes tabbitCtxIn {
-        from { opacity: 0; transform: scale(0.95); }
-        to   { opacity: 1; transform: scale(1); }
-      }
-      .tabbit-copy-ctx-row {
-        display: flex; align-items: center; gap: 8px;
-        color: #eee; font-size: 13px;
-        cursor: pointer; padding: 4px 0;
-        transition: color 0.15s;
-      }
-      .tabbit-copy-ctx-row:hover { color: #fff; }
-      .tabbit-copy-ctx-chk {
-        width: 14px; height: 14px;
-        border: 1.5px solid #888; border-radius: 3px;
+      /* 设置弹窗 */
+      #${SETTINGS_ID} {
+        pointer-events: auto;
+        position: fixed; inset: 0; z-index: 2147483647;
+        background: rgba(0,0,0,.45); backdrop-filter: blur(4px);
         display: flex; align-items: center; justify-content: center;
-        flex-shrink: 0; transition: all 0.15s ease;
       }
-      .tabbit-copy-ctx-chk.on {
-        background: #4fc3f7; border-color: #4fc3f7;
+      .tabbit-settings-content {
+        background: #fff; color: #222;
+        width: 600px; max-width: 96vw; max-height: 90vh; overflow-y: auto;
+        border-radius: 14px; padding: 18px 20px;
       }
-      .tabbit-copy-ctx-chk.on::after {
-        content: '';
-        display: block;
-        width: 4px; height: 7px;
-        border: solid #fff;
-        border-width: 0 1.5px 1.5px 0;
-        transform: rotate(45deg) translateY(-1px);
+      .tabbit-settings-header {
+        display: flex; justify-content: space-between; align-items: center;
+        font-weight: 700; font-size: 16px;
+        border-bottom: 1px solid #eee; padding-bottom: 10px; margin-bottom: 12px;
       }
-      .tabbit-copy-ctx-hint {
-        margin-top: 6px; padding-top: 6px;
-        border-top: 1px solid rgba(255,255,255,0.1);
-        color: #888; font-size: 11px;
+      .tabbit-section-title {
+        font-weight: 700; margin: 14px 0 6px; color: #5a43c8;
+        border-top: 1px dashed #e5e5ea; padding-top: 12px;
       }
+      .tabbit-help { display:block; color: #888; font-size: 12px; margin-bottom: 8px; line-height: 1.6; }
+      .tabbit-help code {
+        background: rgba(139,92,246,.12); padding: 1px 5px;
+        border-radius: 3px; font-size: 11px; color: #be185d;
+      }
+      .tabbit-field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px; font-size: 13px; }
+      .tabbit-field span { color: #555; font-weight: 600; }
+      .tabbit-field input, .tabbit-field textarea, .tabbit-field select {
+        border: 1px solid #ddd; border-radius: 8px; padding: 7px 9px; font-size: 13px;
+        font-family: inherit;
+      }
+      .tabbit-field small { color: #888; font-size: 11px; }
+      .tabbit-row-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+      .tabbit-row-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
+      .tabbit-profile-row {
+        display: flex; gap: 6px; margin-bottom: 12px; flex-wrap: wrap; align-items: center;
+      }
+      .tabbit-profile-select-wide {
+        flex: 1; min-width: 180px;
+        border: 1px solid #ddd; border-radius: 10px;
+        padding: 8px 9px; font-size: 13px; background: #fff;
+        font-weight: 600; color: #5a43c8;
+      }
+      .tabbit-sync-scope {
+        display: flex; flex-direction: column; gap: 4px;
+        padding: 8px 10px; background: #f9fafb;
+        border: 1px solid #e5e5ea; border-radius: 8px;
+        margin: 8px 0; font-size: 12px;
+      }
+      .tabbit-sync-scope-title { font-weight: 600; color: #5a43c8; margin-bottom: 2px; }
+      .tabbit-sync-scope label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+
+      .tabbit-settings-actions { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0; }
+      .tabbit-model-row {
+        display: grid;
+        grid-template-columns: 1.6fr .7fr .8fr auto auto;
+        gap: 6px; margin-bottom: 6px; align-items: center;
+      }
+      .tabbit-model-row input { padding: 5px 7px; font-size: 12px; border: 1px solid #ddd; border-radius: 6px; }
+      .tabbit-current-model { font-size: 11px; display: flex; align-items: center; gap: 3px; }
+      .tabbit-remove-model { background: #fee2e2; color: #b91c1c; border: none; border-radius: 6px; cursor: pointer; padding: 4px 8px; }
+      .tabbit-tpl-row {
+        display: grid;
+        grid-template-columns: 1.2fr 3fr auto auto;
+        gap: 6px; margin-bottom: 8px; align-items: start;
+      }
+      .tabbit-tpl-row input, .tabbit-tpl-row textarea {
+        border: 1px solid #ddd; border-radius: 6px; padding: 6px 8px; font-size: 12px; font-family: inherit;
+      }
+      .tabbit-tpl-row textarea { min-height: 60px; resize: vertical; }
+      .tabbit-tpl-default { font-size: 11px; display: flex; align-items: center; gap: 3px; }
+      .tabbit-rule-row {
+        display: grid;
+        grid-template-columns: 2fr 1.3fr auto;
+        gap: 6px; margin-bottom: 6px; align-items: center;
+      }
+      .tabbit-rule-row input, .tabbit-rule-row select {
+        padding: 5px 7px; font-size: 12px; border: 1px solid #ddd; border-radius: 6px;
+      }
+      .tabbit-modal-footer {
+        display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px;
+        padding-top: 12px; border-top: 1px solid #eee;
+      }
+
+      .tabbit-collapse {
+        border: 1px solid #e5e5ea;
+        border-radius: 10px;
+        margin-bottom: 10px;
+        overflow: hidden;
+        background: #fff;
+      }
+      .tabbit-collapse-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 10px 12px;
+        background: linear-gradient(135deg, rgba(139, 92, 246, .06), rgba(59, 130, 246, .04));
+        cursor: pointer;
+        user-select: none;
+        transition: background .2s;
+        border-bottom: 1px solid transparent;
+      }
+      .tabbit-collapse-header:hover {
+        background: linear-gradient(135deg, rgba(139, 92, 246, .1), rgba(59, 130, 246, .08));
+      }
+      .tabbit-collapse-header .tabbit-collapse-title {
+        font-weight: 700;
+        font-size: 13px;
+        color: #5a43c8;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .tabbit-collapse-header .tabbit-collapse-arrow {
+        width: 20px;
+        height: 20px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        transition: transform .25s ease;
+        color: #8b5cf6;
+        font-size: 12px;
+      }
+      .tabbit-collapse.open > .tabbit-collapse-header {
+        border-bottom-color: #e5e5ea;
+      }
+      .tabbit-collapse.open > .tabbit-collapse-header .tabbit-collapse-arrow {
+        transform: rotate(90deg);
+      }
+      .tabbit-collapse-content {
+        padding: 0;
+        max-height: 0;
+        overflow: hidden;
+        transition: max-height .3s ease, padding .3s ease;
+      }
+      .tabbit-collapse.open > .tabbit-collapse-content {
+        padding: 10px 12px;
+        max-height: 5000px;
+      }
+      .tabbit-collapse.open > .tabbit-collapse-header {
+        background: linear-gradient(135deg, rgba(139, 92, 246, .12), rgba(59, 130, 246, .08));
+      }
+
+      /* 🥟 浮动按钮（Shadow DOM 内） */
+      #${FLOAT_BTN_ID} {
+        pointer-events: auto;
+        position: fixed; z-index: 2147483646;
+        width: 44px; height: 44px; border-radius: 22px;
+        background: linear-gradient(135deg, #8b5cf6, #3b82f6);
+        color: white; font-size: 20px;
+        display: flex; align-items: center; justify-content: center;
+        cursor: pointer; box-shadow: 0 6px 20px rgba(0,0,0,.25);
+        user-select: none; transition: opacity .2s, transform .2s;
+      }
+      #${FLOAT_BTN_ID}:hover { opacity: 1 !important; transform: scale(1.08); }
+      #${FLOAT_BTN_ID}.dragging { transition: none !important; transform: scale(1.08); }
     `;
-    if (typeof GM_addStyle === 'function') GM_addStyle(css);
-    else {
-      const style = document.createElement('style');
-      style.id = STYLE_ID;
-      style.textContent = css;
-      document.head.appendChild(style);
-    }
+  }
+
+  function createExternalStyles() {
+    // 浮动按钮样式已移至 Shadow DOM 内的 createPanelStyles()
+    // 无需在主文档注入额外样式
+  }
+
+  function setupShadowDOM() {
+    shadowHost = document.createElement('div');
+    shadowHost.id = 'tabbit-shadow-host';
+    document.body.appendChild(shadowHost);
+    shadowRoot = shadowHost.attachShadow({ mode: 'open' });
+
+    // 注入面板样式到 Shadow DOM
+    const style = document.createElement('style');
+    style.textContent = createPanelStyles();
+    shadowRoot.appendChild(style);
+
+    // 创建容器
+    shadowContainer = document.createElement('div');
+    shadowContainer.id = 'tabbit-shadow-container';
+    shadowRoot.appendChild(shadowContainer);
   }
 
   /******************************************************************
-   * 11. 浮动按钮（任何网站点击都能打开 + 自动总结）
+   * 11. 浮动按钮
    ******************************************************************/
   let floatBtn = null;
 
   function createFloatButton() {
-    if (document.getElementById(FLOAT_BTN_ID)) return;
+    if (floatBtn) return;
     floatBtn = document.createElement('div');
     floatBtn.id = FLOAT_BTN_ID;
     floatBtn.title = '打开 AI 摘要（点击自动总结）';
     floatBtn.textContent = '🥟';
     floatBtn.style.opacity = config.floatButton.opacity;
-    document.body.appendChild(floatBtn);
+    shadowContainer.appendChild(floatBtn);
     applyFloatButtonPosition();
 
     let dragging = false, startX = 0, startY = 0, startLeft = 0, startTop = 0, moved = false;
@@ -1730,14 +1855,11 @@
         floatBtn.classList.remove('dragging');
         if (moved) {
           const rect = floatBtn.getBoundingClientRect();
-          // 保存相对于窗口右下角的偏移量，保证不同页面位置一致
           config.floatButton.offsetX = window.innerWidth - rect.right;
           config.floatButton.offsetY = window.innerHeight - rect.bottom;
-          // 清除旧的绝对坐标，确保下次用 offset 定位
           config.floatButton.x = null;
           config.floatButton.y = null;
           saveConfig();
-          // 阻止拖拽后的 click 事件
           const blocker = ev => { ev.stopPropagation(); ev.preventDefault(); floatBtn.removeEventListener('click', blocker, true); };
           floatBtn.addEventListener('click', blocker, true);
         }
@@ -1745,9 +1867,16 @@
     });
     floatBtn.addEventListener('click', () => {
       if (moved) return;
-      // 🚀 点击浮窗：如果面板关闭则打开+自动总结，已开则关闭
       if (!panelEl || panelEl.classList.contains('tabbit-hidden')) {
-        openPanel(true); // 自动总结
+        // 🆕 检查缓存：有缓存就恢复，没有才自动总结
+        const cached = loadConversationFromCache();
+        if (cached && cached.messages && cached.messages.length > 0 && conversation.filter(m => m.role !== 'system').length === 0) {
+          openPanel(false);
+          restoreConversationFromCache(cached);
+          setStatus('已恢复上次对话（点击「总结」重新生成）', 'ok', 3000);
+        } else {
+          openPanel(true);
+        }
       } else {
         closePanel();
       }
@@ -1757,13 +1886,11 @@
   function applyFloatButtonPosition() {
     if (!floatBtn) return;
     if (config.floatButton.offsetX != null && config.floatButton.offsetY != null) {
-      // 使用右下角偏移量定位，保证不同窗口大小下位置一致
       floatBtn.style.right = config.floatButton.offsetX + 'px';
       floatBtn.style.bottom = config.floatButton.offsetY + 'px';
       floatBtn.style.left = 'auto';
       floatBtn.style.top = 'auto';
     } else {
-      // 默认位置：右下角
       floatBtn.style.right = '12px';
       floatBtn.style.bottom = '80px';
       floatBtn.style.left = 'auto';
@@ -1771,34 +1898,31 @@
     }
   }
 
-  // 窗口大小变化时，确保悬浮按钮始终在可视区域内
   window.addEventListener('resize', () => {
-    const btn = document.getElementById(FLOAT_BTN_ID);
-    if (!btn || !btn.style.left) return; // 未拖拽过，用 right/bottom 定位，无需修正
-    const rect = btn.getBoundingClientRect();
+    if (!floatBtn || !floatBtn.style.left) return;
+    const rect = floatBtn.getBoundingClientRect();
     const maxLeft = window.innerWidth - 44;
     const maxTop = window.innerHeight - 44;
-    if (rect.left > maxLeft) btn.style.left = Math.max(0, maxLeft) + 'px';
-    if (rect.top > maxTop) btn.style.top = Math.max(0, maxTop) + 'px';
-    if (rect.left < 0) btn.style.left = '0px';
-    if (rect.top < 0) btn.style.top = '0px';
+    if (rect.left > maxLeft) floatBtn.style.left = Math.max(0, maxLeft) + 'px';
+    if (rect.top > maxTop) floatBtn.style.top = Math.max(0, maxTop) + 'px';
+    if (rect.left < 0) floatBtn.style.left = '0px';
+    if (rect.top < 0) floatBtn.style.top = '0px';
   });
 
   /******************************************************************
    * 11.5 📋 自动复制模块
    ******************************************************************/
-  const AC_MIN_LEN = 2;
-  const AC_COOLDOWN = 2000;
   let acLastCopyTime = 0;
   let acCtxEl = null;
   let acToastEl = null;
   let acToastTimer = null;
+  let acTempTimer = null;  // 🆕 临时自动复制计时器
 
   function acShowToast(text) {
     if (!acToastEl) {
       acToastEl = document.createElement('div');
       acToastEl.className = 'tabbit-copy-toast';
-      document.body.appendChild(acToastEl);
+      shadowContainer.appendChild(acToastEl);
     }
     clearTimeout(acToastTimer);
     acToastEl.textContent = text || '✅ 已复制';
@@ -1812,6 +1936,8 @@
     menu.className = 'tabbit-copy-ctx';
     const enabled = config.autoCopy?.enabled !== false;
     const withSrc = !!config.autoCopy?.withSource;
+    const tempMinutes = Number(config.acTempMinutes || 10);
+    const tempActive = !!acTempTimer;
     menu.innerHTML = `
       <div class="tabbit-copy-ctx-row" data-ac="toggle">
         <div class="tabbit-copy-ctx-chk ${enabled ? 'on' : ''}"></div>
@@ -1821,7 +1947,10 @@
         <div class="tabbit-copy-ctx-chk ${withSrc ? 'on' : ''}"></div>
         <span>附带出处信息</span>
       </div>
-      <div class="tabbit-copy-ctx-hint">快捷键 Alt+X</div>
+      <div class="tabbit-copy-ctx-row" data-ac="temp">
+        <div class="tabbit-copy-ctx-chk ${tempActive ? 'on' : ''}"></div>
+        <span>${tempActive ? '⏳ 临时开启中…' : '⏱ 临时开启 ' + tempMinutes + ' 分钟'}</span>
+      </div>
     `;
     if (floatBtn) {
       const rect = floatBtn.getBoundingClientRect();
@@ -1846,9 +1975,32 @@
         saveConfig();
         acBuildCtxMenu();
         acShowToast(config.autoCopy.withSource ? '📎 出处信息已开启' : '📄 出处信息已关闭');
+      } else if (row.dataset.ac === 'temp') {
+        if (acTempTimer) {
+          // 已在临时模式 → 关闭
+          clearTimeout(acTempTimer);
+          acTempTimer = null;
+          config.autoCopy.enabled = false;
+          saveConfig();
+          acBuildCtxMenu();
+          acShowToast('⏹ 临时自动复制已关闭');
+        } else {
+          // 开启临时模式
+          const minutes = Number(config.acTempMinutes || 10);
+          config.autoCopy.enabled = true;
+          saveConfig();
+          acTempTimer = setTimeout(() => {
+            acTempTimer = null;
+            config.autoCopy.enabled = false;
+            saveConfig();
+            acShowToast('⏱ ' + minutes + ' 分钟已到，自动复制已关闭');
+          }, minutes * 60 * 1000);
+          acBuildCtxMenu();
+          acShowToast('⏱ 已临时开启自动复制 ' + minutes + ' 分钟');
+        }
       }
     });
-    document.body.appendChild(menu);
+    shadowContainer.appendChild(menu);
     acCtxEl = menu;
   }
 
@@ -1868,8 +2020,10 @@
     if (acIsInsideEditable(document.activeElement)) return;
     const selection = window.getSelection();
     const text = selection.toString().trim();
-    if (!text || text.length < AC_MIN_LEN) return;
-    if (Date.now() - acLastCopyTime < AC_COOLDOWN) return;
+    const minLen = Number(config.acMinLen || 2);
+    if (!text || text.length < minLen) return;
+    const cooldown = Number(config.acCooldown || 2000);
+    if (Date.now() - acLastCopyTime < cooldown) return;
     acLastCopyTime = Date.now();
     let content = text;
     if (config.autoCopy?.withSource) {
@@ -1895,16 +2049,11 @@
       acSelTimer = setTimeout(() => {
         const sel = window.getSelection();
         const t = sel.toString().trim();
-        if (t.length >= AC_MIN_LEN) acCopySelectedText();
+        const minLen = Number(config.acMinLen || 2);
+        if (t.length >= minLen) acCopySelectedText();
       }, 500);
     });
     document.addEventListener('touchend', () => setTimeout(acCopySelectedText, 100));
-    document.addEventListener('keydown', e => {
-      if (e.altKey && e.key.toLowerCase() === 'x') {
-        e.preventDefault();
-        acToggleAutoCopy();
-      }
-    });
     document.addEventListener('click', acCloseCtxMenu);
     if (floatBtn) {
       floatBtn.addEventListener('contextmenu', e => {
@@ -1922,7 +2071,7 @@
   let panelEl = null;
 
   function createPanel() {
-    if (document.getElementById(PANEL_ID)) return;
+    if (panelEl) return;
     panelEl = document.createElement('div');
     panelEl.id = PANEL_ID;
     panelEl.classList.add('tabbit-hidden');
@@ -1937,7 +2086,7 @@
         </div>
       </div>
 
-        <div class="tabbit-toolbar">
+      <div class="tabbit-toolbar">
         <button id="tabbit-run-btn" class="tabbit-primary-btn">✨ 总结</button>
         <select id="tabbit-prompt-select" class="tabbit-prompt-select" title="选择提示词模板"></select>
         <button id="tabbit-preview-btn" class="tabbit-secondary-btn" title="预览抓取到的正文">👁</button>
@@ -1963,14 +2112,14 @@
 
       <div class="tabbit-resize-handle" id="tabbit-resize-handle" title="拖动调整大小"></div>
     `;
-    document.body.appendChild(panelEl);
+    shadowContainer.appendChild(panelEl);
 
     // 应用持久化的尺寸/位置
     panelEl.style.width = (config.panel?.width || 420) + 'px';
     if (config.panel?.height) {
       panelEl.style.height = config.panel.height + 'px';
     } else {
-      panelEl.style.height = ((config.panel?.heightRatio || 0.82) * 100) + 'vh';
+      panelEl.style.height = ((config.panel?.heightRatio || 0.8) * 100) + 'vh';
     }
     if (config.panel?.left != null && config.panel?.top != null) {
       panelEl.style.left = config.panel.left + 'px';
@@ -1988,7 +2137,6 @@
     panelEl.querySelector('#tabbit-clear-btn').addEventListener('click', handleClearConversation);
     panelEl.querySelector('#tabbit-send-btn').addEventListener('click', handleSendChat);
 
-    // 💬 输入框：Enter 发送，Shift+Enter 换行，自动伸高
     const input = panelEl.querySelector('#tabbit-chat-input');
     input.addEventListener('keydown', e => {
       if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
@@ -2064,7 +2212,17 @@
     if (!panelEl) createPanel();
     panelEl.classList.remove('tabbit-hidden');
     renderModelSelect();
-    if (autoRun) runSummary(true);
+    if (autoRun) {
+      // 🆕 有缓存就恢复，没有才自动总结
+      const cached = loadConversationFromCache();
+      const hasVisible = conversation.filter(m => m.role !== 'system').length > 0;
+      if (!hasVisible && cached && cached.messages && cached.messages.length > 0) {
+        restoreConversationFromCache(cached);
+        setStatus('已恢复上次对话（点击「总结」重新生成）', 'ok', 3000);
+      } else if (!hasVisible) {
+        runSummary(true);
+      }
+    }
   }
 
   function closePanel() {
@@ -2077,8 +2235,9 @@
   }
 
   function renderProfileSelect() {
-    if (!panelEl) return;
-    const select = panelEl.querySelector('#tabbit-profile-select');
+    const root = shadowRoot;
+    if (!root) return;
+    const select = root.querySelector('#tabbit-profile-select');
     if (!select) return;
     select.innerHTML = '';
     config.profiles.forEach(p => {
@@ -2095,9 +2254,10 @@
   }
 
   function renderModelSelect() {
-    if (!panelEl) return;
+    const root = shadowRoot;
+    if (!root) return;
     renderProfileSelect();
-    const select = panelEl.querySelector('#tabbit-model-select');
+    const select = root.querySelector('#tabbit-model-select');
     if (!select) return;
     const profile = getCurrentProfile();
     select.innerHTML = '';
@@ -2113,8 +2273,9 @@
   }
 
   function renderPromptSelect() {
-    if (!panelEl) return;
-    const select = panelEl.querySelector('#tabbit-prompt-select');
+    const root = shadowRoot;
+    if (!root) return;
+    const select = root.querySelector('#tabbit-prompt-select');
     if (!select) return;
     const matchedTpl = getTemplateForUrl(window.location.href);
     select.innerHTML = '';
@@ -2124,17 +2285,15 @@
       if (t.id === matchedTpl.id) opt.selected = true;
       select.appendChild(opt);
     });
-    // 🆕 切换提示词预设后追加总结（保留之前的对话内容，不修改全局默认提示词）
     select.onchange = function () {
       const tpl = config.promptTemplates.find(t => t.id === this.value);
       if (!tpl) return;
       setStatus(`已切换到「${tpl.name}」，正在追加总结…`, 'loading');
-      // 如果有正在进行的请求，先中断
       abortCurrentRequest();
-      // 稍延迟，确保中断完成后再发起追加总结
       setTimeout(() => runSummaryAppend(tpl), 100);
     };
   }
+
   /******************************************************************
    * 13. 📋 复制 / 🌱 flomo / 🗑 清空
    ******************************************************************/
@@ -2147,7 +2306,6 @@
     lines.push(`🔗 ${location.href}`);
     lines.push('');
 
-    // 找到第一条 AI 回复作为"总结"，后续作为"对话"
     const firstAiIdx = visible.findIndex(m => m.role === 'assistant');
     if (firstAiIdx >= 0) {
       lines.push('===== 🤖 AI 总结 =====');
@@ -2163,7 +2321,6 @@
         });
       }
     } else {
-      // 没有 AI 回复，只显示用户消息
       visible.forEach(m => {
         const tag = m.role === 'user' ? '【我】' : `【AI · ${m.meta?.model || ''}】`;
         lines.push(`${tag}\n${m.content}`);
@@ -2192,7 +2349,8 @@
     const tags = (config.flomoTags || '').trim();
     const content = tags ? `${text}\n\n---\n${tags}` : text;
 
-    const btn = panelEl.querySelector('#tabbit-flomo-btn');
+    const root = shadowRoot;
+    const btn = root?.querySelector('#tabbit-flomo-btn');
     if (btn) { btn.disabled = true; btn.textContent = '⏳'; }
     setStatus('正在发送到 flomo…', 'loading');
 
@@ -2234,6 +2392,7 @@
     const visibleCount = conversation.filter(m => m.role !== 'system').length;
     if (!visibleCount) { setStatus('对话已是空的', '', 1500); return; }
     if (!confirm(`确定清空当前 ${visibleCount} 条对话吗？\n（不会影响页面正文上下文，下次提问将基于当前页面重新开始）`)) return;
+    clearConversationCacheForCurrentUrl();
     resetConversation();
     setStatus('对话已清空', 'ok', 1500);
   }
@@ -2242,13 +2401,13 @@
    * 👁 预览抓取到的正文
    ******************************************************************/
   function showPagePreview() {
-    if (!panelEl) return;
+    const root = shadowRoot;
+    if (!root) return;
     const text = getPageText();
     const len = text.length;
     const max = Number(config.extractMaxChars || 16000);
 
-    // 把预览作为一条"系统提示"消息塞进对话区显示，但不进 conversation 上下文
-    const body = panelEl.querySelector('#tabbit-body');
+    const body = root.querySelector('#tabbit-body');
     if (!body) return;
 
     const previewHtml = `
@@ -2266,7 +2425,6 @@
       </div>
     `;
 
-    // 移除已有预览块，避免重复
     const old = body.querySelector('#tabbit-preview-block');
     if (old) old.remove();
 
@@ -2286,11 +2444,10 @@
   }
 
   /******************************************************************
-   * 📌 把当前网址快捷加入规则列表（小卡片版）
+   * 📌 把当前网址快捷加入规则列表
    ******************************************************************/
   function quickAddCurrentUrlToRules() {
-    // 已存在的卡片先关掉，避免叠加
-    document.getElementById('tabbit-addrule-card')?.remove();
+    shadowContainer.querySelector('#tabbit-addrule-card')?.remove();
 
     const origin = location.origin;
     const path = location.pathname;
@@ -2302,7 +2459,6 @@
       { label: '整站全部页面', desc: '范围最大', value: origin + '/*' }
     ];
 
-    // 当前已有的规则，标记一下
     const existing = new Set(config.urlRules);
 
     const card = document.createElement('div');
@@ -2318,7 +2474,7 @@
           🔗 ${escapeAttr(location.href)}
         </div>
         <div class="tabbit-addrule-list">
-          ${candidates.map((c, i) => `
+          ${candidates.map((c) => `
             <button class="tabbit-addrule-option ${existing.has(c.value) ? 'is-existing' : ''}"
                     data-pattern="${escapeAttr(c.value)}"
                     ${existing.has(c.value) ? 'disabled' : ''}>
@@ -2335,13 +2491,12 @@
         </div>
       </div>
     `;
-    document.body.appendChild(card);
+    shadowContainer.appendChild(card);
 
     const close = () => card.remove();
     card.querySelector('#tabbit-addrule-close').addEventListener('click', close);
     card.querySelector('.tabbit-addrule-mask').addEventListener('click', close);
 
-    // ESC 关闭
     const onKey = (e) => {
       if (e.key === 'Escape') { close(); document.removeEventListener('keydown', onKey); }
     };
@@ -2364,6 +2519,7 @@
       });
     });
   }
+
   /******************************************************************
    * 14. 总结 + 💬 连续对话
    ******************************************************************/
@@ -2372,8 +2528,9 @@
     if (panelEl.classList.contains('tabbit-hidden')) panelEl.classList.remove('tabbit-hidden');
     if (!checkApiConfig()) return;
 
-    const tplSelect = panelEl.querySelector('#tabbit-prompt-select');
-    const tplId = tplSelect.value;
+    const root = shadowRoot;
+    const tplSelect = root?.querySelector('#tabbit-prompt-select');
+    const tplId = tplSelect?.value;
     const template = config.promptTemplates.find(t => t.id === tplId) || getDefaultTemplate();
 
     const pageText = getPageText();
@@ -2388,18 +2545,16 @@
     const userPrompt = `请按以下要求总结当前页面：\n\n${template.text}`;
     conversation.push({ role: 'user', content: userPrompt, meta: { hidden: true } });
 
-    const runBtn = panelEl.querySelector('#tabbit-run-btn');
+    const runBtn = root?.querySelector('#tabbit-run-btn');
     runBtn.disabled = false;
     runBtn.textContent = '⏹ 停止';
     runBtn.onclick = abortCurrentRequest;
     setStatus(`使用「${template.name}」模板，模型 ${getCurrentModelDisplayName()}…`, 'loading');
 
-    // 🌊 流式占位
     const streamingMsg = { role: 'assistant', content: '', meta: { model: getCurrentModelDisplayName(), streaming: true } };
     conversation.push(streamingMsg);
     renderConversation();
 
-    // 节流渲染（避免每个 token 都全量重渲）
     let renderTimer = null;
     const scheduleRender = () => {
       if (renderTimer) return;
@@ -2420,10 +2575,10 @@
       streamingMsg.meta.streaming = false;
       if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
       renderConversation();
+      saveConversationToCache(); // 🆕 保存缓存
       setStatus('完成', 'ok', 1500);
     } catch (err) {
       if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
-      // 已有部分输出则保留 + 追加错误；否则替换
       if (streamingMsg.content) {
         streamingMsg.content += `\n\n❌ ${err.message || err}`;
       } else {
@@ -2439,10 +2594,6 @@
     }
   }
 
-  /**
-   * 🆕 追加总结：切换预设时调用，保留现有对话，用新模板追加一次总结
-   * 不修改 config.defaultPromptTemplateId（全局默认提示词只在设置窗口修改）
-   */
   async function runSummaryAppend(template) {
     if (!panelEl) createPanel();
     if (panelEl.classList.contains('tabbit-hidden')) panelEl.classList.remove('tabbit-hidden');
@@ -2458,7 +2609,8 @@
     const userPrompt = `请按以下要求重新总结当前页面（使用「${template.name}」风格）：\n\n${template.text}`;
     conversation.push({ role: 'user', content: userPrompt, meta: { hidden: true } });
 
-    const runBtn = panelEl.querySelector('#tabbit-run-btn');
+    const root = shadowRoot;
+    const runBtn = root?.querySelector('#tabbit-run-btn');
     runBtn.disabled = false;
     runBtn.textContent = '⏹ 停止';
     runBtn.onclick = abortCurrentRequest;
@@ -2488,6 +2640,7 @@
       streamingMsg.meta.streaming = false;
       if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
       renderConversation();
+      saveConversationToCache(); // 🆕 保存缓存
       setStatus('完成', 'ok', 1500);
     } catch (err) {
       if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
@@ -2507,10 +2660,11 @@
   }
 
   async function handleSendChat() {
-    if (!panelEl) return;
+    const root = shadowRoot;
+    if (!root) return;
     if (!checkApiConfig()) return;
-    const input = panelEl.querySelector('#tabbit-chat-input');
-    const sendBtn = panelEl.querySelector('#tabbit-send-btn');
+    const input = root.querySelector('#tabbit-chat-input');
+    const sendBtn = root.querySelector('#tabbit-send-btn');
     const text = (input.value || '').trim();
     if (!text) return;
 
@@ -2546,6 +2700,7 @@
       streamingMsg.meta.streaming = false;
       if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
       renderConversation();
+      saveConversationToCache(); // 🆕 保存缓存
       setStatus('完成', 'ok', 1200);
     } catch (err) {
       if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
@@ -2569,7 +2724,7 @@
   let settingsEl = null;
 
   function createSettingsModal() {
-    if (document.getElementById(SETTINGS_ID)) return;
+    if (settingsEl) return;
     settingsEl = document.createElement('div');
     settingsEl.id = SETTINGS_ID;
     settingsEl.classList.add('tabbit-hidden');
@@ -2661,7 +2816,7 @@
 
         <div class="tabbit-collapse">
           <div class="tabbit-collapse-header" data-collapse="toggle">
-            <span class="tabbit-collapse-title">🔧 通用</span>
+            <span class="tabbit-collapse-title">🔧 通用参数</span>
             <span class="tabbit-collapse-arrow">▶</span>
           </div>
           <div class="tabbit-collapse-content">
@@ -2669,8 +2824,33 @@
               <label class="tabbit-field"><span>面板宽度（px）</span>
                 <input id="tabbit-set-panel-width" type="number" min="320">
               </label>
+              <label class="tabbit-field"><span>面板高度比例</span>
+                <input id="tabbit-set-height-ratio" type="number" step="0.05" min="0.3" max="1">
+                <small>面板占视口高度的比例，默认 0.8（80%）</small>
+              </label>
+            </div>
+            <div class="tabbit-row-2">
               <label class="tabbit-field"><span>正文最大字符数</span>
                 <input id="tabbit-set-extract-max" type="number" min="2000">
+                <small>提取页面正文时的最大字符数，过大会占用 Token</small>
+              </label>
+              <label class="tabbit-field"><span>API 超时时间（ms）</span>
+                <input id="tabbit-set-api-timeout" type="number" min="10000" step="1000">
+                <small>请求超时时间，默认 120000（2 分钟）</small>
+              </label>
+            </div>
+            <div class="tabbit-row-3">
+              <label class="tabbit-field"><span>自动复制最短字数</span>
+                <input id="tabbit-set-ac-min-len" type="number" min="1">
+                <small>少于此字数不触发，默认 2</small>
+              </label>
+              <label class="tabbit-field"><span>冷却时间（ms）</span>
+                <input id="tabbit-set-ac-cooldown" type="number" min="500" step="100">
+                <small>两次复制间隔，默认 2000</small>
+              </label>
+              <label class="tabbit-field"><span>临时开启时长（分钟）</span>
+                <input id="tabbit-set-ac-temp-minutes" type="number" min="1" max="120">
+                <small>右键🥟临时开启，默认 10</small>
               </label>
             </div>
             <label class="tabbit-field">
@@ -2683,6 +2863,23 @@
               <input id="tabbit-set-flomo-tags" type="text" placeholder="#饺子AI摘要">
               <small>发送到 flomo 时自动追加在内容末尾，多个标签用空格分隔</small>
             </label>
+          </div>
+        </div>
+
+        <div class="tabbit-collapse">
+          <div class="tabbit-collapse-header" data-collapse="toggle">
+            <span class="tabbit-collapse-title">💬 对话缓存</span>
+            <span class="tabbit-collapse-arrow">▶</span>
+          </div>
+          <div class="tabbit-collapse-content">
+            <small class="tabbit-help">按页面 URL（路径）缓存对话历史到本地存储，刷新页面或 SPA 导航回来时自动恢复。防止对话丢失。</small>
+            <label class="tabbit-field"><span>最大缓存条目数</span>
+              <input id="tabbit-set-convo-cache-max" type="number" min="5" max="100">
+              <small>保留最近 N 个页面的对话，默认 20。超出时自动淘汰最旧的。</small>
+            </label>
+            <div class="tabbit-settings-actions">
+              <button id="tabbit-clear-convo-cache" class="tabbit-danger-btn" type="button">🗑️ 清空所有对话缓存</button>
+            </div>
           </div>
         </div>
 
@@ -2742,7 +2939,7 @@
         </div>
       </div>
     `;
-    document.body.appendChild(settingsEl);
+    shadowContainer.appendChild(settingsEl);
 
     settingsEl.querySelector('#tabbit-set-close').addEventListener('click', closeSettings);
     settingsEl.querySelector('#tabbit-set-cancel').addEventListener('click', closeSettings);
@@ -2779,11 +2976,16 @@
     settingsEl.querySelector('#tabbit-cloud-pull').addEventListener('click', handleCloudPull);
     settingsEl.querySelector('#tabbit-cloud-push').addEventListener('click', handleCloudPush);
     settingsEl.querySelector('#tabbit-cloud-force-push').addEventListener('click', handleCloudForcePush);
+    settingsEl.querySelector('#tabbit-clear-convo-cache').addEventListener('click', () => {
+      if (!confirm('确定清空所有对话缓存？此操作不可恢复。')) return;
+      try {
+        if (typeof GM_setValue === 'function') GM_setValue(CONVO_CACHE_KEY, '{}');
+      } catch (e) {}
+      alert('✅ 对话缓存已清空');
+    });
 
-    // 📦 折叠菜单交互
     settingsEl.querySelectorAll('.tabbit-collapse-header[data-collapse="toggle"]').forEach(header => {
       header.addEventListener('click', (e) => {
-        // 避免点击 header 内的按钮/输入框时触发展开
         if (e.target.tagName === 'BUTTON' || e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
         const collapse = header.closest('.tabbit-collapse');
         if (collapse) collapse.classList.toggle('open');
@@ -2850,12 +3052,18 @@
     settingsEl.querySelector('#tabbit-set-temperature').value = profile.temperature ?? 0.7;
     settingsEl.querySelector('#tabbit-set-max-tokens').value = profile.maxTokens ?? 2000;
     settingsEl.querySelector('#tabbit-set-panel-width').value = config.panel?.width || 460;
+    settingsEl.querySelector('#tabbit-set-height-ratio').value = config.panel?.heightRatio || 0.8;
     settingsEl.querySelector('#tabbit-set-extract-max').value = config.extractMaxChars || 16000;
+    settingsEl.querySelector('#tabbit-set-api-timeout').value = config.apiTimeout || 120000;
+    settingsEl.querySelector('#tabbit-set-ac-min-len').value = config.acMinLen || 2;
+    settingsEl.querySelector('#tabbit-set-ac-cooldown').value = config.acCooldown || 2000;
+    settingsEl.querySelector('#tabbit-set-ac-temp-minutes').value = config.acTempMinutes || 10;
     settingsEl.querySelector('#tabbit-set-auto-run').checked = !!config.autoRun;
     settingsEl.querySelector('#tabbit-set-flomo-api').value = config.flomoApiUrl || '';
     settingsEl.querySelector('#tabbit-set-flomo-tags').value = config.flomoTags || '#饺子AI摘要';
     settingsEl.querySelector('#tabbit-set-auto-copy').checked = config.autoCopy?.enabled !== false;
     settingsEl.querySelector('#tabbit-set-auto-copy-source').checked = !!config.autoCopy?.withSource;
+    settingsEl.querySelector('#tabbit-set-convo-cache-max').value = config.convoCacheMaxEntries || 20;
     settingsEl.querySelector('#tabbit-set-jgy-account').value = config.cloudSync?.account || '';
     settingsEl.querySelector('#tabbit-set-jgy-password').value = config.cloudSync?.appPassword || '';
 
@@ -3016,6 +3224,11 @@
     syncUrlRulesFromSettings();
     config.autoRun = settingsEl.querySelector('#tabbit-set-auto-run').checked;
     config.extractMaxChars = Number(settingsEl.querySelector('#tabbit-set-extract-max').value || 16000);
+    config.apiTimeout = Number(settingsEl.querySelector('#tabbit-set-api-timeout').value || 120000);
+    config.acMinLen = Number(settingsEl.querySelector('#tabbit-set-ac-min-len').value || 2);
+    config.acCooldown = Number(settingsEl.querySelector('#tabbit-set-ac-cooldown').value || 2000);
+    config.acTempMinutes = Number(settingsEl.querySelector('#tabbit-set-ac-temp-minutes').value || 10);
+    config.convoCacheMaxEntries = Number(settingsEl.querySelector('#tabbit-set-convo-cache-max').value || 20);
     config.flomoApiUrl = settingsEl.querySelector('#tabbit-set-flomo-api').value.trim();
     config.flomoTags = settingsEl.querySelector('#tabbit-set-flomo-tags').value.trim() || '#饺子AI摘要';
     config.autoCopy = {
@@ -3027,14 +3240,21 @@
       account: settingsEl.querySelector('#tabbit-set-jgy-account').value.trim(),
       appPassword: settingsEl.querySelector('#tabbit-set-jgy-password').value.trim()
     };
+    const newHeightRatio = Number(settingsEl.querySelector('#tabbit-set-height-ratio').value || 0.8);
     config.panel = {
       ...config.panel,
-      width: Math.max(320, Number(settingsEl.querySelector('#tabbit-set-panel-width').value || 460))
+      width: Math.max(320, Number(settingsEl.querySelector('#tabbit-set-panel-width').value || 460)),
+      heightRatio: Math.max(0.3, Math.min(1, newHeightRatio))
     };
     saveConfig();
     renderModelSelect();
     applyFloatButtonPosition();
-    if (panelEl) panelEl.style.width = config.panel.width + 'px';
+    if (panelEl) {
+      panelEl.style.width = config.panel.width + 'px';
+      if (!config.panel.height) {
+        panelEl.style.height = (config.panel.heightRatio * 100) + 'vh';
+      }
+    }
     closeSettings();
     setStatus('设置已保存', 'ok', 1200);
   }
@@ -3188,29 +3408,37 @@
   }
 
   /******************************************************************
-   * 19. 🔁 SPA 路由切换监听
+   * 19. 🔁 SPA 路由切换监听（仅路径级变动才重置）
    ******************************************************************/
-  let __lastUrl = location.href;
+  let __lastPathname = location.origin + location.pathname;
 
   function handleUrlChanged() {
-    const newUrl = location.href;
-    if (newUrl === __lastUrl) return;
-    __lastUrl = newUrl;
+    const currentPath = location.origin + location.pathname;
+    if (currentPath === __lastPathname) return; // Query/Hash 变了但路径没变 → 不重置
+    __lastPathname = currentPath;
 
-    // 🔁 SPA 路由切换：自动重置对话 + 重新检查规则
+    // 🆕 保存当前对话到缓存，再重置
+    saveConversationToCache();
+
     resetConversation('🔁 页面已切换，对话已重置。\n\n点击「✨ 总结」开始，或在下方直接提问。');
     renderPromptSelect();
 
-    if (config.autoRun && matchUrl(newUrl, config.urlRules)) {
+    // 🆕 尝试恢复目标页面的缓存对话
+    const cached = loadConversationFromCache();
+    if (cached && cached.messages && cached.messages.length > 0) {
+      setTimeout(() => {
+        if (!panelEl || panelEl.classList.contains('tabbit-hidden')) openPanel(false);
+        restoreConversationFromCache(cached);
+        setStatus('已恢复上次对话（点击「总结」重新生成）', 'ok', 3000);
+      }, 300);
+    } else if (config.autoRun && matchUrl(location.href, config.urlRules)) {
       setTimeout(() => openPanel(true), 600);
     }
   }
 
   function watchUrlChange() {
-    // 1. 轮询兜底
     setInterval(handleUrlChanged, 1000);
 
-    // 2. 拦截 history API（更即时）
     const origPush = history.pushState;
     const origReplace = history.replaceState;
     history.pushState = function (...args) {
@@ -3231,17 +3459,37 @@
    * 20. 入口
    ******************************************************************/
   function bootstrap() {
-    createStyles();
+    // 1. 初始化 Shadow DOM（必须最先执行）
+    setupShadowDOM();
+
+    // 2. 浮动按钮样式注入主文档
+    createExternalStyles();
+
+    // 3. 创建浮动按钮（Shadow DOM 内）
     createFloatButton();
+
+    // 4. 自动复制
     acInit();
+
+    // 5. 油猴菜单
     registerMenus();
 
-    // 📜 规则自动总结：首次加载即匹配
+    // 6. 规则自动总结：首次加载即匹配
     if (config.autoRun && matchUrl(location.href, config.urlRules)) {
-      setTimeout(() => openPanel(true), 800);
+      setTimeout(() => {
+        // 🆕 先检查缓存
+        const cached = loadConversationFromCache();
+        if (cached && cached.messages && cached.messages.length > 0) {
+          openPanel(false);
+          restoreConversationFromCache(cached);
+          setStatus('已恢复上次对话（点击「总结」重新生成）', 'ok', 3000);
+        } else {
+          openPanel(true);
+        }
+      }, 800);
     }
 
-    // 🔁 SPA 路由切换监听
+    // 7. SPA 路由切换监听
     watchUrlChange();
   }
 
