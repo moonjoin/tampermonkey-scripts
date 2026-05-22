@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         B站省流助手 - 字幕AI摘要 Pro
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      3.9.1
-// @description  自动提取B站视频字幕，通过自定义AI API生成极简摘要，支持模型切换、持续对话和评论区总结；支持自动解析开关、自动获取模型列表、flomo自动加标签，新增总结生图功能；v3.9.0 新增html PPT模式，可以作为生图模式平替
+// @version      4.0.0
+// @description  自动提取B站视频字幕，通过自定义AI API生成极简摘要，支持模型切换、持续对话和评论区总结；支持自动解析开关、自动获取模型列表、flomo自动加标签，新增总结生图功能；v3.9.0 新增html PPT模式；v4.0.0 新增新手引导和API兜底功能（无API时仍可下载字幕、一键复制提示词+字幕到其他AI）
 // @author       次元饺子
 // @match        https://www.bilibili.com/video/*
 // @match        https://www.bilibili.com/list/*
@@ -232,6 +232,135 @@
     const count = cache.order.length;
     const chars = cache.order.reduce((sum, key) => sum + ((cache.entries[key]?.summary || '').length), 0);
     return { count, chars };
+  }
+
+  // ==================== API 配置检测 ====================
+  function isApiConfigured() {
+    var url = normalizeApiUrlInput(CONFIG.apiUrl);
+    var key = String(CONFIG.apiKey || '').trim();
+    var defaultUrl = normalizeApiUrlInput(DEFAULT_CONFIG.apiUrl);
+    var defaultKey = String(DEFAULT_CONFIG.apiKey || '').trim();
+
+    if (!url || !key) {
+      return { configured: false, reason: 'API URL 或 API Key 未填写' };
+    }
+    if (url === defaultUrl) {
+      return { configured: false, reason: 'API URL 仍是默认占位符，请填写真实的 API 地址' };
+    }
+    if (key === defaultKey) {
+      return { configured: false, reason: 'API Key 仍是默认占位符，请填写真实的 API Key' };
+    }
+    return { configured: true, reason: '' };
+  }
+
+  /**
+   * 构建完整的"提示词+视频信息+字幕"文本，供用户一键复制到其他AI app
+   */
+  function buildPromptWithTranscript(videoInfo, transcript) {
+    var activePresetId = getCurrentPresetId();
+    var activePreset = (CONFIG.promptPresets || []).find(function(p) { return p.id === activePresetId; });
+    var activePrompt = (activePreset && activePreset.prompt) || CONFIG.promptText || PROMPT_TEXT;
+    var videoDesc = limitText(videoInfo.desc || '', 1500);
+    var pageUrl = window.location.href;
+
+    var parts = [];
+    parts.push('===== 📝 AI 提示词 =====');
+    parts.push(activePrompt);
+    parts.push('');
+    parts.push('===== 📺 视频信息 =====');
+    parts.push('视频URL: ' + pageUrl);
+    parts.push('视频标题: ' + (videoInfo.title || ''));
+    parts.push('UP主: ' + (videoInfo.upName || ''));
+    if (videoDesc) {
+      parts.push('视频简介: ' + videoDesc);
+    }
+    parts.push('');
+    parts.push('===== 📄 字幕内容 =====');
+    parts.push(transcript);
+    parts.push('');
+    parts.push('===== 💡 使用说明 =====');
+    parts.push('请将以上全部内容复制粘贴到任意 AI 对话（如 ChatGPT、DeepSeek、Kimi 等），即可生成视频摘要。');
+    return parts.join('\n');
+  }
+
+  /**
+   * 显示 API 未配置时的兜底 UI：提供下载字幕和一键复制提示词+字幕的功能
+   */
+  function showApiNotConfiguredFallback(contentDiv, videoInfo, reason) {
+    var apiCheck = reason || isApiConfigured().reason;
+    var actionsDiv = contentDiv.querySelector('.tabbit-result-actions');
+
+    var fallbackHtml =
+      '<div style="background:linear-gradient(135deg,#fff3e0 0%,#fff8e1 100%);border:1px solid #ffe0b2;border-radius:10px;padding:14px;margin-bottom:10px;">' +
+        '<div style="font-size:14px;font-weight:600;color:#e65100;margin-bottom:8px;">⚠️ API 未配置或配置错误</div>' +
+        '<div style="font-size:12.5px;color:#bf360c;line-height:1.6;margin-bottom:10px;">' +
+          escapeHtml(apiCheck) + '<br>' +
+          '但别担心！字幕已成功获取，你仍可以：<br>' +
+          '① 一键复制下方内容，粘贴到任意 AI 对话框生成摘要<br>' +
+          '② 直接下载字幕文件留作备份' +
+        '</div>' +
+        '<div style="display:flex;gap:8px;flex-wrap:wrap;">' +
+          '<button class="tabbit-copy-btn" id="tabbit-copy-prompt-transcript" style="background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:white;border:none;font-weight:600;">📋 一键复制 提示词+字幕</button>' +
+          '<button class="tabbit-download-btn" id="tabbit-download-transcript-fallback">💾 下载字幕文件</button>' +
+        '</div>' +
+        '<div style="font-size:11px;color:#999;margin-top:8px;">💡 复制后打开 ChatGPT / DeepSeek / Kimi 等任意 AI，粘贴发送即可获得视频摘要</div>' +
+      '</div>' +
+      '<button class="tabbit-settings-btn tabbit-settings-btn-primary" id="tabbit-open-settings-fallback" style="width:100%;margin-top:6px;padding:10px;font-size:14px;">⚙️ 去配置 API（自动总结）</button>';
+
+    var resultContainer = contentDiv.querySelector('.tabbit-result');
+    if (resultContainer) {
+      resultContainer.innerHTML = fallbackHtml;
+    }
+
+    if (actionsDiv) {
+      actionsDiv.innerHTML = '';
+      var modelTag = document.createElement('span');
+      modelTag.style.cssText = 'font-size:11px;color:#999;margin-left:auto;';
+      modelTag.textContent = '📌 v4.0 兜底模式';
+      actionsDiv.appendChild(modelTag);
+    }
+
+    // 绑定一键复制按钮
+    var copyBtn = contentDiv.querySelector('#tabbit-copy-prompt-transcript');
+    if (copyBtn) {
+      copyBtn.addEventListener('click', function() {
+        var promptText = buildPromptWithTranscript(videoInfo, rawTranscript);
+        copyToClipboard(promptText).then(function() {
+          copyBtn.textContent = '✅ 已复制！去 AI 粘贴吧';
+          copyBtn.style.background = 'linear-gradient(135deg,#43a047 0%,#2e7d32 100%)';
+          setTimeout(function() {
+            copyBtn.textContent = '📋 一键复制 提示词+字幕';
+            copyBtn.style.background = 'linear-gradient(135deg,#667eea 0%,#764ba2 100%)';
+          }, 3000);
+        });
+      });
+    }
+
+    // 绑定下载字幕按钮
+    var downloadBtn = contentDiv.querySelector('#tabbit-download-transcript-fallback');
+    if (downloadBtn) {
+      downloadBtn.addEventListener('click', function() {
+        downloadTranscript(rawTranscript, videoInfo.title, videoInfo.upName, videoInfo.bvid);
+      });
+    }
+
+    // 绑定去设置按钮
+    var settingsBtn = contentDiv.querySelector('#tabbit-open-settings-fallback');
+    if (settingsBtn) {
+      settingsBtn.addEventListener('click', function() {
+        var panel = contentDiv.closest('#tabbit-ai-summary-panel');
+        if (panel) openSettingsPanel(panel);
+      });
+    }
+
+    // 启用评论区按钮和模型芯片
+    var panel = contentDiv.closest('#tabbit-ai-summary-panel');
+    if (panel) {
+      panel.querySelectorAll('.tabbit-model-chip').forEach(function(c) { c.classList.remove('disabled'); });
+      panel.querySelectorAll('.tabbit-preset-chip').forEach(function(c) { c.classList.remove('disabled'); });
+      var commentBtn = contentDiv.querySelector('#tabbit-comment-btn');
+      if (commentBtn) commentBtn.disabled = false;
+    }
   }
 
   let CONFIG = loadConfig();
@@ -4530,6 +4659,14 @@
     contentDiv._tabbitSummaryText = '';
     contentDiv._tabbitHtmlPptDirectPrompt = '';
     contentDiv._tabbitHtmlPptDirectFallback = '';
+
+    // 🆕 v4.0 检测 API 配置：未配置或填错时显示兜底 UI（仍保留下载字幕+一键复制功能）
+    var apiCheck = isApiConfigured();
+    if (!apiCheck.configured) {
+      console.log('[省流助手] API 未配置，显示兜底模式');
+      showApiNotConfiguredFallback(contentDiv, videoInfo, apiCheck.reason);
+      return;
+    }
 
     if (useHtmlPptDirect) {
       abortCurrentTask();
