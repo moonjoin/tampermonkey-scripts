@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         饺子 AI 网页摘要助手
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      2.8.0
-// @description  指定网站自动弹出 AI 网页摘要，支持连续对话、多预设、多模板、SPA路由，flomo、坚果云双文件云同步。Shadow DOM 隔离样式，对话本地缓存。
+// @version      2.8.1
+// @description  指定网站自动弹出 AI 网页摘要，支持连续对话、多预设、多模板、SPA路由，flomo、坚果云双文件云同步。Shadow DOM 隔离样式。
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
 // @match        *://*/*
@@ -30,9 +30,6 @@
   const FLOAT_BTN_ID = 'tabbit-ai-float-btn';
   const SETTINGS_ID = 'tabbit-ai-settings';
   const STYLE_ID = 'tabbit-ai-style';
-
-  // 💬 对话缓存
-  const CONVO_CACHE_KEY = 'tabbit_ai_conversation_cache';
 
   // Shadow DOM 宿主 & 根
   let shadowHost = null;
@@ -88,12 +85,11 @@
     cloudSync: { account: '', appPassword: '', lastSyncAt: 0, lastSyncDirection: '' },
     autoCopy: { enabled: true, withSource: false },
     flomoTags: '#饺子AI摘要',
-    // 🆕 可调参数
-    apiTimeout: 120000,
-    acCooldown: 2000,
-    acMinLen: 2,
-    acTempMinutes: 10,
-    convoCacheMaxEntries: 20
+  // 🆕 可调参数
+  apiTimeout: 120000,
+  acCooldown: 2000,
+  acMinLen: 2,
+  acTempMinutes: 10
   };
 
   function clone(obj) { return JSON.parse(JSON.stringify(obj)); }
@@ -410,7 +406,6 @@
     result.acCooldown = Number(result.acCooldown || 2000);
     result.acMinLen = Number(result.acMinLen || 2);
     result.acTempMinutes = Number(result.acTempMinutes || 10);
-    result.convoCacheMaxEntries = Number(result.convoCacheMaxEntries || 20);
 
     return result;
   }
@@ -822,74 +817,6 @@
    ******************************************************************/
   let conversation = [];
   let pageContextLoaded = false;
-
-  // —— 对话缓存 ——
-  function getConvoCacheKey() {
-    return location.origin + location.pathname;
-  }
-
-  function saveConversationToCache() {
-    try {
-      if (typeof GM_setValue !== 'function') return;
-      const visibleMsgs = conversation.filter(m => m.role !== 'system' && !m.meta?.hidden && !m.meta?.streaming);
-      if (!visibleMsgs.length) return;
-      const key = getConvoCacheKey();
-      let cache = {};
-      try { cache = JSON.parse(GM_getValue(CONVO_CACHE_KEY, '{}')); } catch (e) { cache = {}; }
-      const entry = {
-        messages: visibleMsgs.map(m => ({ role: m.role, content: m.content, meta: { model: m.meta?.model } })),
-        title: document.title,
-        url: location.href,
-        updatedAt: Date.now()
-      };
-      // 太大就跳过
-      if (JSON.stringify(entry).length > 80000) return;
-      cache[key] = entry;
-      // 淘汰超限条目
-      const maxEntries = Number(config.convoCacheMaxEntries || 20);
-      const keys = Object.keys(cache);
-      if (keys.length > maxEntries) {
-        keys.sort((a, b) => (cache[b].updatedAt || 0) - (cache[a].updatedAt || 0));
-        keys.slice(maxEntries).forEach(k => delete cache[k]);
-      }
-      GM_setValue(CONVO_CACHE_KEY, JSON.stringify(cache));
-    } catch (e) {
-      console.warn('[饺子 AI] 对话缓存保存失败：', e);
-    }
-  }
-
-  function loadConversationFromCache() {
-    try {
-      if (typeof GM_getValue !== 'function') return null;
-      const key = getConvoCacheKey();
-      let cache = {};
-      try { cache = JSON.parse(GM_getValue(CONVO_CACHE_KEY, '{}')); } catch (e) { return null; }
-      return cache[key] || null;
-    } catch (e) { return null; }
-  }
-
-  function clearConversationCacheForCurrentUrl() {
-    try {
-      if (typeof GM_setValue !== 'function') return;
-      const key = getConvoCacheKey();
-      let cache = {};
-      try { cache = JSON.parse(GM_getValue(CONVO_CACHE_KEY, '{}')); } catch (e) { return; }
-      delete cache[key];
-      GM_setValue(CONVO_CACHE_KEY, JSON.stringify(cache));
-    } catch (e) {}
-  }
-
-  function restoreConversationFromCache(cached) {
-    if (!cached || !Array.isArray(cached.messages) || !cached.messages.length) return false;
-    conversation = [];
-    pageContextLoaded = false;
-    ensurePageContext();
-    cached.messages.forEach(m => {
-      conversation.push({ role: m.role, content: m.content, meta: m.meta || {} });
-    });
-    renderConversation();
-    return true;
-  }
 
   // —— 对话核心 ——
   function resetConversation(reason) {
@@ -1868,15 +1795,7 @@
     floatBtn.addEventListener('click', () => {
       if (moved) return;
       if (!panelEl || panelEl.classList.contains('tabbit-hidden')) {
-        // 🆕 检查缓存：有缓存就恢复，没有才自动总结
-        const cached = loadConversationFromCache();
-        if (cached && cached.messages && cached.messages.length > 0 && conversation.filter(m => m.role !== 'system').length === 0) {
-          openPanel(false);
-          restoreConversationFromCache(cached);
-          setStatus('已恢复上次对话（点击「总结」重新生成）', 'ok', 3000);
-        } else {
-          openPanel(true);
-        }
+        openPanel(true);
       } else {
         closePanel();
       }
@@ -2213,13 +2132,8 @@
     panelEl.classList.remove('tabbit-hidden');
     renderModelSelect();
     if (autoRun) {
-      // 🆕 有缓存就恢复，没有才自动总结
-      const cached = loadConversationFromCache();
       const hasVisible = conversation.filter(m => m.role !== 'system').length > 0;
-      if (!hasVisible && cached && cached.messages && cached.messages.length > 0) {
-        restoreConversationFromCache(cached);
-        setStatus('已恢复上次对话（点击「总结」重新生成）', 'ok', 3000);
-      } else if (!hasVisible) {
+      if (!hasVisible) {
         runSummary(true);
       }
     }
@@ -2392,7 +2306,6 @@
     const visibleCount = conversation.filter(m => m.role !== 'system').length;
     if (!visibleCount) { setStatus('对话已是空的', '', 1500); return; }
     if (!confirm(`确定清空当前 ${visibleCount} 条对话吗？\n（不会影响页面正文上下文，下次提问将基于当前页面重新开始）`)) return;
-    clearConversationCacheForCurrentUrl();
     resetConversation();
     setStatus('对话已清空', 'ok', 1500);
   }
@@ -2575,7 +2488,6 @@
       streamingMsg.meta.streaming = false;
       if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
       renderConversation();
-      saveConversationToCache(); // 🆕 保存缓存
       setStatus('完成', 'ok', 1500);
     } catch (err) {
       if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
@@ -2640,7 +2552,6 @@
       streamingMsg.meta.streaming = false;
       if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
       renderConversation();
-      saveConversationToCache(); // 🆕 保存缓存
       setStatus('完成', 'ok', 1500);
     } catch (err) {
       if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
@@ -2700,7 +2611,6 @@
       streamingMsg.meta.streaming = false;
       if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
       renderConversation();
-      saveConversationToCache(); // 🆕 保存缓存
       setStatus('完成', 'ok', 1200);
     } catch (err) {
       if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
@@ -2866,22 +2776,6 @@
           </div>
         </div>
 
-        <div class="tabbit-collapse">
-          <div class="tabbit-collapse-header" data-collapse="toggle">
-            <span class="tabbit-collapse-title">💬 对话缓存</span>
-            <span class="tabbit-collapse-arrow">▶</span>
-          </div>
-          <div class="tabbit-collapse-content">
-            <small class="tabbit-help">按页面 URL（路径）缓存对话历史到本地存储，刷新页面或 SPA 导航回来时自动恢复。防止对话丢失。</small>
-            <label class="tabbit-field"><span>最大缓存条目数</span>
-              <input id="tabbit-set-convo-cache-max" type="number" min="5" max="100">
-              <small>保留最近 N 个页面的对话，默认 20。超出时自动淘汰最旧的。</small>
-            </label>
-            <div class="tabbit-settings-actions">
-              <button id="tabbit-clear-convo-cache" class="tabbit-danger-btn" type="button">🗑️ 清空所有对话缓存</button>
-            </div>
-          </div>
-        </div>
 
         <div class="tabbit-collapse">
           <div class="tabbit-collapse-header" data-collapse="toggle">
@@ -2976,13 +2870,6 @@
     settingsEl.querySelector('#tabbit-cloud-pull').addEventListener('click', handleCloudPull);
     settingsEl.querySelector('#tabbit-cloud-push').addEventListener('click', handleCloudPush);
     settingsEl.querySelector('#tabbit-cloud-force-push').addEventListener('click', handleCloudForcePush);
-    settingsEl.querySelector('#tabbit-clear-convo-cache').addEventListener('click', () => {
-      if (!confirm('确定清空所有对话缓存？此操作不可恢复。')) return;
-      try {
-        if (typeof GM_setValue === 'function') GM_setValue(CONVO_CACHE_KEY, '{}');
-      } catch (e) {}
-      alert('✅ 对话缓存已清空');
-    });
 
     settingsEl.querySelectorAll('.tabbit-collapse-header[data-collapse="toggle"]').forEach(header => {
       header.addEventListener('click', (e) => {
@@ -3063,7 +2950,6 @@
     settingsEl.querySelector('#tabbit-set-flomo-tags').value = config.flomoTags || '#饺子AI摘要';
     settingsEl.querySelector('#tabbit-set-auto-copy').checked = config.autoCopy?.enabled !== false;
     settingsEl.querySelector('#tabbit-set-auto-copy-source').checked = !!config.autoCopy?.withSource;
-    settingsEl.querySelector('#tabbit-set-convo-cache-max').value = config.convoCacheMaxEntries || 20;
     settingsEl.querySelector('#tabbit-set-jgy-account').value = config.cloudSync?.account || '';
     settingsEl.querySelector('#tabbit-set-jgy-password').value = config.cloudSync?.appPassword || '';
 
@@ -3228,7 +3114,6 @@
     config.acMinLen = Number(settingsEl.querySelector('#tabbit-set-ac-min-len').value || 2);
     config.acCooldown = Number(settingsEl.querySelector('#tabbit-set-ac-cooldown').value || 2000);
     config.acTempMinutes = Number(settingsEl.querySelector('#tabbit-set-ac-temp-minutes').value || 10);
-    config.convoCacheMaxEntries = Number(settingsEl.querySelector('#tabbit-set-convo-cache-max').value || 20);
     config.flomoApiUrl = settingsEl.querySelector('#tabbit-set-flomo-api').value.trim();
     config.flomoTags = settingsEl.querySelector('#tabbit-set-flomo-tags').value.trim() || '#饺子AI摘要';
     config.autoCopy = {
@@ -3417,21 +3302,10 @@
     if (currentPath === __lastPathname) return; // Query/Hash 变了但路径没变 → 不重置
     __lastPathname = currentPath;
 
-    // 🆕 保存当前对话到缓存，再重置
-    saveConversationToCache();
-
     resetConversation('🔁 页面已切换，对话已重置。\n\n点击「✨ 总结」开始，或在下方直接提问。');
     renderPromptSelect();
 
-    // 🆕 尝试恢复目标页面的缓存对话
-    const cached = loadConversationFromCache();
-    if (cached && cached.messages && cached.messages.length > 0) {
-      setTimeout(() => {
-        if (!panelEl || panelEl.classList.contains('tabbit-hidden')) openPanel(false);
-        restoreConversationFromCache(cached);
-        setStatus('已恢复上次对话（点击「总结」重新生成）', 'ok', 3000);
-      }, 300);
-    } else if (config.autoRun && matchUrl(location.href, config.urlRules)) {
+    if (config.autoRun && matchUrl(location.href, config.urlRules)) {
       setTimeout(() => openPanel(true), 600);
     }
   }
@@ -3476,17 +3350,7 @@
 
     // 6. 规则自动总结：首次加载即匹配
     if (config.autoRun && matchUrl(location.href, config.urlRules)) {
-      setTimeout(() => {
-        // 🆕 先检查缓存
-        const cached = loadConversationFromCache();
-        if (cached && cached.messages && cached.messages.length > 0) {
-          openPanel(false);
-          restoreConversationFromCache(cached);
-          setStatus('已恢复上次对话（点击「总结」重新生成）', 'ok', 3000);
-        } else {
-          openPanel(true);
-        }
-      }, 800);
+      setTimeout(() => openPanel(true), 800);
     }
 
     // 7. SPA 路由切换监听
