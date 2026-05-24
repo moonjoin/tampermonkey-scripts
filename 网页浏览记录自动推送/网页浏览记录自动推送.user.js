@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name        网页浏览记录助手
 // @namespace   https://github.com/moonjoin/tampermonkey-scripts
-// @version     1.5
+// @version     1.6
 // @description  浏览记录自动存储 + 多渠道网页推送 + AI 浏览行为分析（多时间段），支持坚果云增量云同步（和饺子AI网页摘要助手+Folo网站增强工具数据互通）
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
@@ -706,7 +706,44 @@
 2. **核心关注主题**：从高频访问内容中提炼用户最在意的话题
 3. **行动建议**：这些反复查看的内容可能意味着用户在做决策或深入研究，给出相关建议` },
     { id: 'free', icon: '💡', name: '自由提问', desc: '基于浏览记录自由对话',
-      prompt: `你是一位智能助手。以下是用户最近的浏览记录（共 {count} 条），你可以基于这些数据回答用户的任何问题。请先简要总结浏览记录概况，然后等待用户提问。` }
+      prompt: `你是一位智能助手。以下是用户最近的浏览记录（共 {count} 条），你可以基于这些数据回答用户的任何问题。请先简要总结浏览记录概况，然后等待用户提问。` },
+    { id: 'profile', icon: '👤', name: '用户画像', desc: '生成结构化偏好画像文档',
+      prompt: `你是用户的行为画像师。根据以下浏览记录，输出一份简洁的「用户偏好画像」。
+
+要求：
+- 只输出事实，不写分析过程、不写依据、不写建议
+- 没有数据支撑的维度直接跳过，不要编造
+- 判断"喜欢"的标准：访问次数多 + 停留时间长
+- 判断"深度阅读"的标准：单次停留超过 3 分钟
+- 判断"快速浏览"的标准：单次停留不足 1 分钟
+
+输出格式：
+
+# 用户偏好画像
+
+## 兴趣领域
+- 领域名（具体关注内容）
+
+## 阅读偏好
+- 喜欢：xxx
+- 阅读深度：深度阅读型 / 快速浏览型
+
+## 工具偏好
+- 工具A > 工具B（按使用频率排序）
+
+## 时间模式
+- 高频活跃时段：HH:MM - HH:MM
+- 工作时段偏好 xxx，休闲时段偏好 xxx（无法区分则跳过此项）
+
+## 内容优先级
+1. xxx
+2. xxx
+
+## 信息来源
+- 主要渠道（按占比排序）
+
+## 当前聚焦
+- 近期集中关注的主题（无明显聚集则跳过）` }
   ];
 
   function buildAnalysisPrompt(records, timeRangeDesc, templateId) {
@@ -754,7 +791,7 @@ ${lines}`;
     if (!checkApiConfig()) return;
     if (!records?.length) { toast('没有记录可分析'); return; }
     conversation = [];
-    conversation.push({ role: 'system', content: buildAnalysisPrompt(records, timeRangeDesc) });
+    conversation.push({ role: 'system', content: buildAnalysisPrompt(records, timeRangeDesc, templateId || 'summary') });
     conversation.push({ role: 'user', content: `请分析以上 ${records.length} 条浏览记录，给出详细的分析报告。`, meta: { hidden: true } });
     renderConversation();
     await streamChat({
@@ -1297,7 +1334,7 @@ ${lines}`;
         switchTab('analysis'); toast(`📢 你有 ${unreadCount} 条新记录`);
         setTimeout(() => {
           if (confirm(`你有 ${unreadCount} 条新浏览记录，是否立即让 AI 分析？`)) {
-            runAnalysis(historyStore.records.filter(r => isUnread(r)), `最近${formatDate(Date.now())}`);
+            runAnalysis(historyStore.records.filter(r => isUnread(r)), `最近${formatDate(Date.now())}`, 'summary');
           } else { markAllAsRead(); updateBadge(); refreshHistoryTab(); }
         }, 300);
       }
@@ -2243,7 +2280,7 @@ ${lines}`;
     if (typeof GM_registerMenuCommand === 'function') {
       GM_registerMenuCommand('打开面板', () => { const panel = document.getElementById(UI.panelId); if (panel) { panel.classList.add('show'); cfg = loadConfig(); refreshHistoryTab(); updateBadge(); } });
       GM_registerMenuCommand('立即推送当前页', () => pushCurrentPage({ force: true, showToast: true }));
-      GM_registerMenuCommand('分析未读记录', () => { const panel = document.getElementById(UI.panelId); if (panel) panel.classList.add('show'); switchTab('analysis'); const unread = historyStore.records.filter(r => isUnread(r)); if (unread.length && cfg.profiles?.[0]?.apiKey) runAnalysis(unread, '最近未读记录'); else toast(unread.length ? '请先配置 API' : '没有未读记录'); });
+      GM_registerMenuCommand('分析未读记录', () => { const panel = document.getElementById(UI.panelId); if (panel) panel.classList.add('show'); switchTab('analysis'); const unread = historyStore.records.filter(r => isUnread(r)); if (unread.length && cfg.profiles?.[0]?.apiKey) runAnalysis(unread, '最近未读记录', 'summary'); else toast(unread.length ? '请先配置 API' : '没有未读记录'); });
     }
     if (typeof requestIdleCallback === 'function') requestIdleCallback(() => cleanExpiredRecords()); else setTimeout(cleanExpiredRecords, 5000);
     // 定时自动同步（按配置间隔，仅在配置了坚果云时生效）

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站省流助手 - 字幕AI摘要 Pro
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      4.0.0
+// @version      4.1.0
 // @description  自动提取B站视频字幕，通过自定义AI API生成极简摘要，支持模型切换、持续对话和评论区总结；支持自动解析开关、自动获取模型列表、flomo自动加标签，新增总结生图功能；v3.9.0 新增html PPT模式；v4.0.0 新增新手引导和API兜底功能（无API时仍可下载字幕、一键复制提示词+字幕到其他AI）
 // @author       次元饺子
 // @match        https://www.bilibili.com/video/*
@@ -21,7 +21,10 @@
 
   const COMMENT_PROMPT_TEXT = '你是一个专业的评论分析助手。请对以下B站视频评论进行总结分析，包括：\n1. 评论整体情感倾向（正面/负面/中性）\n2. 主要讨论话题（列出3-5个）\n3. 有趣/高赞评论摘录\n4. 我理解能力差、没耐心，别讲铺垫、别讲背景、别讲废话，只告诉我：这东西核心结论是什么、有哪几个关键点、对我有什么用。';
 
+  const DANMAKU_PROMPT_TEXT = '你是一个专业的弹幕分析助手。请对以下B站视频弹幕进行总结分析，包括：\n1. 弹幕整体情感倾向（正面/负面/中性/混合）\n2. 弹幕讨论的热点话题（列出3-5个）\n3. 高频出现的关键词或梗\n4. 观众对视频内容的反应（哪些片段引发热烈讨论）\n5. 有趣/有代表性的弹幕摘录\n6. 我理解能力差、没耐心，别讲铺垫、别讲背景、别讲废话，只告诉我：这东西核心结论是什么、有哪几个关键点、对我有什么用。';
+
   const IMAGE_GEN_PROMPT_TEXT = '根据以下视频内容总结，生成一张信息可视化的精美配图，风格清晰美观，适合作为视频总结的封面图：\n\n{summary}';
+  const COPY_IMAGE_PROMPT_PRESET = '根据以下视频内容总结文字，生成一张信息可视化的精美配图，风格清晰美观，图文并茂，最后带上 #B站省流助手 的标签，注意文字要用中文的：';
   const HTML_PPT_PROMPT_TEXT = '请基于以下视频摘要生成一个可直接保存为 .html 的完整可视化总结页面。\n\n硬性要求：\n1. 只输出完整 HTML 文档，从 <!doctype html> 或 <html> 开始，不要 Markdown 代码块，不要解释。\n2. {layoutInstruction}\n3. 页面必须信息密度高，不能只有空白卡片、空标题、占位符或无正文。\n4. 必须图文并茂：使用 CSS 图形、SVG、图标、流程图、卡片、对比表、时间线、指标块等视觉元素。\n5. 可以使用内联 CSS、内联 SVG、emoji、少量内联 JS；如使用外部图片/字体/CDN，必须有纯 CSS/SVG 降级，不能依赖外部资源才能看。\n6. 视觉风格要现代、清晰、适合全屏查看，不要输出普通文章排版。\n\n视频标题：{title}\nUP主：{upName}\n视频链接：{url}\n\n视频摘要：\n{summary}';
   const HTML_PPT_SINGLE_PROMPT_TEXT = HTML_PPT_PROMPT_TEXT;
   const HTML_PPT_SLIDES_PROMPT_TEXT = '请基于以下视频摘要生成一个可直接保存为 .html 的完整 HTML PPT。\n\n硬性要求：\n1. 只输出完整 HTML 文档，从 <!doctype html> 或 <html> 开始，不要 Markdown 代码块，不要解释。\n2. {layoutInstruction}\n3. 必须做成真正的翻页演示稿，不要输出普通文章排版。\n4. 每页必须图文并茂：使用 CSS 图形、SVG、图标、流程图、卡片、对比表、时间线、指标块等视觉元素。\n5. 可以使用内联 CSS、内联 SVG、emoji、少量内联 JS；如使用外部图片/字体/CDN，必须有纯 CSS/SVG 降级，不能依赖外部资源才能看。\n6. 视觉风格要现代、清晰、适合全屏演示。\n\n视频标题：{title}\nUP主：{upName}\n视频链接：{url}\n\n视频摘要：\n{summary}';
@@ -60,6 +63,28 @@
     }
   ];
 
+
+  const DEFAULT_FULL_ANALYSIS_PRESETS = [
+    {
+      id: 'fullpreset_video_review',
+      name: '内容审核版',
+      icon: '🎬',
+      prompt: '你是一个专业的视频内容审核员。请基于以下视频字幕、弹幕和评论数据，完成以下分析：\n\n首先，以视频字幕内容为主体，完整梳理视频的核心论点、论述逻辑和关键信息。然后，结合弹幕和评论作为观众舆情参考，从以下维度进行分析：\n\n1. 【视频核心内容】用简洁的话概括视频到底在讲什么\n2. 【内容准确性】结合弹幕和评论中的纠错、质疑信息，检查视频内容是否存在事实错误、数据不准、逻辑漏洞或断章取义，如果有请明确指出并给出正确的信息\n3. 【观点补充】弹幕和评论中有哪些对视频内容的重要补充、不同视角或反驳\n4. 【观众反馈】弹幕和评论的整体情感倾向，观众最关注/最认可/最质疑的点\n5. 【综合评价】视频内容质量和可信度如何，值不值得看\n\n注意：弹幕和评论只作为舆情参考，分析应以视频内容本身为主。不要任何废话，直接输出。'
+    },
+    {
+      id: 'fullpreset_quick_review',
+      name: '极简速览版',
+      icon: '⚡',
+      prompt: '你是一个高效的视频内容分析助手。请基于以下视频字幕、弹幕和评论数据，用最简洁的方式告诉我：\n\n1. 【一句话总结】这个视频讲了什么\n2. 【内容要点】3-5个关键点\n3. 【内容纠错】结合弹幕评论，视频中有没有说错的地方（没有就不写）\n4. 【口碑】弹幕和评论里大家怎么看这个视频\n5. 【值不值】花时间看这个视频值不值\n\n弹幕和评论仅作舆情参考，重点分析视频本身内容。废话越少越好，直接开始。'
+    },
+    {
+      id: 'fullpreset_deep_critique',
+      name: '深度批判版',
+      icon: '🔍',
+      prompt: '你是一个深度内容分析师。请基于以下视频字幕、弹幕和评论数据，以视频内容为主体进行全面批判性分析：\n\n1. 【核心论点】视频在表达什么观点/主张\n2. 【论证质量】UP主用了哪些论据和逻辑，是否充分、严谨\n3. 【事实核查】结合弹幕和评论中的纠错信息，视频中是否存在事实错误、数据不准确、过度简化或误导性表达\n4. 【多方视角】弹幕和评论中呈现了哪些不同的观点和争议\n5. 【内容价值】综合评估这个视频的信息密度、可信度和观看价值\n\n以视频内容为核心，弹幕和评论作为辅助验证。直接输出，不要寒暄。'
+    }
+  ];
+
   const DEFAULT_CONFIG = {
     apiUrl: 'https://xxxx/v1',
     apiKey: 'sk-xxxx',
@@ -75,6 +100,11 @@
     promptText: PROMPT_TEXT,
     commentPromptText: COMMENT_PROMPT_TEXT,
     commentTextPresets: ['省流'],
+    danmakuPromptText: DANMAKU_PROMPT_TEXT,
+    fullAnalysisPromptText: DEFAULT_FULL_ANALYSIS_PRESETS[0].prompt,
+    fullAnalysisPresets: DEFAULT_FULL_ANALYSIS_PRESETS,
+    activeFullAnalysisPresetId: 'fullpreset_video_review',
+    fullDataMaxChars: 64000,
     skipDuration: 60,
     autoParse: true,
     promptPresets: DEFAULT_PRESETS,
@@ -95,7 +125,8 @@
     commentMaxPages: 8,
     commentLimit: 188,
     commentMinDelay: 1800,
-    commentMaxDelay: 3800
+    commentMaxDelay: 3800,
+    autoSubmitCommentSummary: false
   };
 
   function loadConfig() {
@@ -360,6 +391,10 @@
       panel.querySelectorAll('.tabbit-preset-chip').forEach(function(c) { c.classList.remove('disabled'); });
       var commentBtn = contentDiv.querySelector('#tabbit-comment-btn');
       if (commentBtn) commentBtn.disabled = false;
+      var danmakuBtn = contentDiv.querySelector('#tabbit-danmaku-btn');
+      if (danmakuBtn) danmakuBtn.disabled = false;
+      var fullBtn = contentDiv.querySelector('#tabbit-full-btn');
+      if (fullBtn) fullBtn.disabled = false;
     }
   }
 
@@ -400,13 +435,25 @@
     retryBaseDelay: 8000
   };
 
+  const DANMAKU_CONFIG = {
+    maxDanmaku: 3000,
+    segmentSize: 2000,
+    maxSegments: 5,
+    minDelay: 1200,
+    maxDelay: 2500,
+    maxRetries: 2,
+    retryBaseDelay: 5000
+  };
+
   let rawMarkdownResult = '';
   let rawTranscript = '';
+  let rawSubtitleBody = [];
   let currentVideoInfo = null;
   let currentModel = CONFIG.model;
   let conversationHistory = [];
   let commentConversationHistory = [];
   let isCommentSummarizing = false;
+  let isDanmakuAnalyzing = false;
   let hasParsed = false;
   let lastRouteKey = '';
   let routeRestartTimer = null;
@@ -1106,6 +1153,120 @@
     }
   }
 
+  // 🆕 查找并点击B站评论区的"发送/发布"按钮
+  function clickBiliCommentSubmitButton(editor) {
+    const host = findBiliCommentHost(editor);
+    const roots = [
+      host && host.shadowRoot,
+      getCommentAreaRoot(),
+      document
+    ].filter(Boolean);
+
+    const submitSelectors = [
+      '.comment-send button.submit-btn',
+      '.comment-send button[aria-label*="发布"]',
+      '.comment-send button[aria-label*="发送"]',
+      'button.submit-btn',
+      'button[aria-label*="发布"]',
+      'button[aria-label*="发送"]',
+      '#comment button.submit-btn',
+      '.reply-box button.submit-btn'
+    ];
+
+    for (const root of roots) {
+      for (const selector of submitSelectors) {
+        const btns = deepQuerySelectorAll(selector, root);
+        const btn = btns.find(function(b) {
+          if (!isUsableBiliElement(b)) return false;
+          const text = (b.textContent || '').trim();
+          return /发布|发送|提交|send|submit/i.test(text) || b.classList.contains('submit-btn');
+        });
+        if (btn) {
+          try { btn.click(); return true; } catch(e) {}
+        }
+      }
+    }
+
+    // 兜底：在评论区域找含有"发布"文字的按钮
+    for (const root of roots) {
+      const allBtns = deepQuerySelectorAll('button, [role="button"]', root);
+      const submitBtn = allBtns.find(function(b) {
+        if (!isUsableBiliElement(b)) return false;
+        const text = (b.textContent || '').trim();
+        return text === '发布' || text === '发送';
+      });
+      if (submitBtn) {
+        try { submitBtn.click(); return true; } catch(e) {}
+      }
+    }
+
+    return false;
+  }
+
+  // 🆕 一键将摘要内容插入评论框（或自动发送）
+  const BILI_COMMENT_MAX_LEN = 1990;
+  async function fillBiliCommentSummary(btn) {
+    const summaryText = getCurrentSummaryText(null, '');
+    if (!summaryText || !summaryText.trim()) {
+      alert('暂无摘要内容，请先生成摘要');
+      return;
+    }
+
+    const originalText = btn ? btn.textContent : '';
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = '⏳ 填写中...';
+    }
+
+    try {
+      // 转纯文本 + 拼后缀
+      let plainText = markdownToPlainText(summaryText).trim();
+      const suffix = '\n\n#B站省流助手';
+      const maxContentLen = BILI_COMMENT_MAX_LEN - suffix.length;
+      if (plainText.length > maxContentLen) {
+        plainText = plainText.slice(0, maxContentLen).trim() + '\n...';
+      }
+      const finalText = plainText + suffix;
+
+      const editor = await findBiliCommentEditor();
+      if (!editor) throw new Error('没找到评论输入框，请先滚到评论区或点一下评论框');
+
+      setBiliCommentText(editor, finalText);
+
+      if (btn) {
+        btn.textContent = '✅ 已填入';
+      }
+
+      // 如果开启了自动发送
+      if (CONFIG.autoSubmitCommentSummary) {
+        if (btn) btn.textContent = '⏳ 正在发送...';
+        await sleep(300);
+        const sent = clickBiliCommentSubmitButton(editor);
+        if (sent) {
+          if (btn) btn.textContent = '✅ 已发送！';
+        } else {
+          if (btn) btn.textContent = '✅ 已填入（未找到发送按钮）';
+        }
+      }
+
+      setTimeout(function() {
+        if (btn) {
+          btn.textContent = originalText || '📋 摘要发评论';
+          btn.disabled = false;
+        }
+      }, 2500);
+    } catch(err) {
+      console.error('[省流助手-摘要发评论]', err);
+      if (btn) {
+        btn.textContent = '❌ 失败';
+        setTimeout(function() {
+          btn.textContent = originalText || '📋 摘要发评论';
+          btn.disabled = false;
+        }, 2000);
+      }
+    }
+  }
+
   function setBiliCommentText(editor, text) {
     if (!isBiliCommentEditorCandidate(editor)) {
       throw new Error('找到的不是评论输入框，已停止写入，避免破坏评论区');
@@ -1321,6 +1482,179 @@
       const prefix = c.isReply ? '  └' : '';
       return prefix + '[' + (i + 1) + '] ' + c.name + ' (👍' + c.like + '): ' + c.text;
     }).join('\n');
+  }
+
+  // ==================== 弹幕获取部分 ====================
+  async function fetchDanmakuXml(safeFetch, cid) {
+    const url = 'https://api.bilibili.com/x/v1/dm/list.so?oid=' + cid;
+    const resp = await safeFetch(url);
+    if (!resp.ok) throw new Error('弹幕API请求失败: HTTP ' + resp.status);
+    const buf = await resp.arrayBuffer();
+    const decoder = new TextDecoder('utf-8');
+    const xmlText = decoder.decode(buf);
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(xmlText, 'text/xml');
+    const dNodes = doc.querySelectorAll('d');
+    const danmakuList = [];
+    dNodes.forEach(function(d) {
+      const p = d.getAttribute('p') || '';
+      const parts = p.split(',');
+      const time = parseFloat(parts[0]) || 0;
+      const text = d.textContent || '';
+      if (text.trim()) {
+        danmakuList.push({ time: time, text: text.trim() });
+      }
+    });
+    return danmakuList;
+  }
+
+  async function fetchAllDanmaku(cid, statusCallback, signal) {
+    const allDanmaku = [];
+    const safeFetch = createSafeFetcher(signal);
+    const maxDanmaku = DANMAKU_CONFIG.maxDanmaku;
+    try {
+      throwIfAborted(signal);
+      if (statusCallback) statusCallback('正在获取弹幕...');
+      const danmaku = await retryWithBackoff(
+        function() { return fetchDanmakuXml(safeFetch, cid); },
+        DANMAKU_CONFIG.maxRetries,
+        DANMAKU_CONFIG.retryBaseDelay,
+        signal
+      );
+      throwIfAborted(signal);
+      allDanmaku.push.apply(allDanmaku, danmaku);
+      if (statusCallback) statusCallback('已获取 ' + allDanmaku.length + ' 条弹幕...');
+    } catch (e) {
+      if (isAbortError(e)) throw e;
+      console.warn('[省流助手] 获取弹幕失败:', e.message);
+      if (e instanceof BiliRiskControlError) {
+        console.warn('[省流助手] 检测到风控，停止弹幕请求');
+      }
+    }
+    return allDanmaku.slice(0, maxDanmaku);
+  }
+
+  function formatDanmakuText(danmaku) {
+    var timeFormat = function(sec) {
+      var m = Math.floor(sec / 60);
+      var s = Math.floor(sec % 60);
+      return m + ':' + (s < 10 ? '0' : '') + s;
+    };
+    return danmaku.map(function(d, i) {
+      return '[' + (i + 1) + '] [' + timeFormat(d.time) + '] ' + d.text;
+    }).join('\n');
+  }
+
+  // ==================== 全面分析：时间轴对齐 ====================
+  function alignTimeline(subtitleBody, danmaku) {
+    if (!subtitleBody || subtitleBody.length === 0) {
+      return [];
+    }
+    var sortedDanmaku = danmaku.slice().sort(function(a, b) { return a.time - b.time; });
+    var segments = [];
+    for (var i = 0; i < subtitleBody.length; i++) {
+      var seg = subtitleBody[i];
+      var from = seg.from || 0;
+      var to = seg.to || (from + 3);
+      var text = seg.content || seg.text || '';
+      if (!text.trim()) continue;
+
+      var matchedDanmaku = [];
+      for (var j = 0; j < sortedDanmaku.length; j++) {
+        var d = sortedDanmaku[j];
+        if (d.time < from - 2) continue;
+        if (d.time > to + 2) break;
+        matchedDanmaku.push(d.text);
+      }
+
+      var timeLabel = timeFormatAlign(from);
+      var entry = { time: from, label: timeLabel, subtitle: text, danmaku: matchedDanmaku };
+      segments.push(entry);
+    }
+    return segments;
+  }
+
+  function timeFormatAlign(sec) {
+    var m = Math.floor(sec / 60);
+    var s = Math.floor(sec % 60);
+    return m + ':' + (s < 10 ? '0' : '') + s;
+  }
+
+  // 全面分析数据量上限（字符），超限时才开始截断
+  var FULL_DATA_MAX_CHARS_DEFAULT = 64000;
+
+  function formatFullData(videoInfo, subtitleBody, danmaku, comments) {
+    var lines = [];
+    lines.push('【视频信息】');
+    lines.push('标题: ' + (videoInfo.title || ''));
+    lines.push('UP主: ' + (videoInfo.upName || ''));
+    if (videoInfo.desc) lines.push('简介: ' + videoInfo.desc);
+    lines.push('链接: https://www.bilibili.com/video/' + (videoInfo.bvid || ''));
+    lines.push('');
+
+    // --- 字幕 + 弹幕时间轴对齐（不过滤，全量输出）---
+    if (subtitleBody && subtitleBody.length > 0) {
+      var aligned = alignTimeline(subtitleBody, danmaku);
+      lines.push('【字幕 + 弹幕时间轴对齐】');
+      lines.push('（字幕' + subtitleBody.length + '句，弹幕' + (danmaku ? danmaku.length : 0) + '条）');
+      lines.push('');
+      for (var i = 0; i < aligned.length; i++) {
+        var seg = aligned[i];
+        lines.push('[' + seg.label + '] ' + seg.subtitle);
+        if (seg.danmaku.length > 0) {
+          for (var j = 0; j < seg.danmaku.length; j++) {
+            lines.push('  💬 ' + seg.danmaku[j]);
+          }
+        }
+      }
+    } else if (danmaku && danmaku.length > 0) {
+      lines.push('【字幕】');
+      lines.push('（该视频无字幕）');
+    }
+
+    // --- 弹幕精选（按字数排序，字多 = 有内容，过滤刷屏短弹幕）---
+    if (danmaku && danmaku.length > 0) {
+      // 去重：相同文本只保留一条
+      var seen = {};
+      var uniqueDanmaku = [];
+      for (var k = 0; k < danmaku.length; k++) {
+        var txt = (danmaku[k].text || '').trim();
+        if (txt.length >= 4 && !seen[txt]) {
+          seen[txt] = true;
+          uniqueDanmaku.push(txt);
+        }
+      }
+      // 按字数降序排列，字越多含金量越高
+      uniqueDanmaku.sort(function(a, b) { return b.length - a.length; });
+      if (uniqueDanmaku.length > 0) {
+        lines.push('');
+        lines.push('【弹幕精选 TOP50（按内容含量排序，共' + danmaku.length + '条弹幕，去重后' + uniqueDanmaku.length + '条）】');
+        var showCount = Math.min(50, uniqueDanmaku.length);
+        for (var s = 0; s < showCount; s++) {
+          lines.push(uniqueDanmaku[s]);
+        }
+      }
+    }
+
+    // --- 评论区（不过滤，全量输出）---
+    if (comments && comments.length > 0) {
+      lines.push('');
+      lines.push('【评论区（' + comments.length + '条，按热度排序）】');
+      for (var c = 0; c < comments.length; c++) {
+        var cm = comments[c];
+        var prefix = cm.isReply ? '  └' : '';
+        lines.push(prefix + '[' + (c + 1) + '] ' + cm.name + ' (👍' + cm.like + '): ' + cm.text);
+      }
+    }
+
+    // --- 超限时截断：从末尾（评论区）开始砍，保留视频信息和字幕核心 ---
+    var result = lines.join('\n');
+    var maxChars = (typeof CONFIG !== 'undefined' && CONFIG.fullDataMaxChars) || FULL_DATA_MAX_CHARS_DEFAULT;
+    if (result.length > maxChars) {
+      // 砍掉超限部分，保留前 FULL_DATA_MAX_CHARS 字符
+      result = result.substring(0, maxChars) + '\n\n...（数据量超限，后续内容已截断）';
+    }
+    return result;
   }
 
   // ==================== Markdown 处理 ====================
@@ -1976,6 +2310,126 @@
         word-break: break-word;
       }
       .tabbit-comment-actions {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-top: 8px;
+        flex-wrap: wrap;
+      }
+
+      .tabbit-danmaku-summary-btn {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        width: 100%;
+        padding: 12px 20px;
+        margin-top: 10px;
+        background: linear-gradient(135deg, #00a1d6 0%, #0086c9 100%);
+        color: white;
+        border: none;
+        border-radius: 12px;
+        font-size: 15px;
+        font-weight: 600;
+        cursor: pointer;
+        transition: all 0.25s;
+        letter-spacing: 0.5px;
+      }
+      .tabbit-danmaku-summary-btn:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 4px 20px rgba(0,161,214,0.5);
+        background: linear-gradient(135deg, #0086c9 0%, #006fa3 100%);
+      }
+      .tabbit-danmaku-summary-btn:active { transform: translateY(0); }
+      .tabbit-danmaku-summary-btn:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+        transform: none;
+        box-shadow: none;
+      }
+      .tabbit-danmaku-summary-btn .tabbit-btn-icon { font-size: 18px; }
+
+      .tabbit-danmaku-section {
+        margin-top: 16px;
+        padding-top: 16px;
+        border-top: 2px solid #e8e8ef;
+      }
+      .tabbit-danmaku-section-title {
+        font-size: 14px;
+        font-weight: 600;
+        color: #00a1d6;
+        margin-bottom: 10px;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .tabbit-danmaku-result {
+        background: #f0fafe;
+        border-radius: 12px;
+        padding: 14px 16px;
+        word-break: break-word;
+      }
+      .tabbit-danmaku-actions {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-top: 8px;
+        flex-wrap: wrap;
+      }
+
+      .tabbit-full-summary-btn {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        width: 100%;
+        padding: 12px 20px;
+        margin-top: 10px;
+        background: linear-gradient(135deg, #ff9800 0%, #f57c00 100%);
+        color: white;
+        border: none;
+        border-radius: 12px;
+        font-size: 15px;
+        font-weight: 600;
+        cursor: pointer;
+        transition: all 0.25s;
+        letter-spacing: 0.5px;
+      }
+      .tabbit-full-summary-btn:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 4px 20px rgba(255,152,0,0.5);
+        background: linear-gradient(135deg, #f57c00 0%, #ef6c00 100%);
+      }
+      .tabbit-full-summary-btn:active { transform: translateY(0); }
+      .tabbit-full-summary-btn:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+        transform: none;
+        box-shadow: none;
+      }
+      .tabbit-full-summary-btn .tabbit-btn-icon { font-size: 18px; }
+
+      .tabbit-full-section {
+        margin-top: 16px;
+        padding-top: 16px;
+        border-top: 2px solid #e8e8ef;
+      }
+      .tabbit-full-section-title {
+        font-size: 14px;
+        font-weight: 600;
+        color: #f57c00;
+        margin-bottom: 10px;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .tabbit-full-result {
+        background: #fff8e1;
+        border-radius: 12px;
+        padding: 14px 16px;
+        word-break: break-word;
+      }
+      .tabbit-full-actions {
         display: flex;
         align-items: center;
         gap: 8px;
@@ -2746,6 +3200,9 @@
         newChip.classList.add('active');
         conversationHistory = [];
         commentConversationHistory = [];
+        rawDanmakuChatContext = '';
+        rawCommentsChatContext = '';
+        rawFullDataChatContext = '';
         if (rawTranscript) {
           await runSummary(panel, rawTranscript, currentVideoInfo);
         } else {
@@ -2797,11 +3254,21 @@
         </div>
         <div class="tabbit-result-actions"></div>
         ${renderPresetBarHtml()}
+        <button class="tabbit-danmaku-summary-btn" id="tabbit-danmaku-btn" disabled>
+          <span class="tabbit-btn-icon">📡</span>
+          <span>弹幕分析</span>
+        </button>
+        <div class="tabbit-danmaku-section" id="tabbit-danmaku-section"></div>
         <button class="tabbit-comment-summary-btn" id="tabbit-comment-btn" disabled>
           <span class="tabbit-btn-icon">💬</span>
           <span>总结评论区</span>
         </button>
         <div class="tabbit-comment-section" id="tabbit-comment-section"></div>
+        <button class="tabbit-full-summary-btn" id="tabbit-full-btn" disabled>
+          <span class="tabbit-btn-icon">🔍</span>
+          <span>全面分析</span>
+        </button>
+        <div class="tabbit-full-section" id="tabbit-full-section"></div>
         <div class="tabbit-chat-messages"></div>
       </div>
       <div class="tabbit-chat-input-bar">
@@ -3095,7 +3562,7 @@
       const data = await res.json();
       if (data.code === 0 || data.code === 200 || data.message === 'ok') {
         btn.textContent = '✅ 已发送';
-        setTimeout(() => { btn.textContent = '🌱 flomo'; btn.disabled = false; }, 2000);
+        setTimeout(() => { btn.textContent = '发送 FLOMO'; btn.disabled = false; }, 2000);
       } else {
         throw new Error(data.message || '发送失败');
       }
@@ -3645,7 +4112,7 @@
       modelTag.textContent = '🤖 ' + currentModel;
       const flomoBtn = document.createElement('button');
       flomoBtn.className = 'tabbit-copy-btn';
-      flomoBtn.textContent = '🌱 flomo';
+      flomoBtn.textContent = '发送 FLOMO';
       flomoBtn.addEventListener('click', function() { sendToFlomo(rawMarkdownResult, this); });
       const genImgBtn = document.createElement('button');
       genImgBtn.className = 'tabbit-copy-btn';
@@ -3661,10 +4128,28 @@
       });
       const editStatus = document.createElement('span');
       editStatus.className = 'tabbit-summary-edit-status';
+      const commentPostBtn = document.createElement('button');
+      commentPostBtn.className = 'tabbit-copy-btn';
+      commentPostBtn.textContent = '📋 摘要发评论';
+      commentPostBtn.title = '一键将摘要插入B站评论框';
+      commentPostBtn.addEventListener('click', function() { fillBiliCommentSummary(commentPostBtn); });
+      const copyImagePromptBtn = document.createElement('button');
+      copyImagePromptBtn.className = 'tabbit-copy-btn';
+      copyImagePromptBtn.textContent = '复制 生图提示词';
+      copyImagePromptBtn.title = '一键复制生图提示词+摘要到剪贴板，粘贴到任意AI生图';
+      copyImagePromptBtn.addEventListener('click', function() {
+        const summaryPlain = markdownToPlainText(getCurrentSummaryText(contentDiv, result));
+        const copyText = COPY_IMAGE_PROMPT_PRESET + '\n\n' + summaryPlain;
+        copyToClipboard(copyText);
+        copyImagePromptBtn.textContent = '✅ 已复制';
+        setTimeout(function() { copyImagePromptBtn.textContent = '复制 生图提示词'; }, 2000);
+      });
       actionsDiv.appendChild(copyBtn);
       actionsDiv.appendChild(editBtn);
-      actionsDiv.appendChild(htmlPptBtn);
       actionsDiv.appendChild(genImgBtn);
+      actionsDiv.appendChild(copyImagePromptBtn);
+      actionsDiv.appendChild(commentPostBtn);
+      actionsDiv.appendChild(htmlPptBtn);
       actionsDiv.appendChild(flomoBtn);
       actionsDiv.appendChild(downloadBtn);
       actionsDiv.appendChild(editStatus);
@@ -3703,11 +4188,21 @@
         <span class="tabbit-btn-icon">📤</span>
         <span>手动上传字幕（srt/txt/粘贴）</span>
       </button>
+      <button class="tabbit-danmaku-summary-btn" id="tabbit-danmaku-btn">
+        <span class="tabbit-btn-icon">📡</span>
+        <span>弹幕分析</span>
+      </button>
+      <div class="tabbit-danmaku-section" id="tabbit-danmaku-section"></div>
       <button class="tabbit-comment-summary-btn" id="tabbit-comment-btn">
         <span class="tabbit-btn-icon">💬</span>
         <span>总结评论区</span>
       </button>
       <div class="tabbit-comment-section" id="tabbit-comment-section"></div>
+      <button class="tabbit-full-summary-btn" id="tabbit-full-btn">
+        <span class="tabbit-btn-icon">🔍</span>
+        <span>全面分析</span>
+      </button>
+      <div class="tabbit-full-section" id="tabbit-full-section"></div>
     `;
 
     const manualFetchBtn = contentDiv.querySelector('#tabbit-manual-fetch-btn');
@@ -3724,6 +4219,16 @@
     const commentBtn = contentDiv.querySelector('#tabbit-comment-btn');
     if (commentBtn) {
       commentBtn.addEventListener('click', () => runCommentSummary(panel, videoInfo));
+    }
+
+    const danmakuBtn = contentDiv.querySelector('#tabbit-danmaku-btn');
+    if (danmakuBtn) {
+      danmakuBtn.addEventListener('click', () => runDanmakuSummary(panel, videoInfo));
+    }
+
+    const fullBtn = contentDiv.querySelector('#tabbit-full-btn');
+    if (fullBtn) {
+      fullBtn.addEventListener('click', () => runFullAnalysis(panel, videoInfo));
     }
 
     input.disabled = true;
@@ -3918,6 +4423,7 @@
         return;
       }
 
+      rawSubtitleBody = content;
       const transcript = formatTranscript(content);
       if (!transcript.trim()) {
         setFetchBtnState(fetchBtn, '字幕文本为空，请稍后再试', '😢', 3000);
@@ -4305,13 +4811,11 @@
           copyBtn.textContent = '✅ 已复制';
           setTimeout(function() { copyBtn.textContent = '📋 复制文字'; }, 2000);
         });
-        actionsDiv.appendChild(copyBtn);
 
         const editBtn = document.createElement('button');
         editBtn.className = 'tabbit-copy-btn';
         editBtn.textContent = '✏️ 编辑摘要';
         editBtn.addEventListener('click', function() { startSummaryEdit(contentDiv, textContent); });
-        actionsDiv.appendChild(editBtn);
 
         const htmlPptBtn = document.createElement('button');
         htmlPptBtn.className = 'tabbit-copy-btn';
@@ -4319,19 +4823,41 @@
         htmlPptBtn.addEventListener('click', function() {
           triggerHtmlPptGen(contentDiv, getCurrentSummaryText(contentDiv, textContent), videoInfo, htmlPptBtn);
         });
-        actionsDiv.appendChild(htmlPptBtn);
-
         const genImgBtn = document.createElement('button');
         genImgBtn.className = 'tabbit-copy-btn';
         genImgBtn.textContent = imageDataUrl && imageDataUrl !== 'ERROR' ? '🔁 重新生成配图' : '🖼️ 生成配图';
         genImgBtn.addEventListener('click', function() {
           triggerManualImageGen(contentDiv, getCurrentSummaryText(contentDiv, textContent), videoInfo, genImgBtn);
         });
+
+        const copyImagePromptBtn = document.createElement('button');
+        copyImagePromptBtn.className = 'tabbit-copy-btn';
+        copyImagePromptBtn.textContent = '复制 生图提示词';
+        copyImagePromptBtn.title = '一键复制生图提示词+摘要到剪贴板，粘贴到任意AI生图';
+        copyImagePromptBtn.addEventListener('click', function() {
+          const summaryPlain = markdownToPlainText(getCurrentSummaryText(contentDiv, textContent));
+          const copyText = COPY_IMAGE_PROMPT_PRESET + '\n\n' + summaryPlain;
+          copyToClipboard(copyText);
+          copyImagePromptBtn.textContent = '✅ 已复制';
+          setTimeout(function() { copyImagePromptBtn.textContent = '复制 生图提示词'; }, 2000);
+        });
+
+        const commentPostBtn = document.createElement('button');
+        commentPostBtn.className = 'tabbit-copy-btn';
+        commentPostBtn.textContent = '📋 摘要发评论';
+        commentPostBtn.title = '一键将摘要插入B站评论框';
+        commentPostBtn.addEventListener('click', function() { fillBiliCommentSummary(commentPostBtn); });
+
+        actionsDiv.appendChild(copyBtn);
+        actionsDiv.appendChild(editBtn);
         actionsDiv.appendChild(genImgBtn);
+        actionsDiv.appendChild(copyImagePromptBtn);
+        actionsDiv.appendChild(commentPostBtn);
+        actionsDiv.appendChild(htmlPptBtn);
 
         const flomoBtn = document.createElement('button');
         flomoBtn.className = 'tabbit-copy-btn';
-        flomoBtn.textContent = '🌱 flomo';
+        flomoBtn.textContent = '发送 FLOMO';
         flomoBtn.addEventListener('click', function() {
           sendToFlomo(getCurrentSummaryText(contentDiv, textContent), this);
         });
@@ -4476,6 +5002,9 @@
         chip.classList.add('active');
         conversationHistory = [];
         commentConversationHistory = [];
+        rawDanmakuChatContext = '';
+        rawCommentsChatContext = '';
+        rawFullDataChatContext = '';
         if (rawTranscript) {
           await runSummary(panel, rawTranscript, videoInfo || currentVideoInfo);
         } else if (videoInfo || currentVideoInfo) {
@@ -4495,10 +5024,32 @@
     return btn;
   }
 
+  function bindDanmakuButton(contentDiv, panel, videoInfo, enabled) {
+    const oldBtn = contentDiv.querySelector('#tabbit-danmaku-btn');
+    if (!oldBtn) return null;
+    const btn = oldBtn.cloneNode(true);
+    oldBtn.parentNode.replaceChild(btn, oldBtn);
+    btn.disabled = !enabled;
+    btn.addEventListener('click', () => runDanmakuSummary(panel, videoInfo));
+    return btn;
+  }
+
+  function bindFullAnalysisButton(contentDiv, panel, videoInfo, enabled) {
+    const oldBtn = contentDiv.querySelector('#tabbit-full-btn');
+    if (!oldBtn) return null;
+    const btn = oldBtn.cloneNode(true);
+    oldBtn.parentNode.replaceChild(btn, oldBtn);
+    btn.disabled = !enabled;
+    btn.addEventListener('click', () => runFullAnalysis(panel, videoInfo));
+    return btn;
+  }
+
   function renderSummaryShell(panel, contentDiv, presetBarHtml, videoInfo, pageUrl) {
     const hasShell = contentDiv.querySelector('.tabbit-result')
       && contentDiv.querySelector('.tabbit-result-actions')
       && contentDiv.querySelector('#tabbit-comment-btn')
+      && contentDiv.querySelector('#tabbit-danmaku-btn')
+      && contentDiv.querySelector('#tabbit-full-btn')
       && contentDiv.querySelector('.tabbit-chat-messages');
 
     if (hasShell) {
@@ -4509,11 +5060,16 @@
         const newPresetBar = wrapper.firstElementChild;
         if (newPresetBar) oldPresetBar.replaceWith(newPresetBar);
       } else {
-        const commentBtnEl = contentDiv.querySelector('#tabbit-comment-btn');
-        if (commentBtnEl) {
-          commentBtnEl.insertAdjacentHTML('beforebegin', presetBarHtml);
+        const danmakuBtnEl = contentDiv.querySelector('#tabbit-danmaku-btn');
+        if (danmakuBtnEl) {
+          danmakuBtnEl.insertAdjacentHTML('beforebegin', presetBarHtml);
         } else {
-          contentDiv.insertAdjacentHTML('beforeend', presetBarHtml);
+          const commentBtnEl = contentDiv.querySelector('#tabbit-comment-btn');
+          if (commentBtnEl) {
+            commentBtnEl.insertAdjacentHTML('beforebegin', presetBarHtml);
+          } else {
+            contentDiv.insertAdjacentHTML('beforeend', presetBarHtml);
+          }
         }
       }
 
@@ -4530,6 +5086,12 @@
       contentDiv.querySelector('.tabbit-result-actions').innerHTML = '';
       contentDiv.querySelector('.tabbit-chat-messages').innerHTML = '';
 
+      const oldDanmakuSection = contentDiv.querySelector('#tabbit-danmaku-section');
+      if (oldDanmakuSection) oldDanmakuSection.innerHTML = '';
+
+      const oldFullSection = contentDiv.querySelector('#tabbit-full-section');
+      if (oldFullSection) oldFullSection.innerHTML = '';
+
       const oldMeta = contentDiv.querySelector('.tabbit-video-info-bottom');
       const metaHtml = renderVideoMetaBottomHtml(videoInfo, pageUrl);
       if (oldMeta) {
@@ -4543,6 +5105,10 @@
 
       const commentBtn = contentDiv.querySelector('#tabbit-comment-btn');
       commentBtn.disabled = true;
+      const danmakuBtn = contentDiv.querySelector('#tabbit-danmaku-btn');
+      if (danmakuBtn) danmakuBtn.disabled = true;
+      const fullBtn = contentDiv.querySelector('#tabbit-full-btn');
+      if (fullBtn) fullBtn.disabled = true;
     } else {
       contentDiv.innerHTML = `
         ${renderVideoMetaBottomHtml(videoInfo, pageUrl)}
@@ -4550,17 +5116,29 @@
         <div class="tabbit-result"><span class="tabbit-typing-cursor"></span></div>
         <div class="tabbit-result-actions"></div>
         ${presetBarHtml}
+        <button class="tabbit-danmaku-summary-btn" id="tabbit-danmaku-btn" disabled>
+          <span class="tabbit-btn-icon">📡</span>
+          <span>弹幕分析</span>
+        </button>
+        <div class="tabbit-danmaku-section" id="tabbit-danmaku-section"></div>
         <button class="tabbit-comment-summary-btn" id="tabbit-comment-btn" disabled>
           <span class="tabbit-btn-icon">💬</span>
           <span>总结评论区</span>
         </button>
         <div class="tabbit-comment-section" id="tabbit-comment-section"></div>
+        <button class="tabbit-full-summary-btn" id="tabbit-full-btn" disabled>
+          <span class="tabbit-btn-icon">🔍</span>
+          <span>全面分析</span>
+        </button>
+        <div class="tabbit-full-section" id="tabbit-full-section"></div>
         <div class="tabbit-chat-messages"></div>
       `;
     }
 
     bindPresetChips(panel, videoInfo);
     bindCommentButton(contentDiv, panel, videoInfo, false);
+    bindDanmakuButton(contentDiv, panel, videoInfo, false);
+    bindFullAnalysisButton(contentDiv, panel, videoInfo, false);
   }
 
   function setSummaryReady(panel, contentDiv, videoInfo) {
@@ -4572,6 +5150,8 @@
     }
     if (sendBtn) sendBtn.disabled = false;
     bindCommentButton(contentDiv, panel, videoInfo, true);
+    bindDanmakuButton(contentDiv, panel, videoInfo, true);
+    bindFullAnalysisButton(contentDiv, panel, videoInfo, true);
     panel.querySelectorAll('.tabbit-model-chip').forEach(c => c.classList.remove('disabled'));
     panel.querySelectorAll('.tabbit-preset-chip').forEach(c => c.classList.remove('disabled'));
   }
@@ -4929,6 +5509,7 @@
       }
 
       const commentsText = formatCommentsText(comments);
+      rawCommentsChatContext = '\n\n[评论区原文数据（' + comments.length + '条，格式：[序号] 用户名 (👍点赞): 内容）]\n' + commentsText;
       const activeCommentPrompt = CONFIG.commentPromptText || COMMENT_PROMPT_TEXT;
       const fullPrompt = activeCommentPrompt + '\n\n评论内容如下：\n' + commentsText;
 
@@ -4969,7 +5550,7 @@
       actionsDiv.className = 'tabbit-comment-actions';
       actionsDiv.innerHTML = `
         <button class="tabbit-copy-btn" id="tabbit-copy-comment">📋 复制评论总结</button>
-        <button class="tabbit-copy-btn" id="tabbit-flomo-comment">🌱 flomo</button>
+        <button class="tabbit-copy-btn" id="tabbit-flomo-comment">发送 FLOMO</button>
         <span style="font-size:11px;color:#999;margin-left:auto;">🤖 ${currentModel}</span>
       `;
       commentSection.appendChild(actionsDiv);
@@ -5012,15 +5593,333 @@
     }
   }
 
+  // ==================== 弹幕分析主流程（流式 + 打断） ====================
+  async function runDanmakuSummary(panel, videoInfo) {
+    if (isDanmakuAnalyzing) return;
+    isDanmakuAnalyzing = true;
+
+    const contentDiv = panel.querySelector('.tabbit-panel-content');
+    const danmakuBtn = contentDiv.querySelector('#tabbit-danmaku-btn');
+    if (danmakuBtn) danmakuBtn.disabled = true;
+
+    let danmakuSection = contentDiv.querySelector('#tabbit-danmaku-section');
+    if (!danmakuSection) {
+      danmakuSection = document.createElement('div');
+      danmakuSection.className = 'tabbit-danmaku-section';
+      danmakuSection.id = 'tabbit-danmaku-section';
+      contentDiv.appendChild(danmakuSection);
+    }
+    danmakuSection.innerHTML = `
+      <div class="tabbit-danmaku-section-title">📡 弹幕分析</div>
+      <div class="tabbit-loading">
+        <div class="tabbit-spinner"></div>
+        <span id="tabbit-danmaku-status">正在获取弹幕...</span>
+      </div>
+    `;
+
+    const statusEl = danmakuSection.querySelector('#tabbit-danmaku-status');
+
+    abortCurrentTask();
+    currentAbortController = new AbortController();
+    const localController = currentAbortController;
+    let abortBtn = null;
+    const fetchAbortBtnWrap = document.createElement('div');
+    fetchAbortBtnWrap.style.cssText = 'text-align:center;';
+    abortBtn = insertInlineAbortBtn(fetchAbortBtnWrap, function() {
+      abortCurrentTask();
+    });
+    danmakuSection.appendChild(fetchAbortBtnWrap);
+    abortBtn._wrap = fetchAbortBtnWrap;
+
+    try {
+      const cid = videoInfo.cid;
+      if (!cid) throw new Error('无法获取视频 cid');
+
+      const danmaku = await fetchAllDanmaku(cid, function(msg) {
+        if (statusEl) statusEl.textContent = msg;
+      }, localController.signal);
+      if (danmaku.length === 0) throw new Error('该视频没有弹幕');
+
+      if (localController.signal.aborted) {
+        const abortErr = new Error('用户已打断');
+        abortErr.name = 'AbortError';
+        throw abortErr;
+      }
+
+      if (statusEl) statusEl.textContent = '已获取 ' + danmaku.length + ' 条弹幕，AI 正在流式分析...';
+      if (abortBtn && abortBtn._wrap && abortBtn._wrap.parentNode) {
+        abortBtn._wrap.remove();
+        abortBtn = null;
+      }
+
+      const danmakuText = formatDanmakuText(danmaku);
+      rawDanmakuChatContext = '\n\n[弹幕原文数据（' + danmaku.length + '条，格式：[时间] 内容）]\n' + danmakuText;
+      const activeDanmakuPrompt = CONFIG.danmakuPromptText || DANMAKU_PROMPT_TEXT;
+      const fullPrompt = activeDanmakuPrompt + '\n\n弹幕内容如下：\n' + danmakuText;
+
+      danmakuSection.innerHTML = `
+        <div class="tabbit-danmaku-section-title">📡 弹幕分析 <span style="font-size:11px;color:#999;font-weight:400;">（${danmaku.length}条弹幕）</span></div>
+        <div class="tabbit-danmaku-result"><span class="tabbit-typing-cursor"></span></div>
+      `;
+      const resultEl = danmakuSection.querySelector('.tabbit-danmaku-result');
+
+      const abortBtnWrap = document.createElement('div');
+      abortBtnWrap.style.cssText = 'text-align:center;';
+      abortBtn = insertInlineAbortBtn(abortBtnWrap, function() {
+        abortCurrentTask();
+      });
+      danmakuSection.appendChild(abortBtnWrap);
+      abortBtn._wrap = abortBtnWrap;
+
+      const messages = [{ role: 'user', content: fullPrompt }];
+
+      const onDelta = createThrottledDelta(function(fullText) {
+        resultEl.textContent = fullText;
+        const cursor = document.createElement('span');
+        cursor.className = 'tabbit-typing-cursor';
+        resultEl.appendChild(cursor);
+      });
+
+      const reply = await callAIStream(messages, onDelta, { signal: localController.signal });
+
+      resultEl.innerHTML = parseMarkdown(reply);
+
+      const actionsDiv = document.createElement('div');
+      actionsDiv.className = 'tabbit-danmaku-actions';
+      actionsDiv.innerHTML = `
+        <button class="tabbit-copy-btn" id="tabbit-copy-danmaku">📋 复制弹幕分析</button>
+        <button class="tabbit-copy-btn" id="tabbit-flomo-danmaku">发送 FLOMO</button>
+        <span style="font-size:11px;color:#999;margin-left:auto;">🤖 ${currentModel}</span>
+      `;
+      danmakuSection.appendChild(actionsDiv);
+
+      const copyDanmakuBtn = danmakuSection.querySelector('#tabbit-copy-danmaku');
+      if (copyDanmakuBtn) {
+        copyDanmakuBtn.addEventListener('click', function() { copyCommentResult(this, reply); });
+      }
+      const flomoDanmakuBtn = danmakuSection.querySelector('#tabbit-flomo-danmaku');
+      if (flomoDanmakuBtn) {
+        flomoDanmakuBtn.addEventListener('click', function() { sendToFlomo(reply, this); });
+      }
+
+    } catch (err) {
+      console.error('[省流助手-弹幕分析]', err);
+      if (isAbortError(err)) {
+        danmakuSection.innerHTML = `
+          <div class="tabbit-danmaku-section-title">📡 弹幕分析</div>
+          <div style="background:#e6f7ff;border:1px solid #91d5ff;border-radius:8px;padding:14px;color:#0050b3;text-align:center;">⏹ 已被用户打断</div>
+        `;
+      } else {
+        danmakuSection.innerHTML = `
+          <div class="tabbit-danmaku-section-title">📡 弹幕分析</div>
+          <div class="tabbit-error">
+            <div class="tabbit-error-title">⚠️ 弹幕分析失败</div>
+            <div>${escapeHtml(err.message)}</div>
+          </div>
+        `;
+      }
+    } finally {
+      if (abortBtn && abortBtn._wrap && abortBtn._wrap.parentNode) {
+        abortBtn._wrap.remove();
+      }
+      if (currentAbortController === localController) currentAbortController = null;
+      isDanmakuAnalyzing = false;
+      const btn = contentDiv.querySelector('#tabbit-danmaku-btn');
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  // ==================== 全面分析主流程（流式 + 打断） ====================
+  let isFullAnalyzing = false;
+  let rawDanmakuChatContext = '';
+  let rawCommentsChatContext = '';
+  let rawFullDataChatContext = '';
+
+  const FULL_ANALYSIS_PROMPT = '你是一个专业的视频内容全面分析师。请对以下视频的字幕内容、弹幕和评论进行综合分析，输出一份完整的分析报告，包括：\n1. 【视频核心内容】用简洁的话概括视频到底在讲什么\n2. 【弹幕热评联动】哪些字幕片段引发了最热烈的弹幕/评论讨论，分析观众的反应和情绪\n3. 【观众共鸣点】弹幕和评论中反复出现的话题、梗或观点\n4. 【争议与分歧】弹幕/评论中存在对立看法的地方\n5. 【时间轴亮点】按时间线标注视频中哪些时刻引发了最多的弹幕互动\n6. 【综合评价】综合字幕+弹幕+评论，给出这个视频的整体质量和口碑\n7. 我理解能力差、没耐心，别讲铺垫、别讲背景、别讲废话，只告诉我核心结论和关键点。';
+
+  async function runFullAnalysis(panel, videoInfo) {
+    if (isFullAnalyzing) return;
+    isFullAnalyzing = true;
+
+    const contentDiv = panel.querySelector('.tabbit-panel-content');
+    const fullBtn = contentDiv.querySelector('#tabbit-full-btn');
+    if (fullBtn) fullBtn.disabled = true;
+
+    let fullSection = contentDiv.querySelector('#tabbit-full-section');
+    if (!fullSection) {
+      fullSection = document.createElement('div');
+      fullSection.className = 'tabbit-full-section';
+      fullSection.id = 'tabbit-full-section';
+      contentDiv.appendChild(fullSection);
+    }
+    fullSection.innerHTML = `
+      <div class="tabbit-full-section-title">🔍 全面分析</div>
+      <div class="tabbit-loading">
+        <div class="tabbit-spinner"></div>
+        <span id="tabbit-full-status">正在准备数据...</span>
+      </div>
+    `;
+
+    const statusEl = fullSection.querySelector('#tabbit-full-status');
+
+    abortCurrentTask();
+    currentAbortController = new AbortController();
+    const localController = currentAbortController;
+    let abortBtn = null;
+    const fetchAbortBtnWrap = document.createElement('div');
+    fetchAbortBtnWrap.style.cssText = 'text-align:center;';
+    abortBtn = insertInlineAbortBtn(fetchAbortBtnWrap, function() {
+      abortCurrentTask();
+    });
+    fullSection.appendChild(fetchAbortBtnWrap);
+    abortBtn._wrap = fetchAbortBtnWrap;
+
+    try {
+      const aid = getAid(videoInfo);
+      const cid = videoInfo.cid;
+      if (!aid && !cid) throw new Error('无法获取视频 aid 或 cid');
+
+      // 1. 获取弹幕
+      let danmaku = [];
+      if (cid) {
+        if (statusEl) statusEl.textContent = '正在获取弹幕...';
+        try {
+          danmaku = await fetchAllDanmaku(cid, function(msg) {
+            if (statusEl) statusEl.textContent = msg;
+          }, localController.signal);
+        } catch(e) {
+          if (isAbortError(e)) throw e;
+          console.warn('[省流助手-全面分析] 弹幕获取失败:', e.message);
+        }
+      }
+
+      if (localController.signal.aborted) throw Object.assign(new Error('用户已打断'), { name: 'AbortError' });
+
+      // 2. 获取评论
+      let comments = [];
+      if (aid) {
+        if (statusEl) statusEl.textContent = '正在获取评论...';
+        try {
+          comments = await fetchAllComments(aid, function(msg) {
+            if (statusEl) statusEl.textContent = '弹幕' + danmaku.length + '条，' + msg;
+          }, localController.signal);
+        } catch(e) {
+          if (isAbortError(e)) throw e;
+          console.warn('[省流助手-全面分析] 评论获取失败:', e.message);
+        }
+      }
+
+      if (localController.signal.aborted) throw Object.assign(new Error('用户已打断'), { name: 'AbortError' });
+
+      // 3. 检查数据量
+      if (danmaku.length === 0 && comments.length === 0 && !rawSubtitleBody.length && !rawTranscript) {
+        throw new Error('未获取到任何数据（弹幕、评论、字幕均为空）');
+      }
+
+      if (statusEl) statusEl.textContent = '数据就绪（弹幕' + danmaku.length + '条 + 评论' + comments.length + '条），AI 正在全面分析...';
+      if (abortBtn && abortBtn._wrap && abortBtn._wrap.parentNode) {
+        abortBtn._wrap.remove();
+        abortBtn = null;
+      }
+
+      // 4. 构建全面数据
+      const fullDataText = formatFullData(videoInfo, rawSubtitleBody, danmaku, comments);
+      rawFullDataChatContext = '\n\n[全面分析原始数据]\n' + fullDataText;
+      const activeFullPrompt = CONFIG.fullAnalysisPromptText || FULL_ANALYSIS_PROMPT;
+      const fullPrompt = activeFullPrompt + '\n\n以下是完整数据：\n' + fullDataText;
+
+      const totalItems = (rawSubtitleBody.length || 0) + danmaku.length + comments.length;
+      fullSection.innerHTML = `
+        <div class="tabbit-full-section-title">🔍 全面分析 <span style="font-size:11px;color:#999;font-weight:400;">（字幕${rawSubtitleBody.length}句 + 弹幕${danmaku.length}条 + 评论${comments.length}条）</span></div>
+        <div class="tabbit-full-result"><span class="tabbit-typing-cursor"></span></div>
+      `;
+      const resultEl = fullSection.querySelector('.tabbit-full-result');
+
+      const abortBtnWrap = document.createElement('div');
+      abortBtnWrap.style.cssText = 'text-align:center;';
+      abortBtn = insertInlineAbortBtn(abortBtnWrap, function() {
+        abortCurrentTask();
+      });
+      fullSection.appendChild(abortBtnWrap);
+      abortBtn._wrap = abortBtnWrap;
+
+      const messages = [{ role: 'user', content: fullPrompt }];
+
+      const onDelta = createThrottledDelta(function(fullText) {
+        resultEl.textContent = fullText;
+        const cursor = document.createElement('span');
+        cursor.className = 'tabbit-typing-cursor';
+        resultEl.appendChild(cursor);
+      });
+
+      const reply = await callAIStream(messages, onDelta, { signal: localController.signal });
+
+      resultEl.innerHTML = parseMarkdown(reply);
+
+      const actionsDiv = document.createElement('div');
+      actionsDiv.className = 'tabbit-full-actions';
+      actionsDiv.innerHTML = `
+        <button class="tabbit-copy-btn" id="tabbit-copy-full">📋 复制全面分析</button>
+        <button class="tabbit-copy-btn" id="tabbit-flomo-full">发送 FLOMO</button>
+        <span style="font-size:11px;color:#999;margin-left:auto;">🤖 ${currentModel}</span>
+      `;
+      fullSection.appendChild(actionsDiv);
+
+      const copyFullBtn = fullSection.querySelector('#tabbit-copy-full');
+      if (copyFullBtn) {
+        copyFullBtn.addEventListener('click', function() { copyCommentResult(this, reply); });
+      }
+      const flomoFullBtn = fullSection.querySelector('#tabbit-flomo-full');
+      if (flomoFullBtn) {
+        flomoFullBtn.addEventListener('click', function() { sendToFlomo(reply, this); });
+      }
+
+    } catch (err) {
+      console.error('[省流助手-全面分析]', err);
+      if (isAbortError(err)) {
+        fullSection.innerHTML = `
+          <div class="tabbit-full-section-title">🔍 全面分析</div>
+          <div style="background:#fff7e6;border:1px solid #ffd591;border-radius:8px;padding:14px;color:#b76d00;text-align:center;">⏹ 已被用户打断</div>
+        `;
+      } else {
+        fullSection.innerHTML = `
+          <div class="tabbit-full-section-title">🔍 全面分析</div>
+          <div class="tabbit-error">
+            <div class="tabbit-error-title">⚠️ 全面分析失败</div>
+            <div>${escapeHtml(err.message)}</div>
+          </div>
+        `;
+      }
+    } finally {
+      if (abortBtn && abortBtn._wrap && abortBtn._wrap.parentNode) {
+        abortBtn._wrap.remove();
+      }
+      if (currentAbortController === localController) currentAbortController = null;
+      isFullAnalyzing = false;
+      const btn = contentDiv.querySelector('#tabbit-full-btn');
+      if (btn) btn.disabled = false;
+    }
+  }
+
   // ==================== 对话功能（流式 + 打断） ====================
   async function handleSend(panel) {
     const input = panel.querySelector('.tabbit-chat-input');
     const sendBtn = panel.querySelector('.tabbit-chat-send');
     const text = input.value.trim();
     if (!text) return;
-    if (conversationHistory.length === 0) {
-      alert('请等待初始摘要完成后再发起对话');
+    if (conversationHistory.length === 0 && !rawDanmakuChatContext && !rawCommentsChatContext && !rawFullDataChatContext) {
+      alert('请先等待摘要完成或运行弹幕/评论/全面分析后再发起对话');
       return;
+    }
+    // 如果没有初始摘要但有分析数据，创建初始对话上下文
+    if (conversationHistory.length === 0) {
+      let initContext = '你是一个B站视频分析助手，以下是当前视频的相关数据，请基于这些数据回答用户问题。';
+      if (rawFullDataChatContext) initContext += rawFullDataChatContext;
+      else {
+        if (rawDanmakuChatContext) initContext += rawDanmakuChatContext;
+        if (rawCommentsChatContext) initContext += rawCommentsChatContext;
+      }
+      conversationHistory = [{ role: 'user', content: initContext }, { role: 'assistant', content: '已收到视频相关数据，可以开始提问了。' }];
     }
 
     let messagesContainer = panel.querySelector('.tabbit-chat-messages');
@@ -5062,7 +5961,18 @@
     });
 
     try {
-      conversationHistory.push({ role: 'user', content: text });
+      // 构建包含所有可用原始数据的用户消息
+      let userContext = text;
+      let allContext = '';
+      if (rawFullDataChatContext) allContext += rawFullDataChatContext;
+      else {
+        if (rawDanmakuChatContext) allContext += rawDanmakuChatContext;
+        if (rawCommentsChatContext) allContext += rawCommentsChatContext;
+      }
+      if (allContext) {
+        userContext = text + '\n\n[参考数据-仅供参考，不要重复展示]' + allContext;
+      }
+      conversationHistory.push({ role: 'user', content: userContext });
 
       let sentMessages = conversationHistory;
       if (conversationHistory.length > MAX_CONVERSATION_HISTORY) {
@@ -5238,6 +6148,49 @@
                 <textarea class="tabbit-settings-textarea" id="ts-commentTextPresets" placeholder="每行一条，点击填字按钮时随机选择">${escapeHtml(currentCommentTextPresets)}</textarea>
                 <div class="tabbit-settings-hint">用于图片下方「填字并点上传」按钮。每次随机选一条填入评论框。</div>
               </div>
+              <div class="tabbit-switch-row" style="padding:10px 12px;background:#f8f9ff;border:1px solid #e2e6f2;border-radius:8px;">
+                <div>
+                  <div class="tabbit-settings-label">🚀 摘要发评论自动发送</div>
+                  <div class="tabbit-settings-hint" style="margin-top:2px;">开启：点击「摘要发评论」后自动点发布按钮；关闭：只填入评论框，手动点发送</div>
+                </div>
+                <label class="tabbit-switch">
+                  <input type="checkbox" id="ts-autoSubmitCommentSummary" ${CONFIG.autoSubmitCommentSummary ? 'checked' : ''} />
+                  <span class="tabbit-slider"></span>
+                </label>
+              </div>
+            </div>
+          </div>
+
+
+          <div class="tabbit-collapse">
+            <div class="tabbit-collapse-header" data-collapse="analysis-settings">
+              <div class="tabbit-collapse-title">📡 弹幕 & 全面分析</div>
+              <span class="tabbit-collapse-arrow">▶</span>
+            </div>
+            <div class="tabbit-collapse-body">
+              <div class="tabbit-settings-group">
+                <div class="tabbit-settings-label">弹幕分析提示词</div>
+                <textarea class="tabbit-settings-textarea" id="ts-danmakuPromptText" rows="4" placeholder="弹幕分析的 AI 提示词...">${escapeHtml(CONFIG.danmakuPromptText || DANMAKU_PROMPT_TEXT)}</textarea>
+                <div class="tabbit-settings-hint">发送给 AI 的弹幕分析指令。弹幕将作为数据附在提示词后面。</div>
+              </div>
+              <div class="tabbit-settings-group">
+                <div class="tabbit-settings-label">全面分析数据上限（字符）</div>
+                <input class="tabbit-settings-input" id="ts-fullDataMaxChars" type="number" min="10000" max="200000" step="2000" value="${CONFIG.fullDataMaxChars || 64000}" placeholder="64000" />
+                <div class="tabbit-settings-hint">发送给 AI 的全面分析原始数据（字幕+弹幕+评论）最大字符数。超限自动截断。建议先用默认值测试，被 API 拒绝就调小。</div>
+              </div>
+
+              <div class="tabbit-settings-group" style="border-top:1px solid #e8e8f0;padding-top:14px;margin-top:14px;">
+                <div class="tabbit-settings-label">全面分析预设</div>
+                <div class="tabbit-settings-hint" style="margin-bottom:8px;">选择全面分析的提示词预设，可在下方编辑</div>
+                <div id="ts-fullAnalysisPresets" style="display:flex;flex-direction:column;gap:8px;"></div>
+                <button class="tabbit-settings-btn tabbit-settings-btn-secondary" id="ts-fullPreset-add" type="button" style="margin-top:8px;">➕ 新增预设</button>
+              </div>
+
+              <div class="tabbit-settings-group">
+                <div class="tabbit-settings-label">当前预设提示词</div>
+                <textarea class="tabbit-settings-textarea" id="ts-fullAnalysisPromptText" rows="6" placeholder="全面分析的 AI 提示词..."></textarea>
+                <div class="tabbit-settings-hint">编辑当前选中预设的提示词。弹幕和评论将作为舆情数据附在提示词后面。</div>
+              </div>
             </div>
           </div>
 
@@ -5298,7 +6251,7 @@
                 </label>
               </div>
               <div class="tabbit-settings-group" style="margin-top:10px;">
-                <div class="tabbit-settings-label">🎨 生图提示词（自动+手动生图共用）</div>
+                <div class="tabbit-settings-label">复制 生图提示词（自动+手动生图共用）</div>
                 <textarea class="tabbit-settings-textarea" id="ts-imageGenPromptText" placeholder="生图提示词，使用 {summary} 作为视频总结的占位符...">${escapeHtml(CONFIG.imageGenPromptText || IMAGE_GEN_PROMPT_TEXT)}</textarea>
                 <div class="tabbit-settings-hint">用于指导生图模型的提示词模板。使用 <code style="background:#eef;padding:1px 4px;border-radius:3px;">{summary}</code> 占位符表示视频总结内容（运行时自动替换）。如不写占位符，总结会自动追加在末尾。</div>
               </div>
@@ -5462,6 +6415,95 @@
     }
     renderPresetEditList();
 
+    // ==================== 全面分析预设编辑器 ====================
+    let editingFullPresets = JSON.parse(JSON.stringify(CONFIG.fullAnalysisPresets || DEFAULT_FULL_ANALYSIS_PRESETS));
+    let editingFullActiveId = CONFIG.activeFullAnalysisPresetId || (editingFullPresets[0] && editingFullPresets[0].id);
+
+    function syncFullPromptTextarea() {
+      const ta = overlay.querySelector('#ts-fullAnalysisPromptText');
+      if (!ta) return;
+      const active = editingFullPresets.find(function(p) { return p.id === editingFullActiveId; });
+      ta.value = active ? (active.prompt || '') : '';
+    }
+
+    function renderFullPresetEditList() {
+      const listEl = overlay.querySelector('#ts-fullAnalysisPresets');
+      if (!listEl) return;
+      listEl.innerHTML = '';
+      editingFullPresets.forEach(function(preset, idx) {
+        const isActive = preset.id === editingFullActiveId;
+        const row = document.createElement('div');
+        row.style.cssText = 'display:flex;align-items:center;gap:6px;background:' + (isActive ? '#eef0ff' : '#f8f9fa') + ';border:1px solid ' + (isActive ? '#667eea' : '#e8e8f0') + ';border-radius:6px;padding:6px 8px;cursor:pointer;transition:all .15s;';
+        row.innerHTML =
+          '<span style="font-size:16px;">' + (preset.icon || '📄') + '</span>' +
+          '<input class="tabbit-settings-input tabbit-preset-name-input" data-ffield="name" data-fidx="' + idx + '" type="text" value="' + escapeHtml(preset.name || '') + '" placeholder="预设名称" style="flex:1;border:none;background:transparent;font-weight:' + (isActive ? '600' : '400') + ';padding:2px 4px;" />' +
+          '<label style="display:flex;align-items:center;gap:3px;font-size:11px;color:#666;white-space:nowrap;cursor:pointer;">' +
+            '<input type="radio" name="ts-active-full-preset" data-fidx="' + idx + '" ' + (isActive ? 'checked' : '') + ' style="margin:0;" />' +
+            '使用' +
+          '</label>' +
+          '<button class="tabbit-preset-del-btn" data-fidx="' + idx + '" title="删除此预设" style="background:none;border:none;cursor:pointer;font-size:14px;padding:2px;">🗑</button>';
+        listEl.appendChild(row);
+      });
+
+      listEl.querySelectorAll('input[data-ffield]').forEach(function(el) {
+        el.addEventListener('input', function() {
+          const idx = parseInt(el.dataset.fidx, 10);
+          if (editingFullPresets[idx]) {
+            editingFullPresets[idx].name = el.value;
+          }
+        });
+      });
+
+      listEl.querySelectorAll('input[name="ts-active-full-preset"]').forEach(function(el) {
+        el.addEventListener('change', function() {
+          const idx = parseInt(el.dataset.fidx, 10);
+          if (editingFullPresets[idx]) {
+            editingFullActiveId = editingFullPresets[idx].id;
+            syncFullPromptTextarea();
+            renderFullPresetEditList();
+          }
+        });
+      });
+
+      listEl.querySelectorAll('.tabbit-preset-del-btn[data-fidx]').forEach(function(btn) {
+        btn.addEventListener('click', function(e) {
+          e.stopPropagation();
+          const idx = parseInt(btn.dataset.fidx, 10);
+          if (editingFullPresets.length <= 1) {
+            alert('至少保留一个预设');
+            return;
+          }
+          if (!confirm('确定删除「' + (editingFullPresets[idx].name || '未命名') + '」？')) return;
+          const removedId = editingFullPresets[idx].id;
+          editingFullPresets.splice(idx, 1);
+          if (editingFullActiveId === removedId) {
+            editingFullActiveId = editingFullPresets[0].id;
+          }
+          syncFullPromptTextarea();
+          renderFullPresetEditList();
+        });
+      });
+    }
+    renderFullPresetEditList();
+    syncFullPromptTextarea();
+
+    overlay.querySelector('#ts-fullPreset-add').addEventListener('click', function() {
+      editingFullPresets.push({
+        id: 'fullpreset_' + Date.now(),
+        name: '新预设',
+        icon: '✨',
+        prompt: '请基于视频字幕、弹幕和评论进行分析...'
+      });
+      renderFullPresetEditList();
+    });
+
+    // Sync textarea changes back to the active preset
+    overlay.querySelector('#ts-fullAnalysisPromptText').addEventListener('input', function() {
+      const active = editingFullPresets.find(function(p) { return p.id === editingFullActiveId; });
+      if (active) active.prompt = this.value;
+    });
+
+
     overlay.querySelector('#ts-preset-add').addEventListener('click', function() {
       editingPresets.push({
         id: 'preset_' + Date.now(),
@@ -5617,6 +6659,7 @@
         .split('\n')
         .map(function(s) { return s.trim(); })
         .filter(Boolean);
+      CONFIG.autoSubmitCommentSummary = overlay.querySelector('#ts-autoSubmitCommentSummary').checked;
       const newAutoParse = overlay.querySelector('#ts-autoParse').checked;
 
       const cleanedPresets = editingPresets
@@ -5653,6 +6696,32 @@
       if (activeP) CONFIG.promptText = activeP.prompt;
       CONFIG.commentPromptText = newCommentPromptText || COMMENT_PROMPT_TEXT;
       CONFIG.commentTextPresets = newCommentTextPresets.length > 0 ? newCommentTextPresets : DEFAULT_CONFIG.commentTextPresets.slice();
+      const newDanmakuPromptText = overlay.querySelector('#ts-danmakuPromptText').value.trim();
+      CONFIG.danmakuPromptText = newDanmakuPromptText || DANMAKU_PROMPT_TEXT;
+      // Save full analysis presets
+      const cleanedFullPresets = editingFullPresets
+        .map(function(p) {
+          return {
+            id: p.id || ('fullpreset_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8)),
+            name: (p.name || '').trim() || '未命名',
+            icon: (p.icon || '📄').trim(),
+            prompt: (p.prompt || '').trim()
+          };
+        })
+        .filter(function(p) { return p.prompt.length > 0; });
+      if (cleanedFullPresets.length > 0) {
+        CONFIG.fullAnalysisPresets = cleanedFullPresets;
+        let validFullActiveId = editingFullActiveId;
+        if (!cleanedFullPresets.find(function(p) { return p.id === validFullActiveId; })) {
+          validFullActiveId = cleanedFullPresets[0].id;
+        }
+        CONFIG.activeFullAnalysisPresetId = validFullActiveId;
+        var newFullDataMaxChars = parseInt(overlay.querySelector('#ts-fullDataMaxChars').value, 10);
+        CONFIG.fullDataMaxChars = isNaN(newFullDataMaxChars) ? 64000 : Math.max(10000, Math.min(200000, newFullDataMaxChars));
+        const activeFP = cleanedFullPresets.find(function(p) { return p.id === validFullActiveId; });
+        if (activeFP) CONFIG.fullAnalysisPromptText = activeFP.prompt;
+      }
+      CONFIG.autoSubmitCommentSummary = overlay.querySelector('#ts-autoSubmitCommentSummary').checked;
       const newCommentMaxPages = parseInt(overlay.querySelector('#ts-commentMaxPages').value, 10);
       CONFIG.commentMaxPages = isNaN(newCommentMaxPages) ? 8 : Math.max(1, Math.min(20, newCommentMaxPages));
       const newCommentLimit = parseInt(overlay.querySelector('#ts-commentLimit').value, 10);
@@ -5748,6 +6817,18 @@
               var commentTextPresetsEl = overlay.querySelector('#ts-commentTextPresets');
               if (commentTextPresetsEl) commentTextPresetsEl.value = importedCommentTexts.map(function(s) { return String(s || '').trim(); }).filter(Boolean).join('\n') || '省流';
             }
+            if (imported.autoSubmitCommentSummary !== undefined) {
+              var autoSubmitEl = overlay.querySelector('#ts-autoSubmitCommentSummary');
+              if (autoSubmitEl) autoSubmitEl.checked = !!imported.autoSubmitCommentSummary;
+            }
+            if (imported.danmakuPromptText !== undefined) overlay.querySelector('#ts-danmakuPromptText').value = imported.danmakuPromptText;
+            if (imported.fullDataMaxChars !== undefined) { var fdcEl = overlay.querySelector('#ts-fullDataMaxChars'); if (fdcEl) fdcEl.value = imported.fullDataMaxChars; }
+            if (Array.isArray(imported.fullAnalysisPresets) && imported.fullAnalysisPresets.length > 0) {
+              editingFullPresets = JSON.parse(JSON.stringify(imported.fullAnalysisPresets));
+              editingFullActiveId = imported.activeFullAnalysisPresetId || editingFullPresets[0].id;
+              renderFullPresetEditList();
+              syncFullPromptTextarea();
+            }
             if (imported.commentMaxPages !== undefined) overlay.querySelector('#ts-commentMaxPages').value = imported.commentMaxPages;
             if (imported.commentLimit !== undefined) overlay.querySelector('#ts-commentLimit').value = imported.commentLimit;
             if (imported.commentMinDelay !== undefined) overlay.querySelector('#ts-commentMinDelay').value = imported.commentMinDelay;
@@ -5821,6 +6902,8 @@
       overlay.querySelector('#ts-flomoTags').value = DEFAULT_CONFIG.flomoTags;
       overlay.querySelector('#ts-commentPromptText').value = COMMENT_PROMPT_TEXT;
       overlay.querySelector('#ts-commentTextPresets').value = DEFAULT_CONFIG.commentTextPresets.join('\n');
+      CONFIG.autoSubmitCommentSummary = false;
+      var autoSubmitReset = overlay.querySelector('#ts-autoSubmitCommentSummary'); if (autoSubmitReset) autoSubmitReset.checked = false;
       overlay.querySelector('#ts-commentMaxPages').value = DEFAULT_CONFIG.commentMaxPages;
       overlay.querySelector('#ts-commentLimit').value = DEFAULT_CONFIG.commentLimit;
       overlay.querySelector('#ts-commentMinDelay').value = DEFAULT_CONFIG.commentMinDelay;
@@ -5844,6 +6927,12 @@
       editingPresets = JSON.parse(JSON.stringify(DEFAULT_PRESETS));
       editingActiveId = 'preset_default';
       renderPresetEditList();
+      var danmakuPromptReset = overlay.querySelector('#ts-danmakuPromptText'); if (danmakuPromptReset) danmakuPromptReset.value = DANMAKU_PROMPT_TEXT;
+      var fullDataMaxCharsReset = overlay.querySelector('#ts-fullDataMaxChars'); if (fullDataMaxCharsReset) fullDataMaxCharsReset.value = DEFAULT_CONFIG.fullDataMaxChars;
+      editingFullPresets = JSON.parse(JSON.stringify(DEFAULT_FULL_ANALYSIS_PRESETS));
+      editingFullActiveId = 'fullpreset_video_review';
+      renderFullPresetEditList();
+      syncFullPromptTextarea();
     });
   }
   // ==================== 字幕可用性检测 ====================
@@ -5903,10 +6992,16 @@
     currentSubtitleManualFallback = null;
     rawMarkdownResult = '';
     rawTranscript = '';
+    rawSubtitleBody = [];
     currentVideoInfo = null;
     conversationHistory = [];
     commentConversationHistory = [];
     isCommentSummarizing = false;
+    isDanmakuAnalyzing = false;
+    isFullAnalyzing = false;
+    rawDanmakuChatContext = '';
+    rawCommentsChatContext = '';
+    rawFullDataChatContext = '';
     hasParsed = false;
     currentPresetId = CONFIG.activePresetId || 'preset_default';
     const panel = document.querySelector('#tabbit-ai-summary-panel');
@@ -6104,6 +7199,7 @@
           return 'no_subtitle';
         }
 
+        rawSubtitleBody = content;
         const transcript = formatTranscript(content);
         if (!transcript.trim()) {
           return 'no_subtitle';

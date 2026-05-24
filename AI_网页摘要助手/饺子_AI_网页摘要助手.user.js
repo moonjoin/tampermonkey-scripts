@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         饺子 AI 网页摘要助手
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      2.8.1
+// @version      2.8.2
 // @description  指定网站自动弹出 AI 网页摘要，支持连续对话、多预设、多模板、SPA路由，flomo、坚果云双文件云同步。Shadow DOM 隔离样式。
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
@@ -85,6 +85,9 @@
     cloudSync: { account: '', appPassword: '', lastSyncAt: 0, lastSyncDirection: '' },
     autoCopy: { enabled: true, withSource: false },
     flomoTags: '#饺子AI摘要',
+    systemPromptMd: '',
+    systemPromptMdEnabled: false,
+    systemPromptMdAsSystem: true,
   // 🆕 可调参数
   apiTimeout: 120000,
   acCooldown: 2000,
@@ -846,8 +849,17 @@
     );
   }
 
+  function getSystemPromptMd() {
+    if (!config.systemPromptMdEnabled) return '';
+    return (config.systemPromptMd || '').trim();
+  }
+
   function ensurePageContext() {
     if (pageContextLoaded) return;
+    const mdContent = getSystemPromptMd();
+    if (mdContent && config.systemPromptMdAsSystem !== false) {
+      conversation.unshift({ role: 'system', content: '==== 预加载上下文 ====' + '\n' + mdContent });
+    }
     conversation.unshift({ role: 'system', content: buildPageSystemPrompt() });
     pageContextLoaded = true;
   }
@@ -1615,6 +1627,8 @@
       .tabbit-sync-scope label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
 
       .tabbit-settings-actions { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0; }
+      .tabbit-md-actions { display: flex; gap: 8px; margin-bottom: 8px; }
+      .tabbit-md-textarea { width: 100%; min-height: 120px; padding: 8px; border: 1px solid #d9d9d9; border-radius: 6px; font-family: 'SF Mono', Monaco, Consolas, monospace; font-size: 12px; line-height: 1.5; resize: vertical; box-sizing: border-box; background: #fafafa; color: #333; }
       .tabbit-model-row {
         display: grid;
         grid-template-columns: 1.6fr .7fr .8fr auto auto;
@@ -2455,7 +2469,11 @@
     pageContextLoaded = false;
     ensurePageContext();
 
-    const userPrompt = `请按以下要求总结当前页面：\n\n${template.text}`;
+    let userPrompt = `请按以下要求总结当前页面：\n\n${template.text}`;
+    const mdContent = getSystemPromptMd();
+    if (mdContent && config.systemPromptMdAsSystem === false) {
+      userPrompt = '==== 预加载上下文 ====\n' + mdContent + '\n\n' + userPrompt;
+    }
     conversation.push({ role: 'user', content: userPrompt, meta: { hidden: true } });
 
     const runBtn = root?.querySelector('#tabbit-run-btn');
@@ -2518,7 +2536,11 @@
 
     ensurePageContext();
 
-    const userPrompt = `请按以下要求重新总结当前页面（使用「${template.name}」风格）：\n\n${template.text}`;
+    let userPrompt = `请按以下要求重新总结当前页面（使用「${template.name}」风格）：\n\n${template.text}`;
+    const mdContent2 = getSystemPromptMd();
+    if (mdContent2 && config.systemPromptMdAsSystem === false) {
+      userPrompt = '==== 预加载上下文 ====\n' + mdContent2 + '\n\n' + userPrompt;
+    }
     conversation.push({ role: 'user', content: userPrompt, meta: { hidden: true } });
 
     const root = shadowRoot;
@@ -2775,6 +2797,30 @@
             </label>
           </div>
         </div>
+        <div class="tabbit-collapse">
+          <div class="tabbit-collapse-header" data-collapse="toggle">
+            <span class="tabbit-collapse-title">📎 预加载上下文（MD 文件）</span>
+            <span class="tabbit-collapse-arrow">▶</span>
+          </div>
+          <div class="tabbit-collapse-content">
+            <small class="tabbit-help">此处填写的 Markdown 内容会插入到提示词最前面，作为 AI 的上下文。例如：用户偏好、Skill 指令、角色设定等。配合提示词模板使用，AI 会先读取这里的上下文再结合页面内容进行总结。</small>
+            <div class="tabbit-md-actions">
+              <button id="tabbit-md-upload" class="tabbit-secondary-btn" type="button">📂 导入 .md 文件</button>
+              <button id="tabbit-md-clear" class="tabbit-danger-btn" type="button">🗑️ 清空</button>
+              <input id="tabbit-md-file" type="file" accept=".md,.txt,.markdown" style="display:none">
+            </div>
+            <textarea id="tabbit-set-system-md" class="tabbit-md-textarea" rows="10" placeholder="在此粘贴或编写 Markdown 内容...\n\n例如用户偏好：\n- 我对科技、AI、投资话题感兴趣\n- 我是软件工程师\n- 我喜欢简洁的总结风格"></textarea>
+            <small id="tabbit-md-chars" class="tabbit-help">字数：0</small>
+            <label class="tabbit-field" style="margin-top:6px;">
+              <span><input id="tabbit-set-md-enabled" type="checkbox"> 启用上下文注入</span>
+            </label>
+            <label class="tabbit-field">
+              <span><input id="tabbit-set-md-as-system" type="checkbox" checked> 作为独立 System 消息注入</span>
+              <small>开启：单独一条 system 消息（推荐，更清晰）。关闭：拼接在用户提示词前面。</small>
+            </label>
+          </div>
+        </div>
+
 
 
         <div class="tabbit-collapse">
@@ -2838,6 +2884,38 @@
     settingsEl.querySelector('#tabbit-set-close').addEventListener('click', closeSettings);
     settingsEl.querySelector('#tabbit-set-cancel').addEventListener('click', closeSettings);
     settingsEl.querySelector('#tabbit-set-save').addEventListener('click', saveSettingsFromForm);
+
+    // MD 文件导入/清空/字数统计
+    const mdUploadBtn = settingsEl.querySelector('#tabbit-md-upload');
+    const mdFileInput = settingsEl.querySelector('#tabbit-md-file');
+    const mdClearBtn = settingsEl.querySelector('#tabbit-md-clear');
+    const mdTextarea = settingsEl.querySelector('#tabbit-set-system-md');
+    const mdCharsEl = settingsEl.querySelector('#tabbit-md-chars');
+    if (mdUploadBtn && mdFileInput) {
+      mdUploadBtn.addEventListener('click', () => mdFileInput.click());
+      mdFileInput.addEventListener('change', (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = (ev) => {
+          mdTextarea.value = ev.target.result;
+          if (mdCharsEl) mdCharsEl.textContent = '字数：' + ev.target.result.length;
+        };
+        reader.readAsText(file);
+        mdFileInput.value = '';
+      });
+    }
+    if (mdClearBtn && mdTextarea) {
+      mdClearBtn.addEventListener('click', () => {
+        mdTextarea.value = '';
+        if (mdCharsEl) mdCharsEl.textContent = '字数：0';
+      });
+    }
+    if (mdTextarea && mdCharsEl) {
+      mdTextarea.addEventListener('input', () => {
+        mdCharsEl.textContent = '字数：' + mdTextarea.value.length;
+      });
+    }
     settingsEl.querySelector('#tabbit-set-profile-select').addEventListener('change', handleProfileSwitch);
     settingsEl.querySelector('#tabbit-profile-add').addEventListener('click', handleProfileAdd);
     settingsEl.querySelector('#tabbit-profile-clone').addEventListener('click', handleProfileClone);
@@ -2952,6 +3030,17 @@
     settingsEl.querySelector('#tabbit-set-auto-copy-source').checked = !!config.autoCopy?.withSource;
     settingsEl.querySelector('#tabbit-set-jgy-account').value = config.cloudSync?.account || '';
     settingsEl.querySelector('#tabbit-set-jgy-password').value = config.cloudSync?.appPassword || '';
+
+    const mdTa = settingsEl.querySelector('#tabbit-set-system-md');
+    if (mdTa) {
+      mdTa.value = config.systemPromptMd || '';
+      const mdChars = settingsEl.querySelector('#tabbit-md-chars');
+      if (mdChars) mdChars.textContent = '字数：' + (config.systemPromptMd || '').length;
+    }
+    const mdEnabled = settingsEl.querySelector('#tabbit-set-md-enabled');
+    if (mdEnabled) mdEnabled.checked = !!config.systemPromptMdEnabled;
+    const mdAsSystem = settingsEl.querySelector('#tabbit-set-md-as-system');
+    if (mdAsSystem) mdAsSystem.checked = config.systemPromptMdAsSystem !== false;
 
     const cs = settingsEl.querySelector('#tabbit-cloud-status');
     if (cs) {
@@ -3114,6 +3203,12 @@
     config.acMinLen = Number(settingsEl.querySelector('#tabbit-set-ac-min-len').value || 2);
     config.acCooldown = Number(settingsEl.querySelector('#tabbit-set-ac-cooldown').value || 2000);
     config.acTempMinutes = Number(settingsEl.querySelector('#tabbit-set-ac-temp-minutes').value || 10);
+    const mdTa2 = settingsEl.querySelector('#tabbit-set-system-md');
+    if (mdTa2) config.systemPromptMd = mdTa2.value;
+    const mdEn2 = settingsEl.querySelector('#tabbit-set-md-enabled');
+    if (mdEn2) config.systemPromptMdEnabled = mdEn2.checked;
+    const mdSys2 = settingsEl.querySelector('#tabbit-set-md-as-system');
+    if (mdSys2) config.systemPromptMdAsSystem = mdSys2.checked;
     config.flomoApiUrl = settingsEl.querySelector('#tabbit-set-flomo-api').value.trim();
     config.flomoTags = settingsEl.querySelector('#tabbit-set-flomo-tags').value.trim() || '#饺子AI摘要';
     config.autoCopy = {
