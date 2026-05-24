@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站省流助手 - 字幕AI摘要 Pro
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      4.1.0
+// @version      4.1.1
 // @description  自动提取B站视频字幕，通过自定义AI API生成极简摘要，支持模型切换、持续对话和评论区总结；支持自动解析开关、自动获取模型列表、flomo自动加标签，新增总结生图功能；v3.9.0 新增html PPT模式；v4.0.0 新增新手引导和API兜底功能（无API时仍可下载字幕、一键复制提示词+字幕到其他AI）
 // @author       次元饺子
 // @match        https://www.bilibili.com/video/*
@@ -5734,6 +5734,7 @@
   let rawDanmakuChatContext = '';
   let rawCommentsChatContext = '';
   let rawFullDataChatContext = '';
+  let lastFullPromptText = '';
 
   const FULL_ANALYSIS_PROMPT = '你是一个专业的视频内容全面分析师。请对以下视频的字幕内容、弹幕和评论进行综合分析，输出一份完整的分析报告，包括：\n1. 【视频核心内容】用简洁的话概括视频到底在讲什么\n2. 【弹幕热评联动】哪些字幕片段引发了最热烈的弹幕/评论讨论，分析观众的反应和情绪\n3. 【观众共鸣点】弹幕和评论中反复出现的话题、梗或观点\n4. 【争议与分歧】弹幕/评论中存在对立看法的地方\n5. 【时间轴亮点】按时间线标注视频中哪些时刻引发了最多的弹幕互动\n6. 【综合评价】综合字幕+弹幕+评论，给出这个视频的整体质量和口碑\n7. 我理解能力差、没耐心，别讲铺垫、别讲背景、别讲废话，只告诉我核心结论和关键点。';
 
@@ -5827,6 +5828,7 @@
       rawFullDataChatContext = '\n\n[全面分析原始数据]\n' + fullDataText;
       const activeFullPrompt = CONFIG.fullAnalysisPromptText || FULL_ANALYSIS_PROMPT;
       const fullPrompt = activeFullPrompt + '\n\n以下是完整数据：\n' + fullDataText;
+      lastFullPromptText = fullPrompt;
 
       const totalItems = (rawSubtitleBody.length || 0) + danmaku.length + comments.length;
       fullSection.innerHTML = `
@@ -5861,6 +5863,7 @@
       actionsDiv.innerHTML = `
         <button class="tabbit-copy-btn" id="tabbit-copy-full">📋 复制全面分析</button>
         <button class="tabbit-copy-btn" id="tabbit-flomo-full">发送 FLOMO</button>
+        <button class="tabbit-copy-btn" id="tabbit-export-full">📄 导出原文</button>
         <span style="font-size:11px;color:#999;margin-left:auto;">🤖 ${currentModel}</span>
       `;
       fullSection.appendChild(actionsDiv);
@@ -5872,6 +5875,16 @@
       const flomoFullBtn = fullSection.querySelector('#tabbit-flomo-full');
       if (flomoFullBtn) {
         flomoFullBtn.addEventListener('click', function() { sendToFlomo(reply, this); });
+      }
+      const exportFullBtn = fullSection.querySelector('#tabbit-export-full');
+      if (exportFullBtn) {
+        exportFullBtn.addEventListener("click", function() {
+          if (!lastFullPromptText) { alert("没有可导出的原文数据"); return; }
+          var title = (videoInfo && videoInfo.title) || "全面分析";
+          var safeTitle = sanitizeFilename(title) || "全面分析";
+          var ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+          triggerDownload(lastFullPromptText, safeTitle + "__全面分析原文__" + ts + ".txt", "text/plain;charset=utf-8");
+        });
       }
 
     } catch (err) {
