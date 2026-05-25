@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         饺子 AI 网页摘要助手
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      2.8.2
-// @description  指定网站自动弹出 AI 网页摘要，支持连续对话、多预设、多模板、SPA路由，flomo、坚果云双文件云同步。Shadow DOM 隔离样式。
+// @version      2.8.4
+// @description  指定网站自动弹出 AI 网页摘要，支持连续对话、多预设、多模板、SPA路由、摘要生图、flomo、坚果云双文件云同步。Shadow DOM 隔离样式。
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
 // @match        *://*/*
@@ -44,6 +44,10 @@
     '\n\n## 值得关注的细节\n如果有数据、案例、引用、关键人物，请单独列出。' +
     '\n\n## 我的解读建议\n如果可能，给出一段独立思考或建议（可选）。';
 
+  const IMAGE_GEN_PROMPT_TEXT =
+    '根据以下网页摘要，生成一张信息可视化的精美配图，风格清晰美观，适合作为网页摘要的封面图：\n\n{summary}';
+  const IMAGE_GEN_SUMMARY_MAX_LEN = 5000;
+
   const DEFAULT_PROFILE = {
     id: 'default',
     name: '默认配置',
@@ -84,6 +88,13 @@
     extractMaxChars: 16000,
     cloudSync: { account: '', appPassword: '', lastSyncAt: 0, lastSyncDirection: '' },
     autoCopy: { enabled: true, withSource: false },
+    enableImageGen: false,
+    imageGenApiUrl: '',
+    imageGenApiKey: '',
+    imageGenModel: 'gemini-3.1-flash-image-preview',
+    imageGenSize: '1024x1024',
+    enableImageAutoDownload: true,
+    imageGenPromptText: IMAGE_GEN_PROMPT_TEXT,
     flomoTags: '#饺子AI摘要',
     systemPromptMd: '',
     systemPromptMdEnabled: false,
@@ -257,6 +268,36 @@
     if (apiUrl.endsWith('/')) return apiUrl + 'models';
     return apiUrl + '/v1/models';
   }
+  function normalizeImageSizeInput(raw) {
+    const value = String(raw || '').trim().replace(/[×＊*]/g, 'x').toLowerCase();
+    if (!value) return '1024x1024';
+    if (value === 'auto') return value;
+    if (!/^\d{2,5}x\d{2,5}$/.test(value)) return '';
+    return value;
+  }
+  function normalizeApiUrlInput(apiUrl) {
+    return String(apiUrl || '').trim().replace(/\/+$/, '');
+  }
+  function escapeRegExp(text) {
+    return String(text || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+  function buildApiUrl(apiUrl, endpointPath) {
+    const endpoint = String(endpointPath || '').replace(/^\/+/, '');
+    let url = normalizeApiUrlInput(apiUrl);
+    if (!url || !endpoint) return url;
+
+    const exactEndpointReg = new RegExp('/' + escapeRegExp(endpoint) + '$', 'i');
+    if (exactEndpointReg.test(url)) return url;
+
+    const versionMatch = url.match(/^(.*\/v\d+)(?:\/.*)?$/i);
+    if (versionMatch) return versionMatch[1] + '/' + endpoint;
+
+    if (/\/(?:chat\/completions|completions|images\/generations|images\/edits|responses|models)$/i.test(url)) {
+      return url.replace(/\/(?:chat\/completions|completions|images\/generations|images\/edits|responses|models)$/i, '/' + endpoint);
+    }
+
+    return url + '/' + endpoint;
+  }
   function formatApiError(status, body) {
     let msg = `HTTP ${status}`;
     try {
@@ -274,6 +315,13 @@
     return patterns.some(p => {
       try { return urlPatternToRegExp(p).test(url); } catch (e) { return false; }
     });
+  }
+  function sanitizeFilename(str) {
+    return String(str || '').replace(/[\\/:*?"<>|]/g, '_').replace(/\s+/g, ' ').trim();
+  }
+  function writeClipboard(text) {
+    if (typeof GM_setClipboard === 'function') GM_setClipboard(text);
+    else navigator.clipboard?.writeText(text);
   }
 
   /******************************************************************
@@ -403,6 +451,13 @@
     }
     result.extractMaxChars = Number(result.extractMaxChars || 16000);
     result.autoCopy = { ...base.autoCopy, ...(saved.autoCopy || {}) };
+    result.enableImageGen = saved.enableImageGen === true;
+    result.imageGenApiUrl = String(saved.imageGenApiUrl || '');
+    result.imageGenApiKey = String(saved.imageGenApiKey || '');
+    result.imageGenModel = String(saved.imageGenModel || base.imageGenModel || '').trim() || base.imageGenModel;
+    result.imageGenSize = normalizeImageSizeInput(saved.imageGenSize || base.imageGenSize) || base.imageGenSize;
+    result.enableImageAutoDownload = saved.enableImageAutoDownload !== false;
+    result.imageGenPromptText = String(saved.imageGenPromptText || base.imageGenPromptText || IMAGE_GEN_PROMPT_TEXT);
 
     // 🆕 可调参数归一化
     result.apiTimeout = Number(result.apiTimeout || 120000);
@@ -432,6 +487,8 @@
       config.rulePromptBindings = normalizeRulePromptBindings(config.rulePromptBindings);
       config.promptTemplates = normalizePromptTemplates(config.promptTemplates);
       config.profiles = normalizeProfiles(config.profiles);
+      config.imageGenSize = normalizeImageSizeInput(config.imageGenSize) || DEFAULT_CONFIG.imageGenSize;
+      config.imageGenPromptText = String(config.imageGenPromptText || IMAGE_GEN_PROMPT_TEXT);
       if (!config.profiles.some(p => p.id === config.currentProfileId)) {
         config.currentProfileId = config.profiles[0].id;
       }
@@ -816,6 +873,311 @@
   }
 
   /******************************************************************
+   * 6.5 摘要生图
+   ******************************************************************/
+  function buildImagePrompt(textContent) {
+    const summaryForImage = String(textContent || '')
+      .slice(0, IMAGE_GEN_SUMMARY_MAX_LEN)
+      .replace(/[#*_\[\]()]/g, '');
+    const promptTemplate = config.imageGenPromptText || IMAGE_GEN_PROMPT_TEXT;
+    return promptTemplate.includes('{summary}')
+      ? promptTemplate.replace(/\{summary\}/g, summaryForImage)
+      : promptTemplate + '\n\n' + summaryForImage;
+  }
+
+  function addUniqueImageCandidate(candidates, kind, url) {
+    url = normalizeApiUrlInput(url);
+    if (!url) return;
+    const key = kind + '|' + url;
+    if (candidates.some(item => item.key === key)) return;
+    candidates.push({ key, kind, url });
+  }
+
+  function buildImageApiCandidates(apiUrl) {
+    const url = normalizeApiUrlInput(apiUrl);
+    const candidates = [];
+    if (!url) return candidates;
+
+    if (/\/images\/generations$/i.test(url)) addUniqueImageCandidate(candidates, 'images', url);
+    if (/\/responses$/i.test(url)) addUniqueImageCandidate(candidates, 'responses', url);
+    addUniqueImageCandidate(candidates, 'images', buildApiUrl(url, 'images/generations'));
+    addUniqueImageCandidate(candidates, 'responses', buildApiUrl(url, 'responses'));
+    if (/\/chat\/completions$/i.test(url)) addUniqueImageCandidate(candidates, 'chat', url);
+    addUniqueImageCandidate(candidates, 'chat', buildApiUrl(url, 'chat/completions'));
+    return candidates;
+  }
+
+  function getImageRequestBodies(kind, model, imagePrompt) {
+    const size = config.imageGenSize || '1024x1024';
+    if (kind === 'images') {
+      const baseBody = { model, prompt: imagePrompt, n: 1, size };
+      return [
+        { ...baseBody, response_format: 'b64_json' },
+        baseBody
+      ];
+    }
+    if (kind === 'responses') {
+      const tool = { type: 'image_generation' };
+      if (size && size !== 'auto') tool.size = size;
+      return [
+        { model, input: imagePrompt, tools: [tool] },
+        { model, input: imagePrompt, tools: [{ type: 'image_generation' }] }
+      ];
+    }
+    const sizeHint = size && size !== 'auto' ? '\n\n请严格按 ' + size + ' 画布尺寸生成，保持对应宽高比。' : '';
+    return [
+      { model, messages: [{ role: 'user', content: imagePrompt + sizeHint }] },
+      { model, messages: [{ role: 'user', content: imagePrompt + sizeHint }], modalities: ['text', 'image'] }
+    ];
+  }
+
+  function normalizeExtractedImage(value) {
+    const text = String(value || '').trim();
+    if (!text) return '';
+    if (/^data:image\//i.test(text) || /^https?:\/\//i.test(text)) return text;
+    const compact = text.replace(/\s/g, '');
+    if (compact.length > 100 && /^[A-Za-z0-9+/]+={0,2}$/.test(compact)) {
+      return 'data:image/png;base64,' + compact;
+    }
+    return '';
+  }
+
+  function extractImageDataUrlFromResponse(data) {
+    if (!data) return '';
+    const seen = new Set();
+    function walk(node, key, parent) {
+      if (node == null) return '';
+      if (typeof node === 'string') {
+        if (/^(b64_json|base64|image_base64|result|data)$/i.test(key || '')) {
+          const parentType = String(parent && (parent.type || parent.kind || parent.object || parent.mime_type || parent.mimeType) || '');
+          if (!parentType || /image|generation|inline/i.test(parentType)) {
+            const direct = normalizeExtractedImage(node);
+            if (direct) return direct;
+          }
+        }
+        if (/^(url|image_url|output_url)$/i.test(key || '')) {
+          const direct = normalizeExtractedImage(node);
+          if (direct) return direct;
+        }
+        const dataUrlMatch = node.match(/data:image\/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=\s]+/i);
+        if (dataUrlMatch) return normalizeExtractedImage(dataUrlMatch[0]);
+        const markdownImageMatch = node.match(/!\[[^\]]*]\((https?:\/\/[^)\s]+|data:image\/[^)\s]+)\)/i);
+        if (markdownImageMatch) return normalizeExtractedImage(markdownImageMatch[1]);
+        return '';
+      }
+      if (typeof node !== 'object') return '';
+      if (seen.has(node)) return '';
+      seen.add(node);
+
+      if (node.image_url && typeof node.image_url === 'object') {
+        const directImageUrl = walk(node.image_url.url || node.image_url.data || node.image_url.b64_json, 'image_url', node.image_url);
+        if (directImageUrl) return directImageUrl;
+      }
+      if (Array.isArray(node)) {
+        for (const item of node) {
+          const found = walk(item, key, parent);
+          if (found) return found;
+        }
+        return '';
+      }
+      for (const prop of Object.keys(node)) {
+        const found = walk(node[prop], prop, node);
+        if (found) return found;
+      }
+      return '';
+    }
+    return walk(data, '', null);
+  }
+
+  function requestImageFromCandidate(candidate, apiKey, model, imagePrompt) {
+    const bodies = getImageRequestBodies(candidate.kind, model, imagePrompt);
+    let lastError = '';
+
+    const requestOne = (body) => new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method: 'POST',
+        url: candidate.url,
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer ' + apiKey
+        },
+        data: JSON.stringify(body),
+        timeout: Math.max(config.apiTimeout || 120000, 180000),
+        onload(res) {
+          const text = res.responseText || '';
+          let data = null;
+          try { data = text ? JSON.parse(text) : null; } catch (e) {}
+          if (res.status < 200 || res.status >= 300) {
+            reject(new Error(formatApiError(res.status, text)));
+            return;
+          }
+          const imageDataUrl = extractImageDataUrlFromResponse(data || text);
+          if (imageDataUrl) resolve(imageDataUrl);
+          else reject(new Error('响应里没有解析到图片数据'));
+        },
+        onerror() { reject(new Error('网络请求失败')); },
+        ontimeout() { reject(new Error('生图请求超时')); }
+      });
+    });
+
+    return bodies.reduce((chain, body) => {
+      return chain.catch(async () => {
+        try {
+          return await requestOne(body);
+        } catch (err) {
+          lastError = err.message || String(err);
+          throw err;
+        }
+      });
+    }, Promise.reject()).catch(() => {
+      throw new Error(lastError || '生图请求失败');
+    });
+  }
+
+  async function generateImageByApi(apiUrl, apiKey, model, imagePrompt) {
+    const candidates = buildImageApiCandidates(apiUrl);
+    let lastError = '';
+    for (const candidate of candidates) {
+      try {
+        console.log('[饺子AI-生图] 尝试 ' + candidate.kind + ' 接口:', candidate.url);
+        const imageDataUrl = await requestImageFromCandidate(candidate, apiKey, model, imagePrompt);
+        console.log('[饺子AI-生图] ✅ ' + candidate.kind + ' 接口返回图片');
+        return imageDataUrl;
+      } catch (err) {
+        lastError = candidate.kind + ' ' + candidate.url + ' -> ' + (err.message || String(err));
+        console.warn('[饺子AI-生图] ' + lastError);
+      }
+    }
+    throw new Error(lastError || '生图 API 未返回图片数据');
+  }
+
+  function downloadGeneratedImage(imageDataUrl, title, suffix) {
+    if (!imageDataUrl || imageDataUrl === 'ERROR') return false;
+    const safeTitle = sanitizeFilename(title || document.title || '网页摘要') || '网页摘要';
+    const a = document.createElement('a');
+    a.href = imageDataUrl;
+    a.download = safeTitle + (suffix || '_配图') + '.png';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    return true;
+  }
+
+  function openImagePreview(imageDataUrl) {
+    const overlay = document.createElement('div');
+    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.85);z-index:2147483647;display:flex;align-items:center;justify-content:center;cursor:zoom-out;';
+    const bigImg = document.createElement('img');
+    bigImg.src = imageDataUrl;
+    bigImg.style.cssText = 'max-width:95vw;max-height:95vh;border-radius:8px;box-shadow:0 8px 32px rgba(0,0,0,0.3);';
+    overlay.appendChild(bigImg);
+    overlay.addEventListener('click', () => overlay.remove());
+    document.body.appendChild(overlay);
+  }
+
+  function getLatestAssistantMessageIndex() {
+    for (let i = conversation.length - 1; i >= 0; i--) {
+      const m = conversation[i];
+      if (m && m.role === 'assistant' && !m.meta?.hidden && !m.meta?.streaming && String(m.content || '').trim()) return i;
+    }
+    return -1;
+  }
+
+  function renderImageResult(slot, imageDataUrl) {
+    if (!slot) return;
+    slot.innerHTML = `
+      <div class="tabbit-img-wrap">
+        <img src="${escapeAttr(imageDataUrl)}" title="点击查看大图">
+        <div class="tabbit-img-actions">
+          <button class="tabbit-secondary-btn tabbit-save-img-btn" type="button">💾 保存图片</button>
+        </div>
+      </div>
+    `;
+    const img = slot.querySelector('img');
+    if (img) img.addEventListener('click', () => openImagePreview(imageDataUrl));
+    const saveBtn = slot.querySelector('.tabbit-save-img-btn');
+    if (saveBtn) saveBtn.addEventListener('click', () => downloadGeneratedImage(imageDataUrl, document.title, '_配图'));
+  }
+
+  async function triggerImageGenForMessage(msgIndex, btn, opts) {
+    opts = opts || {};
+    const msg = conversation[msgIndex];
+    if (!msg || msg.role !== 'assistant' || !String(msg.content || '').trim()) {
+      setStatus('没有可用于生图的 AI 回复', 'error', 1800);
+      return;
+    }
+
+    const profile = getCurrentProfile();
+    const apiUrl = config.imageGenApiUrl || profile.apiUrl;
+    const apiKey = config.imageGenApiKey || profile.apiKey;
+    const model = config.imageGenModel || 'gemini-3.1-flash-image-preview';
+    if (!apiUrl || !apiKey || !model) {
+      openSettings();
+      setStatus('请先配置生图 API URL、Key 和模型', 'error', 2500);
+      return;
+    }
+
+    const root = shadowRoot;
+    const slot = root?.querySelector(`#tabbit-img-slot-${msgIndex}`);
+    const originalText = btn?.textContent || '';
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = '⏳ 生成中';
+    }
+    if (slot) {
+      slot.innerHTML = `
+        <div class="tabbit-img-wrap tabbit-img-loading">
+          <div class="tabbit-spinner"></div>
+          <div class="tabbit-img-loading-title">配图生成中，请稍候...</div>
+          <div class="tabbit-img-loading-sub">使用当前 AI 回复作为生图内容</div>
+        </div>
+      `;
+    }
+    setStatus('正在生成配图...', 'loading');
+
+    try {
+      const imagePrompt = buildImagePrompt(msg.content);
+      const imageDataUrl = await generateImageByApi(apiUrl, apiKey, model, imagePrompt);
+      msg.meta = { ...(msg.meta || {}), imageDataUrl };
+      if (slot) renderImageResult(slot, imageDataUrl);
+      if (config.enableImageAutoDownload !== false) downloadGeneratedImage(imageDataUrl, document.title, '_配图');
+      if (btn) btn.textContent = '🔁 重新生成';
+      setStatus(opts.auto ? '摘要和配图已完成' : '配图生成完成', 'ok', 1800);
+    } catch (err) {
+      if (slot) {
+        slot.innerHTML = `<div class="tabbit-img-error">⚠️ 配图生成失败：${escapeAttr(err.message || err)}</div>`;
+      }
+      if (btn) btn.textContent = originalText || '🖼️ 生成配图';
+      setStatus('配图生成失败', 'error', 2500);
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  function bindMessageImageActions() {
+    const root = shadowRoot;
+    if (!root) return;
+    root.querySelectorAll('.tabbit-gen-image-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        triggerImageGenForMessage(Number(btn.dataset.msgIndex), btn);
+      });
+    });
+    root.querySelectorAll('.tabbit-copy-image-prompt-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const msg = conversation[Number(btn.dataset.msgIndex)];
+        const text = buildImagePrompt(msg?.content || '');
+        if (!text.trim()) {
+          setStatus('没有可复制的生图提示词', 'error', 1500);
+          return;
+        }
+        writeClipboard(text);
+        const old = btn.textContent;
+        btn.textContent = '✅ 已复制';
+        setTimeout(() => { btn.textContent = old || '复制生图提示词'; }, 1600);
+      });
+    });
+  }
+
+  /******************************************************************
    * 7. 💬 对话状态管理 + 对话缓存
    ******************************************************************/
   let conversation = [];
@@ -869,19 +1231,34 @@
     if (!root) return;
     const body = root.querySelector('#tabbit-body');
     if (!body) return;
-    const visibleMsgs = conversation.filter(m => m.role !== 'system' && !m.meta?.hidden);
+    const visibleMsgs = conversation
+      .map((m, index) => ({ m, index }))
+      .filter(item => item.m.role !== 'system' && !item.m.meta?.hidden);
     if (!visibleMsgs.length) {
       body.innerHTML = `<p class="tabbit-placeholder">点击「✨ 总结」开始，或在下方输入框直接提问。</p>`;
       return;
     }
-    body.innerHTML = visibleMsgs.map(m => {
+    body.innerHTML = visibleMsgs.map(({ m, index }) => {
       if (m.role === 'user') {
         return `<div class="tabbit-msg tabbit-msg-user"><div class="tabbit-msg-role">🙋 我</div><div class="tabbit-msg-content">${_md(m.content)}</div></div>`;
       } else {
         const cursor = m.meta?.streaming ? '<span class="tabbit-cursor">▍</span>' : '';
-        return `<div class="tabbit-msg tabbit-msg-assistant"><div class="tabbit-msg-role">🤖 ${escapeAttr(m.meta?.model || 'AI')}${m.meta?.streaming ? ' · 输出中…' : ''}</div><div class="tabbit-msg-content">${_md(m.content)}${cursor}</div></div>`;
+        const imageActions = m.meta?.streaming ? '' : `
+          <div class="tabbit-msg-actions">
+            <button class="tabbit-secondary-btn tabbit-gen-image-btn" type="button" data-msg-index="${index}">🖼️ 生成配图</button>
+            <button class="tabbit-secondary-btn tabbit-copy-image-prompt-btn" type="button" data-msg-index="${index}">复制生图提示词</button>
+          </div>
+          <div class="tabbit-image-slot" id="tabbit-img-slot-${index}"></div>
+        `;
+        return `<div class="tabbit-msg tabbit-msg-assistant"><div class="tabbit-msg-role">🤖 ${escapeAttr(m.meta?.model || 'AI')}${m.meta?.streaming ? ' · 输出中…' : ''}</div><div class="tabbit-msg-content">${_md(m.content)}${cursor}</div>${imageActions}</div>`;
       }
     }).join('');
+    visibleMsgs.forEach(({ m, index }) => {
+      if (m.role === 'assistant' && m.meta?.imageDataUrl) {
+        renderImageResult(body.querySelector(`#tabbit-img-slot-${index}`), m.meta.imageDataUrl);
+      }
+    });
+    bindMessageImageActions();
     body.scrollTop = body.scrollHeight;
   }
 
@@ -1295,6 +1672,71 @@
         background: #fafafa;
         border: 1px solid #eee;
       }
+      .tabbit-msg-actions {
+        display: flex;
+        gap: 6px;
+        flex-wrap: wrap;
+        margin-top: 6px;
+      }
+      .tabbit-image-slot:empty { display: none; }
+      .tabbit-image-slot {
+        margin-top: 8px;
+      }
+      .tabbit-img-wrap {
+        text-align: center;
+        padding: 10px;
+        border: 1px solid #e5e7eb;
+        border-radius: 10px;
+        background: #fafafa;
+      }
+      .tabbit-img-wrap img {
+        max-width: 100%;
+        border-radius: 8px;
+        box-shadow: 0 4px 16px rgba(0,0,0,0.12);
+        cursor: pointer;
+      }
+      .tabbit-img-actions {
+        display: flex;
+        justify-content: center;
+        gap: 8px;
+        flex-wrap: wrap;
+        margin-top: 8px;
+      }
+      .tabbit-img-loading {
+        padding: 24px 14px;
+        border: 1px dashed #c5d3ff;
+        background: linear-gradient(135deg, #f0f4ff, #fff5f8);
+      }
+      .tabbit-img-loading-title {
+        font-size: 13px;
+        color: #667eea;
+        font-weight: 700;
+        margin-top: 8px;
+      }
+      .tabbit-img-loading-sub {
+        font-size: 11px;
+        color: #888;
+        margin-top: 4px;
+      }
+      .tabbit-img-error {
+        margin-top: 8px;
+        padding: 10px 12px;
+        background: #fff3f3;
+        border: 1px solid #ffcccc;
+        border-radius: 8px;
+        color: #c00;
+        font-size: 12px;
+      }
+      .tabbit-spinner {
+        width: 24px;
+        height: 24px;
+        margin: 0 auto;
+        border: 3px solid rgba(102,126,234,.2);
+        border-top-color: #667eea;
+        border-radius: 50%;
+        animation: tabbitSpin .8s linear infinite;
+      }
+      @keyframes tabbitSpin { to { transform: rotate(360deg); } }
       .tabbit-msg-content > *:first-child { margin-top: 0; }
       .tabbit-msg-content > *:last-child { margin-bottom: 0; }
 
@@ -2025,6 +2467,7 @@
         <button id="tabbit-preview-btn" class="tabbit-secondary-btn" title="预览抓取到的正文">👁</button>
         <button id="tabbit-addrule-btn" class="tabbit-secondary-btn" title="把当前网址加入规则">📌</button>
         <button id="tabbit-copy-btn" class="tabbit-secondary-btn" title="复制全部对话">📋</button>
+        <button id="tabbit-image-btn" class="tabbit-secondary-btn" title="给最近一次 AI 回复生成配图">🖼️</button>
         <button id="tabbit-flomo-btn" class="tabbit-secondary-btn" title="发送到 flomo">🌱</button>
         <button id="tabbit-clear-btn" class="tabbit-danger-btn" title="清空对话">🗑</button>
       </div>
@@ -2066,6 +2509,14 @@
     panelEl.querySelector('#tabbit-preview-btn').addEventListener('click', showPagePreview);
     panelEl.querySelector('#tabbit-addrule-btn').addEventListener('click', quickAddCurrentUrlToRules);
     panelEl.querySelector('#tabbit-copy-btn').addEventListener('click', copyAllConversation);
+    panelEl.querySelector('#tabbit-image-btn').addEventListener('click', (e) => {
+      const idx = getLatestAssistantMessageIndex();
+      if (idx < 0) {
+        setStatus('先生成一段 AI 总结，再生图', 'error', 1800);
+        return;
+      }
+      triggerImageGenForMessage(idx, e.currentTarget);
+    });
     panelEl.querySelector('#tabbit-flomo-btn').addEventListener('click', sendToFlomo);
     panelEl.querySelector('#tabbit-clear-btn').addEventListener('click', handleClearConversation);
     panelEl.querySelector('#tabbit-send-btn').addEventListener('click', handleSendChat);
@@ -2507,6 +2958,9 @@
       if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
       renderConversation();
       setStatus('完成', 'ok', 1500);
+      if (config.enableImageGen === true) {
+        triggerImageGenForMessage(conversation.indexOf(streamingMsg), null, { auto: true });
+      }
     } catch (err) {
       if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
       if (streamingMsg.content) {
@@ -2575,6 +3029,9 @@
       if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
       renderConversation();
       setStatus('完成', 'ok', 1500);
+      if (config.enableImageGen === true) {
+        triggerImageGenForMessage(conversation.indexOf(streamingMsg), null, { auto: true });
+      }
     } catch (err) {
       if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
       if (streamingMsg.content) {
@@ -2748,7 +3205,7 @@
 
         <div class="tabbit-collapse">
           <div class="tabbit-collapse-header" data-collapse="toggle">
-            <span class="tabbit-collapse-title">🔧 通用参数</span>
+            <span class="tabbit-collapse-title">🔧 通用参数 + 自动复制</span>
             <span class="tabbit-collapse-arrow">▶</span>
           </div>
           <div class="tabbit-collapse-content">
@@ -2788,12 +3245,66 @@
             <label class="tabbit-field">
               <span><input id="tabbit-set-auto-run" type="checkbox"> 命中网址规则时自动弹出并总结</span>
             </label>
+            <div class="tabbit-section-title">📋 自动复制</div>
+            <small class="tabbit-help">选中文本后自动复制到剪贴板，可选择是否附带页面标题和链接作为出处。也可右键点击浮动按钮快速切换。</small>
+            <label class="tabbit-field">
+              <span><input id="tabbit-set-auto-copy" type="checkbox"> 开启自动复制（选中文本自动复制）</span>
+            </label>
+            <label class="tabbit-field">
+              <span><input id="tabbit-set-auto-copy-source" type="checkbox"> 复制时附带出处信息（页面标题 + 链接）</span>
+            </label>
             <label class="tabbit-field"><span>flomo API（可选，PRO 会员功能）</span>
               <input id="tabbit-set-flomo-api" type="text" placeholder="https://flomoapp.com/iwh/...">
             </label>
             <label class="tabbit-field"><span>🏷️ flomo 标签</span>
               <input id="tabbit-set-flomo-tags" type="text" placeholder="#饺子AI摘要">
               <small>发送到 flomo 时自动追加在内容末尾，多个标签用空格分隔</small>
+            </label>
+          </div>
+        </div>
+
+        <div class="tabbit-collapse">
+          <div class="tabbit-collapse-header" data-collapse="toggle">
+            <span class="tabbit-collapse-title">🖼️ 生图设置</span>
+            <span class="tabbit-collapse-arrow">▶</span>
+          </div>
+          <div class="tabbit-collapse-content">
+            <small class="tabbit-help">默认复用当前 API 预设的 URL 和 Key；如果生图服务不同，再单独填写下面两项。摘要完成后也可以在结果区手动生成配图。</small>
+            <label class="tabbit-field">
+              <span><input id="tabbit-set-enable-image-gen" type="checkbox"> 摘要完成后自动生成配图</span>
+            </label>
+            <div class="tabbit-row-2">
+              <label class="tabbit-field"><span>生图模型 API URL</span>
+                <input id="tabbit-set-image-api-url" type="text" placeholder="https://your-api/v1（留空复用当前 API URL）">
+                <small>可填 /v1、/v1/images/generations、/v1/responses 或 /v1/chat/completions</small>
+              </label>
+              <label class="tabbit-field"><span>生图模型 API Key</span>
+                <input id="tabbit-set-image-api-key" type="password" placeholder="留空复用当前 API Key">
+              </label>
+            </div>
+            <div class="tabbit-row-2">
+              <label class="tabbit-field"><span>生图模型名称</span>
+                <input id="tabbit-set-image-model" type="text" placeholder="gemini-3.1-flash-image-preview">
+              </label>
+              <label class="tabbit-field"><span>生图尺寸</span>
+                <input id="tabbit-set-image-size" type="text" list="tabbit-image-size-presets" placeholder="1024x1024 / 1280x720 / auto">
+                <datalist id="tabbit-image-size-presets">
+                  <option value="1024x1024"></option>
+                  <option value="1536x1024"></option>
+                  <option value="1024x1536"></option>
+                  <option value="1280x720"></option>
+                  <option value="720x1280"></option>
+                  <option value="auto"></option>
+                </datalist>
+                <small>最终是否支持由你的生图 API 决定</small>
+              </label>
+            </div>
+            <label class="tabbit-field">
+              <span><input id="tabbit-set-image-auto-download" type="checkbox"> 生成后自动下载图片</span>
+            </label>
+            <label class="tabbit-field"><span>生图提示词模板</span>
+              <textarea id="tabbit-set-image-prompt" rows="5" placeholder="使用 {summary} 作为摘要占位符"></textarea>
+              <small>使用 <code>{summary}</code> 作为 AI 摘要占位符；不写占位符时，摘要会自动追加到模板后面。</small>
             </label>
           </div>
         </div>
@@ -2822,22 +3333,6 @@
         </div>
 
 
-
-        <div class="tabbit-collapse">
-          <div class="tabbit-collapse-header" data-collapse="toggle">
-            <span class="tabbit-collapse-title">📋 自动复制</span>
-            <span class="tabbit-collapse-arrow">▶</span>
-          </div>
-          <div class="tabbit-collapse-content">
-            <small class="tabbit-help">选中文本后自动复制到剪贴板，可选择是否附带页面标题和链接作为出处。也可右键点击浮动按钮快速切换。</small>
-            <label class="tabbit-field">
-              <span><input id="tabbit-set-auto-copy" type="checkbox"> 开启自动复制（选中文本自动复制）</span>
-            </label>
-            <label class="tabbit-field">
-              <span><input id="tabbit-set-auto-copy-source" type="checkbox"> 复制时附带出处信息（页面标题 + 链接）</span>
-            </label>
-          </div>
-        </div>
 
         <div class="tabbit-collapse">
           <div class="tabbit-collapse-header" data-collapse="toggle">
@@ -3028,6 +3523,13 @@
     settingsEl.querySelector('#tabbit-set-flomo-tags').value = config.flomoTags || '#饺子AI摘要';
     settingsEl.querySelector('#tabbit-set-auto-copy').checked = config.autoCopy?.enabled !== false;
     settingsEl.querySelector('#tabbit-set-auto-copy-source').checked = !!config.autoCopy?.withSource;
+    settingsEl.querySelector('#tabbit-set-enable-image-gen').checked = config.enableImageGen === true;
+    settingsEl.querySelector('#tabbit-set-image-api-url').value = config.imageGenApiUrl || '';
+    settingsEl.querySelector('#tabbit-set-image-api-key').value = config.imageGenApiKey || '';
+    settingsEl.querySelector('#tabbit-set-image-model').value = config.imageGenModel || DEFAULT_CONFIG.imageGenModel;
+    settingsEl.querySelector('#tabbit-set-image-size').value = config.imageGenSize || DEFAULT_CONFIG.imageGenSize;
+    settingsEl.querySelector('#tabbit-set-image-auto-download').checked = config.enableImageAutoDownload !== false;
+    settingsEl.querySelector('#tabbit-set-image-prompt').value = config.imageGenPromptText || IMAGE_GEN_PROMPT_TEXT;
     settingsEl.querySelector('#tabbit-set-jgy-account').value = config.cloudSync?.account || '';
     settingsEl.querySelector('#tabbit-set-jgy-password').value = config.cloudSync?.appPassword || '';
 
@@ -3215,6 +3717,18 @@
       enabled: settingsEl.querySelector('#tabbit-set-auto-copy').checked,
       withSource: settingsEl.querySelector('#tabbit-set-auto-copy-source').checked
     };
+    config.enableImageGen = settingsEl.querySelector('#tabbit-set-enable-image-gen').checked;
+    config.imageGenApiUrl = settingsEl.querySelector('#tabbit-set-image-api-url').value.trim();
+    config.imageGenApiKey = settingsEl.querySelector('#tabbit-set-image-api-key').value.trim();
+    config.imageGenModel = settingsEl.querySelector('#tabbit-set-image-model').value.trim() || DEFAULT_CONFIG.imageGenModel;
+    const normalizedImageSize = normalizeImageSizeInput(settingsEl.querySelector('#tabbit-set-image-size').value);
+    if (!normalizedImageSize) {
+      alert('生图尺寸格式不正确，请填写类似 1024x1024、1280x720，或 auto');
+      return;
+    }
+    config.imageGenSize = normalizedImageSize;
+    config.enableImageAutoDownload = settingsEl.querySelector('#tabbit-set-image-auto-download').checked;
+    config.imageGenPromptText = settingsEl.querySelector('#tabbit-set-image-prompt').value.trim() || IMAGE_GEN_PROMPT_TEXT;
     config.cloudSync = {
       ...(config.cloudSync || {}),
       account: settingsEl.querySelector('#tabbit-set-jgy-account').value.trim(),

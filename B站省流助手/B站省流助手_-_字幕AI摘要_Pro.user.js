@@ -1,13 +1,18 @@
 // ==UserScript==
 // @name         B站省流助手 - 字幕AI摘要 Pro
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      4.1.1
+// @version      4.2.0
 // @description  自动提取B站视频字幕，通过自定义AI API生成极简摘要，支持模型切换、持续对话和评论区总结；支持自动解析开关、自动获取模型列表、flomo自动加标签，新增总结生图功能；v3.9.0 新增html PPT模式；v4.0.0 新增新手引导和API兜底功能（无API时仍可下载字幕、一键复制提示词+字幕到其他AI）
 // @author       次元饺子
 // @match        https://www.bilibili.com/video/*
 // @match        https://www.bilibili.com/list/*
+// @match        https://labs.google/fx/*/tools/flow/project*
 // @icon         https://www.bilibili.com/favicon.ico
-// @grant        none
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_addValueChangeListener
+// @grant        GM_openInTab
+// @grant        unsafeWindow
 // @license      MIT
 // @downloadURL https://update.greasyfork.org/scripts/574935/B%E7%AB%99%E7%9C%81%E6%B5%81%E5%8A%A9%E6%89%8B%20-%20%E5%AD%97%E5%B9%95AI%E6%91%98%E8%A6%81%20Pro.user.js
 // @updateURL https://update.greasyfork.org/scripts/574935/B%E7%AB%99%E7%9C%81%E6%B5%81%E5%8A%A9%E6%89%8B%20-%20%E5%AD%97%E5%B9%95AI%E6%91%98%E8%A6%81%20Pro.meta.js
@@ -17,6 +22,786 @@
   if (window.__BILI_SUBTITLE_SUMMARY__) return;
   window.__BILI_SUBTITLE_SUMMARY__ = true;
 
+  const FLOW_PROMPT_JOB_KEY = 'tabbit_flow_prompt_job_v1';
+  const FLOW_HEARTBEAT_KEY = 'tabbit_flow_receiver_heartbeat_v1';
+  const FLOW_PROMPT_MESSAGE_TYPE = 'FLOW_PROMPT_SUBMIT';
+  const DEFAULT_FLOW_PROJECT_URL = 'https://labs.google/fx/zh/tools/flow/project/0ad40d66-236b-42f3-a95f-dde090db0fae';
+  const FLOW_HEARTBEAT_INTERVAL_MS = 10000;
+  const FLOW_HEARTBEAT_MAX_AGE_MS = 35000;
+
+  function isFlowProjectPage() {
+    return location.hostname === 'labs.google' && /\/fx\/.*\/tools\/flow\/project\//.test(location.pathname);
+  }
+
+  function parseFlowPromptJob(value) {
+    if (!value) return null;
+    if (typeof value === 'object') return value;
+    try {
+      return JSON.parse(value);
+    } catch(e) {
+      console.warn('[省流助手-Flow] 解析任务失败:', e.message);
+      return null;
+    }
+  }
+
+  function postFlowPromptJob(job) {
+    if (!job || !job.text) return;
+    const message = {
+      source: 'BiliSummaryFlowRelay',
+      type: FLOW_PROMPT_MESSAGE_TYPE,
+      id: job.id || '',
+      text: job.text,
+      options: job.options || {}
+    };
+    window.postMessage(message, window.location.origin);
+    if ('BroadcastChannel' in window) {
+      try {
+        const channel = new BroadcastChannel('flow-prompt-bridge');
+        channel.postMessage(message);
+        setTimeout(function() { channel.close(); }, 500);
+      } catch(e) {
+        console.warn('[省流助手-Flow] BroadcastChannel 转发失败:', e.message);
+      }
+    }
+  }
+
+  function setupFlowPromptRelayPage() {
+    console.log('[省流助手-Flow] Flow 接收端已启动，等待 B站脚本发送生图提示词');
+    const createReceiverWidget = function() {
+      const old = document.getElementById('tabbit-flow-receiver-widget');
+      if (old) old.remove();
+
+      const widget = document.createElement('div');
+      widget.id = 'tabbit-flow-receiver-widget';
+      widget.style.cssText = [
+        'position:fixed',
+        'right:16px',
+        'bottom:16px',
+        'z-index:999999',
+        'font-family:Arial,"Microsoft YaHei",sans-serif',
+        'color:oklch(94% .01 160)',
+        'line-height:1.35'
+      ].join(';');
+
+      const panel = document.createElement('div');
+      panel.style.cssText = [
+        'width:276px',
+        'background:oklch(20% .018 165)',
+        'border:1px solid oklch(42% .04 165)',
+        'border-radius:8px',
+        'box-shadow:0 14px 36px rgba(0,0,0,.34)',
+        'overflow:hidden'
+      ].join(';');
+
+      const header = document.createElement('button');
+      header.type = 'button';
+      header.style.cssText = [
+        'width:100%',
+        'display:flex',
+        'align-items:center',
+        'gap:8px',
+        'border:0',
+        'background:oklch(23% .022 165)',
+        'color:oklch(95% .01 165)',
+        'padding:10px 12px',
+        'cursor:pointer',
+        'text-align:left'
+      ].join(';');
+
+      const dot = document.createElement('span');
+      dot.style.cssText = 'width:8px;height:8px;border-radius:999px;background:oklch(73% .16 155);box-shadow:0 0 0 3px oklch(73% .16 155 / .16);flex:0 0 auto;';
+
+      const titleWrap = document.createElement('span');
+      titleWrap.style.cssText = 'display:flex;flex-direction:column;gap:1px;min-width:0;flex:1;';
+
+      const title = document.createElement('span');
+      title.textContent = 'Flow 接收端';
+      title.style.cssText = 'font-size:13px;font-weight:800;letter-spacing:0;';
+
+      const subtitle = document.createElement('span');
+      subtitle.textContent = '在线，等待生图任务';
+      subtitle.style.cssText = 'font-size:11px;color:oklch(78% .025 165);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;';
+
+      const toggleIcon = document.createElement('span');
+      toggleIcon.textContent = '收起';
+      toggleIcon.style.cssText = 'font-size:11px;color:oklch(76% .035 165);flex:0 0 auto;';
+
+      titleWrap.appendChild(title);
+      titleWrap.appendChild(subtitle);
+      header.appendChild(dot);
+      header.appendChild(titleWrap);
+      header.appendChild(toggleIcon);
+
+      const body = document.createElement('div');
+      body.style.cssText = 'padding:10px 12px 12px;background:oklch(18% .014 165);display:flex;flex-direction:column;gap:8px;';
+
+      const statusLine = document.createElement('div');
+      statusLine.textContent = '接收 B站摘要，转发给 Flow 页面。';
+      statusLine.style.cssText = 'font-size:12px;color:oklch(84% .018 165);';
+
+      const meta = document.createElement('div');
+      meta.style.cssText = 'display:grid;grid-template-columns:56px 1fr;gap:5px 8px;font-size:11px;color:oklch(76% .024 165);';
+      meta.innerHTML =
+        '<span>最近任务</span><b id="tabbit-flow-last-job" style="color:oklch(91% .02 165);font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">暂无</b>' +
+        '<span>心跳</span><b id="tabbit-flow-heartbeat" style="color:oklch(91% .02 165);font-weight:700;">刚刚</b>';
+
+      const monitorBox = document.createElement('div');
+      monitorBox.style.cssText = 'border-top:1px solid oklch(33% .026 165);padding-top:9px;display:flex;flex-direction:column;gap:8px;';
+
+      const monitorTitle = document.createElement('div');
+      monitorTitle.style.cssText = 'display:flex;justify-content:space-between;align-items:center;gap:8px;font-size:12px;color:oklch(89% .016 165);font-weight:800;';
+      monitorTitle.innerHTML = '<span>新图监控下载</span><span id="tabbit-flow-monitor-count" style="font-size:11px;color:oklch(76% .024 165);font-weight:700;">已记 0 / 下载 0 / 生图 0</span>';
+
+      const monitorButtons = document.createElement('div');
+      monitorButtons.style.cssText = 'display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;';
+
+      const monitorBtnStyle = 'border:0;border-radius:6px;padding:7px 6px;font-size:12px;font-weight:800;cursor:pointer;';
+      const monitorToggleBtn = document.createElement('button');
+      monitorToggleBtn.type = 'button';
+      monitorToggleBtn.textContent = '开启监控';
+      monitorToggleBtn.style.cssText = monitorBtnStyle + 'background:oklch(63% .14 155);color:oklch(15% .02 155);';
+
+      const downloadCurrentBtn = document.createElement('button');
+      downloadCurrentBtn.type = 'button';
+      downloadCurrentBtn.textContent = '下载当前';
+      downloadCurrentBtn.style.cssText = monitorBtnStyle + 'background:oklch(58% .12 250);color:oklch(97% .01 250);opacity:.55;cursor:default;';
+      downloadCurrentBtn.disabled = true;
+
+      const clearMemoryBtn = document.createElement('button');
+      clearMemoryBtn.type = 'button';
+      clearMemoryBtn.textContent = '清记录';
+      clearMemoryBtn.style.cssText = monitorBtnStyle + 'background:oklch(32% .025 165);color:oklch(91% .01 165);border:1px solid oklch(43% .04 165);';
+
+      monitorButtons.appendChild(monitorToggleBtn);
+      monitorButtons.appendChild(downloadCurrentBtn);
+      monitorButtons.appendChild(clearMemoryBtn);
+      monitorBox.appendChild(monitorTitle);
+      monitorBox.appendChild(monitorButtons);
+
+      const actions = document.createElement('div');
+      actions.style.cssText = 'display:flex;gap:8px;';
+
+      const collapseBtn = document.createElement('button');
+      collapseBtn.type = 'button';
+      collapseBtn.textContent = '最小化';
+      collapseBtn.style.cssText = 'flex:1;border:1px solid oklch(43% .04 165);border-radius:6px;background:oklch(26% .02 165);color:oklch(94% .01 165);padding:7px 8px;font-size:12px;font-weight:700;cursor:pointer;';
+
+      const openBtn = document.createElement('span');
+      openBtn.textContent = '后台就绪';
+      openBtn.title = '这个标签页保持打开即可接收任务';
+      openBtn.style.cssText = 'flex:1;border-radius:6px;background:oklch(63% .14 155);color:oklch(16% .02 155);padding:7px 8px;font-size:12px;font-weight:800;text-align:center;';
+
+      actions.appendChild(collapseBtn);
+      actions.appendChild(openBtn);
+      body.appendChild(statusLine);
+      body.appendChild(meta);
+      body.appendChild(monitorBox);
+      body.appendChild(actions);
+
+      const mini = document.createElement('button');
+      mini.type = 'button';
+      mini.style.cssText = [
+        'display:none',
+        'align-items:center',
+        'gap:7px',
+        'border:1px solid oklch(42% .04 165)',
+        'border-radius:999px',
+        'background:oklch(21% .018 165)',
+        'color:oklch(94% .01 165)',
+        'box-shadow:0 10px 30px rgba(0,0,0,.32)',
+        'padding:8px 11px',
+        'font-size:12px',
+        'font-weight:800',
+        'cursor:pointer'
+      ].join(';');
+      mini.innerHTML = '<span style="width:8px;height:8px;border-radius:999px;background:oklch(73% .16 155);box-shadow:0 0 0 3px oklch(73% .16 155 / .16);"></span><span>Flow 接收</span>';
+
+      panel.appendChild(header);
+      panel.appendChild(body);
+      widget.appendChild(panel);
+      widget.appendChild(mini);
+
+      let collapsed = localStorage.getItem('tabbit_flow_receiver_collapsed') !== 'false';
+      const applyCollapsed = function(nextCollapsed) {
+        collapsed = !!nextCollapsed;
+        localStorage.setItem('tabbit_flow_receiver_collapsed', collapsed ? 'true' : 'false');
+        panel.style.display = collapsed ? 'none' : 'block';
+        mini.style.display = collapsed ? 'inline-flex' : 'none';
+        toggleIcon.textContent = collapsed ? '展开' : '收起';
+      };
+
+      header.addEventListener('click', function() { applyCollapsed(true); });
+      collapseBtn.addEventListener('click', function() { applyCollapsed(true); });
+      mini.addEventListener('click', function() { applyCollapsed(false); });
+
+      const mount = function() {
+        if (!document.body || document.getElementById('tabbit-flow-receiver-widget')) return;
+        document.body.appendChild(widget);
+        applyCollapsed(collapsed);
+      };
+
+      document.addEventListener('DOMContentLoaded', mount);
+      mount();
+
+      return {
+        setStatus: function(text) {
+          subtitle.textContent = text || '在线，等待生图任务';
+          statusLine.textContent = text || '接收 B站摘要，转发给 Flow 页面。';
+        },
+        setLastJob: function(text) {
+          const el = widget.querySelector('#tabbit-flow-last-job');
+          if (el) el.textContent = text || '暂无';
+        },
+        beat: function() {
+          const el = widget.querySelector('#tabbit-flow-heartbeat');
+          if (el) el.textContent = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+        },
+        setMonitorCount: function(text) {
+          const el = widget.querySelector('#tabbit-flow-monitor-count');
+          if (el) el.textContent = text || '已记 0 / 下载 0 / 生图 0';
+        },
+        controls: {
+          monitorToggleBtn: monitorToggleBtn,
+          downloadCurrentBtn: downloadCurrentBtn,
+          clearMemoryBtn: clearMemoryBtn
+        },
+        flashJob: function(text) {
+          this.setStatus('已转发 Flow 生图任务');
+          this.setLastJob(text || '刚刚收到');
+          mini.style.background = 'oklch(25% .04 155)';
+          setTimeout(function() {
+            mini.style.background = 'oklch(21% .018 165)';
+          }, 1400);
+          setTimeout(() => this.setStatus('在线，等待生图任务'), 2500);
+        }
+      };
+    };
+
+    const receiverWidget = createReceiverWidget();
+
+    const setupIntegratedFlowTools = function(widgetApi) {
+      const TOOL_CONFIG = {
+        scanIntervalMs: 2000,
+        menuOpenDelayMs: 650,
+        submenuDelayMs: 650,
+        afterClickDelayMs: 250,
+        toastTimeoutMs: 45000,
+        retryLimit: 6,
+        retryBaseDelayMs: 7000,
+        qualityText: '2K',
+        downloadText: '下载'
+      };
+      const HACK_ID = 'tabbit-integrated-flow-react-hack';
+      const STORAGE_ID = 'tabbit_flow_downloaded_' + (function() {
+        const match = location.pathname.match(/\/project\/([^/]+)/);
+        return match ? match[1] : 'default_project';
+      })();
+      const sleep = function(ms) { return new Promise(function(resolve) { setTimeout(resolve, ms); }); };
+      const safeJsonParse = function(value) {
+        try {
+          const parsed = JSON.parse(value || '[]');
+          return Array.isArray(parsed) ? parsed : [];
+        } catch(e) {
+          return [];
+        }
+      };
+
+      let downloadedIds = new Set(safeJsonParse(typeof GM_getValue === 'function' ? GM_getValue(STORAGE_ID, '[]') : '[]'));
+      let seenTileIds = new Set();
+      let pendingTileIds = new Set();
+      let retryCountById = new Map();
+      let queue = [];
+      let observer = null;
+      let scanTimer = null;
+      let isMonitoring = false;
+      let isProcessing = false;
+      let promptQueue = [];
+      let isPromptProcessing = false;
+      let handledPromptJobIds = new Set();
+
+      const controls = widgetApi.controls || {};
+
+      const saveDownloadedIds = function() {
+        if (typeof GM_setValue === 'function') GM_setValue(STORAGE_ID, JSON.stringify(Array.from(downloadedIds)));
+      };
+
+      const updateCounts = function() {
+        if (widgetApi && widgetApi.setMonitorCount) {
+          widgetApi.setMonitorCount('已记 ' + downloadedIds.size + ' / 下载 ' + (queue.length + pendingTileIds.size) + ' / 生图 ' + promptQueue.length);
+        }
+      };
+
+      const setReceiverStatus = function(text) {
+        if (widgetApi && widgetApi.setStatus) widgetApi.setStatus(text);
+        updateCounts();
+      };
+
+      const attrEscape = function(value) {
+        return String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+      };
+
+      const injectReactHack = function() {
+        if (document.getElementById(HACK_ID)) return;
+        const script = document.createElement('script');
+        script.id = HACK_ID;
+        script.textContent = [
+          '(function() {',
+          '  if (window.__tabbit_flow_react_hack_installed) return;',
+          '  window.__tabbit_flow_react_hack_installed = true;',
+          '  var getProps = function(el) {',
+          '    if (!el) return null;',
+          '    var key = Object.keys(el).find(function(k) { return k.indexOf("__reactProps$") === 0 || k.indexOf("__reactEventHandlers$") === 0; });',
+          '    return key ? el[key] : null;',
+          '  };',
+          '  var trigger = function(el, eventName, eventData) {',
+          '    var curr = el;',
+          '    while (curr && curr !== document.body) {',
+          '      var props = getProps(curr);',
+          '      if (props && typeof props[eventName] === "function") {',
+          '        try {',
+          '          props[eventName](Object.assign({',
+          '            preventDefault: function() {},',
+          '            stopPropagation: function() {},',
+          '            nativeEvent: { isTrusted: true },',
+          '            isTrusted: true',
+          '          }, eventData || {}));',
+          '          return true;',
+          '        } catch(e) {}',
+          '      }',
+          '      curr = curr.parentElement;',
+          '    }',
+          '    return false;',
+          '  };',
+          '  var tileSelector = function(tileId) {',
+          '    return "div[data-tile-id=\\"" + String(tileId).replace(/\\\\/g, "\\\\\\\\").replace(/"/g, "\\\\\\"") + "\\"]";',
+          '  };',
+          '  document.addEventListener("FMD_RightClick", function(e) {',
+          '    var root = document.querySelector(tileSelector(e.detail));',
+          '    var el = root && (root.querySelector("img") || root);',
+          '    if (!el) return;',
+          '    var rect = el.getBoundingClientRect();',
+          '    trigger(el, "onContextMenu", { clientX: rect.left + rect.width / 2, clientY: rect.top + rect.height / 2, button: 2, buttons: 2 });',
+          '  });',
+          '  document.addEventListener("FMD_ClickItem", function(e) {',
+          '    var keyword = e.detail;',
+          '    var items = Array.from(document.querySelectorAll("[role=\\"menuitem\\"], button, [role=\\"menuitemradio\\"], div[role=\\"menuitem\\"]"));',
+          '    var target = items.find(function(el) {',
+          '      var rect = el.getBoundingClientRect();',
+          '      return rect.width > 0 && rect.height > 0 && el.textContent && el.textContent.indexOf(keyword) !== -1;',
+          '    });',
+          '    if (!target) return;',
+          '    var eventData = { button: 0, pointerType: "mouse", pointerId: 1 };',
+          '    trigger(target, "onPointerDown", eventData);',
+          '    trigger(target, "onPointerUp", eventData);',
+          '    trigger(target, "onClick", eventData);',
+          '    target.click();',
+          '  });',
+          '})();'
+        ].join('\n');
+        document.head.appendChild(script);
+      };
+
+      const findTileById = function(tileId) {
+        return document.querySelector('div[data-tile-id="' + attrEscape(tileId) + '"]');
+      };
+
+      const getReadyTileContainers = function() {
+        return Array.from(document.querySelectorAll('div[data-tile-id]')).filter(function(container) {
+          const tileId = container.getAttribute('data-tile-id');
+          if (!tileId) return false;
+          if (!container.querySelector('a[href*="/edit/"]')) return false;
+          if (container.querySelector('a[href*="/collection/"]')) return false;
+          return true;
+        });
+      };
+
+      const getCurrentTileIds = function() {
+        return getReadyTileContainers().map(function(container) {
+          return container.getAttribute('data-tile-id');
+        }).filter(Boolean);
+      };
+
+      const findMenuItem = function(keyword) {
+        const items = Array.from(document.querySelectorAll('[role="menuitem"], button, [role="menuitemradio"], div[role="menuitem"]'));
+        return items.find(function(el) {
+          const rect = el.getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0 && el.textContent && el.textContent.indexOf(keyword) !== -1;
+        });
+      };
+
+      const closeVisibleToasts = async function() {
+        const closeButtons = Array.from(document.querySelectorAll('li[data-sonner-toast] button'))
+          .filter(function(button) { return button.textContent && button.textContent.indexOf('关闭') !== -1; });
+        for (const button of closeButtons) {
+          button.click();
+          await sleep(100);
+        }
+      };
+
+      const waitForDownloadToast = async function() {
+        let elapsed = 0;
+        while (elapsed < TOOL_CONFIG.toastTimeoutMs && isMonitoring) {
+          const toasts = Array.from(document.querySelectorAll('li[data-sonner-toast]'));
+          for (const toast of toasts) {
+            const text = toast.textContent || '';
+            if (text.indexOf('失败') !== -1 || text.toLowerCase().indexOf('error') !== -1) return -1;
+            if (text.indexOf('已完成高清重塑') !== -1 || text.indexOf('已下载') !== -1 || text.indexOf('保存') !== -1 || text.indexOf('成功') !== -1 || text.toLowerCase().indexOf('download') !== -1) {
+              await closeVisibleToasts();
+              return 1;
+            }
+          }
+          await sleep(500);
+          elapsed += 500;
+        }
+        return 0;
+      };
+
+      const markDownloaded = function(tileId) {
+        downloadedIds.add(tileId);
+        saveDownloadedIds();
+        const tile = findTileById(tileId);
+        if (tile && !tile.querySelector('.tabbit-flow-downloaded-mark')) {
+          const mark = document.createElement('div');
+          mark.className = 'tabbit-flow-downloaded-mark';
+          mark.textContent = '已下';
+          mark.style.cssText = 'position:absolute;left:8px;bottom:8px;z-index:99999;padding:2px 6px;border-radius:4px;background:rgba(16,185,129,.95);color:#fff;font-size:12px;font-weight:700;pointer-events:none;';
+          tile.style.position = 'relative';
+          tile.appendChild(mark);
+        }
+        updateCounts();
+      };
+
+      const downloadTile = async function(tileId) {
+        if (downloadedIds.has(tileId)) return { ok: true, skipped: true };
+        const tile = findTileById(tileId);
+        const editLink = tile && tile.querySelector('a[href*="/edit/"]');
+        if (!tile || !editLink) return { ok: false, reason: '图片卡片还没准备好' };
+        try {
+          editLink.scrollIntoView({ block: 'center', inline: 'center' });
+          await sleep(550);
+          await closeVisibleToasts();
+          document.body.click();
+          await sleep(200);
+          document.dispatchEvent(new CustomEvent('FMD_RightClick', { detail: tileId }));
+          await sleep(TOOL_CONFIG.menuOpenDelayMs);
+          let qualityItem = findMenuItem(TOOL_CONFIG.qualityText);
+          if (!qualityItem) {
+            document.dispatchEvent(new CustomEvent('FMD_ClickItem', { detail: TOOL_CONFIG.downloadText }));
+            await sleep(TOOL_CONFIG.submenuDelayMs);
+            qualityItem = findMenuItem(TOOL_CONFIG.qualityText);
+          }
+          if (!qualityItem) {
+            document.body.click();
+            return { ok: false, reason: '下载菜单未出现' };
+          }
+          document.dispatchEvent(new CustomEvent('FMD_ClickItem', { detail: TOOL_CONFIG.qualityText }));
+          await sleep(TOOL_CONFIG.afterClickDelayMs);
+          document.body.click();
+          const toastStatus = await waitForDownloadToast();
+          if (toastStatus === -1) return { ok: false, reason: '页面提示下载失败' };
+          markDownloaded(tileId);
+          return { ok: true, timeout: toastStatus === 0 };
+        } catch(e) {
+          console.error('[省流助手-Flow] 下载异常:', e);
+          return { ok: false, reason: e.message || '下载异常' };
+        }
+      };
+
+      const enqueueTile = function(tileId, source) {
+        if (!tileId || downloadedIds.has(tileId) || pendingTileIds.has(tileId)) return;
+        pendingTileIds.add(tileId);
+        queue.push(tileId);
+        console.log('[省流助手-Flow] 下载队列:', tileId, source);
+        setReceiverStatus('发现新图，准备下载');
+        processQueue();
+      };
+
+      const retryLater = function(tileId, reason) {
+        const nextCount = (retryCountById.get(tileId) || 0) + 1;
+        retryCountById.set(tileId, nextCount);
+        if (nextCount > TOOL_CONFIG.retryLimit) {
+          console.warn('[省流助手-Flow] 已放弃下载 ' + tileId + ': ' + reason);
+          setReceiverStatus('部分图片下载失败');
+          return;
+        }
+        setTimeout(function() {
+          if (isMonitoring && !downloadedIds.has(tileId)) enqueueTile(tileId, 'retry');
+        }, TOOL_CONFIG.retryBaseDelayMs * nextCount);
+      };
+
+      async function processQueue() {
+        if (isProcessing) return;
+        isProcessing = true;
+        while (isMonitoring && queue.length > 0) {
+          const tileId = queue.shift();
+          pendingTileIds.delete(tileId);
+          updateCounts();
+          if (downloadedIds.has(tileId)) continue;
+          setReceiverStatus('下载中');
+          const result = await downloadTile(tileId);
+          if (!result.ok && isMonitoring) retryLater(tileId, result.reason);
+          await sleep(900);
+        }
+        isProcessing = false;
+        if (isMonitoring) setReceiverStatus(queue.length ? '排队中' : '监控中');
+      }
+
+      const scanForNewTiles = function() {
+        if (!isMonitoring) return;
+        getCurrentTileIds().forEach(function(tileId) {
+          if (seenTileIds.has(tileId)) return;
+          seenTileIds.add(tileId);
+          enqueueTile(tileId, 'new');
+        });
+      };
+
+      const enqueueCurrentTiles = function() {
+        const ids = getCurrentTileIds();
+        ids.forEach(function(tileId) {
+          seenTileIds.add(tileId);
+          if (!downloadedIds.has(tileId)) enqueueTile(tileId, 'current');
+        });
+        setReceiverStatus(ids.length ? '当前图片已入队' : '未发现图片');
+      };
+
+      const startMonitoring = function() {
+        if (isMonitoring) return;
+        isMonitoring = true;
+        queue = [];
+        pendingTileIds.clear();
+        retryCountById.clear();
+        seenTileIds = new Set(getCurrentTileIds());
+        observer = new MutationObserver(scanForNewTiles);
+        observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['data-tile-id', 'href', 'src'] });
+        scanTimer = setInterval(scanForNewTiles, TOOL_CONFIG.scanIntervalMs);
+        if (controls.monitorToggleBtn) {
+          controls.monitorToggleBtn.textContent = '停止监控';
+          controls.monitorToggleBtn.style.background = 'oklch(62% .18 28)';
+          controls.monitorToggleBtn.style.color = 'oklch(98% .01 28)';
+        }
+        if (controls.downloadCurrentBtn) {
+          controls.downloadCurrentBtn.disabled = false;
+          controls.downloadCurrentBtn.style.opacity = '1';
+          controls.downloadCurrentBtn.style.cursor = 'pointer';
+        }
+        setReceiverStatus('监控中，已忽略当前 ' + seenTileIds.size + ' 张');
+      };
+
+      const stopMonitoring = function() {
+        isMonitoring = false;
+        queue = [];
+        pendingTileIds.clear();
+        if (observer) observer.disconnect();
+        observer = null;
+        if (scanTimer) clearInterval(scanTimer);
+        scanTimer = null;
+        if (controls.monitorToggleBtn) {
+          controls.monitorToggleBtn.textContent = '开启监控';
+          controls.monitorToggleBtn.style.background = 'oklch(63% .14 155)';
+          controls.monitorToggleBtn.style.color = 'oklch(15% .02 155)';
+        }
+        if (controls.downloadCurrentBtn) {
+          controls.downloadCurrentBtn.disabled = true;
+          controls.downloadCurrentBtn.style.opacity = '.55';
+          controls.downloadCurrentBtn.style.cursor = 'default';
+        }
+        setReceiverStatus('在线，等待生图任务');
+      };
+
+      const clearDownloadedMemory = function() {
+        downloadedIds = new Set();
+        saveDownloadedIds();
+        document.querySelectorAll('.tabbit-flow-downloaded-mark').forEach(function(el) { el.remove(); });
+        setReceiverStatus('下载记录已清空');
+      };
+
+      const findSubmitButton = function() {
+        return Array.from(document.querySelectorAll('button')).find(function(button) {
+          const icon = button.querySelector('i.google-symbols');
+          const text = button.textContent || '';
+          const isSubmitLike = (icon && icon.textContent.trim() === 'arrow_forward') || text.indexOf('创建') !== -1;
+          return isSubmitLike && !button.disabled && button.getAttribute('aria-disabled') !== 'true';
+        });
+      };
+
+      const fillPromptText = async function(text) {
+        const editor = document.querySelector('[data-slate-editor="true"]');
+        if (!editor) return { ok: false, reason: '未找到 Flow 输入框' };
+        try {
+          editor.scrollIntoView({ block: 'center', inline: 'center' });
+          await sleep(200);
+          editor.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+          editor.focus();
+          const selection = window.getSelection();
+          const range = document.createRange();
+          range.selectNodeContents(editor);
+          selection.removeAllRanges();
+          selection.addRange(range);
+          await sleep(50);
+          const dt = new DataTransfer();
+          dt.setData('text/plain', text);
+          editor.dispatchEvent(new InputEvent('beforeinput', { inputType: 'insertFromPaste', dataTransfer: dt, bubbles: true, cancelable: true }));
+          editor.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+          return { ok: true };
+        } catch(e) {
+          console.error('[省流助手-Flow] 填入失败:', e);
+          return { ok: false, reason: e.message || '填入失败' };
+        }
+      };
+
+      const submitGeneration = async function() {
+        await sleep(600);
+        document.dispatchEvent(new CustomEvent('FMD_ClickItem', { detail: '创建' }));
+        document.dispatchEvent(new CustomEvent('FMD_ClickItem', { detail: 'arrow_forward' }));
+        let submitBtn = findSubmitButton();
+        let waited = 0;
+        while (!submitBtn && waited < 4000) {
+          await sleep(500);
+          waited += 500;
+          submitBtn = findSubmitButton();
+        }
+        if (submitBtn) {
+          submitBtn.click();
+          return { ok: true };
+        }
+        return { ok: false, reason: '未找到可点击的创建按钮' };
+      };
+
+      const waitForGenerationReady = async function(timeoutMs) {
+        let elapsed = 0;
+        while (elapsed < timeoutMs) {
+          if (findSubmitButton()) return true;
+          await sleep(1000);
+          elapsed += 1000;
+        }
+        return false;
+      };
+
+      const runPromptJob = async function(job) {
+        const text = String(job.text || '').trim();
+        if (!text) return { ok: false, reason: '收到的文字为空' };
+        setReceiverStatus('填词中');
+        const fillResult = await fillPromptText(text);
+        if (!fillResult.ok) return fillResult;
+        setReceiverStatus('提交生图');
+        const submitResult = await submitGeneration();
+        if (!submitResult.ok) return submitResult;
+        setReceiverStatus('等待生图完成');
+        await sleep(2000);
+        await waitForGenerationReady(Number(job.options && job.options.waitMs) || 120000);
+        setReceiverStatus(isMonitoring ? '监控中' : '已提交生图');
+        return { ok: true };
+      };
+
+      async function processPromptQueue() {
+        if (isPromptProcessing) return;
+        isPromptProcessing = true;
+        while (promptQueue.length > 0) {
+          const job = promptQueue.shift();
+          updateCounts();
+          const result = await runPromptJob(job);
+          if (!result.ok) {
+            console.warn('[省流助手-Flow] 生图任务失败:', result.reason);
+            setReceiverStatus(result.reason || '接口任务失败');
+          }
+          await sleep(800);
+        }
+        isPromptProcessing = false;
+        if (isMonitoring) setReceiverStatus('监控中');
+        updateCounts();
+      }
+
+      const enqueuePromptJob = function(text, options) {
+        options = options || {};
+        promptQueue.push({ text: text, options: options, createdAt: Date.now() });
+        setReceiverStatus('收到生图任务');
+        updateCounts();
+        processPromptQueue();
+      };
+
+      const acceptPromptMessage = function(data) {
+        if (!data || data.type !== FLOW_PROMPT_MESSAGE_TYPE) return;
+        if (data.id) {
+          if (handledPromptJobIds.has(data.id)) return;
+          handledPromptJobIds.add(data.id);
+          if (handledPromptJobIds.size > 300) handledPromptJobIds = new Set(Array.from(handledPromptJobIds).slice(-120));
+        }
+        enqueuePromptJob(data.text, data.options || {});
+      };
+
+      window.addEventListener('message', function(event) {
+        if (event.origin && event.origin !== window.location.origin) return;
+        acceptPromptMessage(event.data);
+      });
+
+      if ('BroadcastChannel' in window) {
+        const channel = new BroadcastChannel('flow-prompt-bridge');
+        channel.onmessage = function(event) { acceptPromptMessage(event.data); };
+      }
+
+      window.FlowPromptBridge = {
+        submit: function(text, options) {
+          enqueuePromptJob(text, options || {});
+        },
+        send: function(text, options) {
+          enqueuePromptJob(text, options || {});
+        }
+      };
+      window.FlowSubmitPrompt = window.FlowPromptBridge.submit;
+
+      injectReactHack();
+      if (controls.monitorToggleBtn) controls.monitorToggleBtn.addEventListener('click', function() {
+        if (isMonitoring) stopMonitoring();
+        else startMonitoring();
+      });
+      if (controls.downloadCurrentBtn) controls.downloadCurrentBtn.addEventListener('click', enqueueCurrentTiles);
+      if (controls.clearMemoryBtn) controls.clearMemoryBtn.addEventListener('click', clearDownloadedMemory);
+      updateCounts();
+    };
+
+    setupIntegratedFlowTools(receiverWidget);
+
+    let lastJobId = '';
+    const handleJob = function(value) {
+      const job = parseFlowPromptJob(value);
+      if (!job || !job.text || job.id === lastJobId) return;
+      lastJobId = job.id || String(Date.now());
+      postFlowPromptJob(job);
+      setTimeout(function() { postFlowPromptJob(job); }, 1500);
+      setTimeout(function() { postFlowPromptJob(job); }, 4000);
+      receiverWidget.flashJob(job.title || job.id || '新任务');
+    };
+
+    if (typeof GM_addValueChangeListener === 'function') {
+      GM_addValueChangeListener(FLOW_PROMPT_JOB_KEY, function(_name, _oldValue, newValue, remote) {
+        if (!remote) return;
+        handleJob(newValue);
+      });
+    } else {
+      console.warn('[省流助手-Flow] 当前脚本环境缺少 GM_addValueChangeListener');
+    }
+
+    if (typeof GM_getValue === 'function') {
+      setTimeout(function() { handleJob(GM_getValue(FLOW_PROMPT_JOB_KEY, '')); }, 1200);
+    }
+
+    const writeHeartbeat = function() {
+      if (typeof GM_setValue !== 'function') return;
+      GM_setValue(FLOW_HEARTBEAT_KEY, JSON.stringify({
+        url: location.href,
+        ts: Date.now()
+      }));
+      receiverWidget.beat();
+    };
+    writeHeartbeat();
+    setInterval(writeHeartbeat, FLOW_HEARTBEAT_INTERVAL_MS);
+  }
+
+  if (isFlowProjectPage()) {
+    setupFlowPromptRelayPage();
+    return;
+  }
+
   const PROMPT_TEXT = '我极度没有耐心，不想动脑子，脾气暴躁且阅读困难。请用最直白的大白话给我解释这视频到底在说什么，在能解释清楚的前提下废话越少越好，禁止使用任何专业术语。请按以下顺序直接输出：1.【结论】直接告诉我核心意思；2.【具体讲了啥】用极简的白话说明来龙去脉；3.【关键点】列出最重要的几个要点；4.【对我有什么用】直接说明价值，如果是纯广告或水视频请直接告诉我避雷；5.【原链接】在最后附上视频原始链接。记住，不要任何寒暄、铺垫和解释，直接开始回答！';
 
   const COMMENT_PROMPT_TEXT = '你是一个专业的评论分析助手。请对以下B站视频评论进行总结分析，包括：\n1. 评论整体情感倾向（正面/负面/中性）\n2. 主要讨论话题（列出3-5个）\n3. 有趣/高赞评论摘录\n4. 我理解能力差、没耐心，别讲铺垫、别讲背景、别讲废话，只告诉我：这东西核心结论是什么、有哪几个关键点、对我有什么用。';
@@ -24,7 +809,6 @@
   const DANMAKU_PROMPT_TEXT = '你是一个专业的弹幕分析助手。请对以下B站视频弹幕进行总结分析，包括：\n1. 弹幕整体情感倾向（正面/负面/中性/混合）\n2. 弹幕讨论的热点话题（列出3-5个）\n3. 高频出现的关键词或梗\n4. 观众对视频内容的反应（哪些片段引发热烈讨论）\n5. 有趣/有代表性的弹幕摘录\n6. 我理解能力差、没耐心，别讲铺垫、别讲背景、别讲废话，只告诉我：这东西核心结论是什么、有哪几个关键点、对我有什么用。';
 
   const IMAGE_GEN_PROMPT_TEXT = '根据以下视频内容总结，生成一张信息可视化的精美配图，风格清晰美观，适合作为视频总结的封面图：\n\n{summary}';
-  const COPY_IMAGE_PROMPT_PRESET = '根据以下视频内容总结文字，生成一张信息可视化的精美配图，风格清晰美观，图文并茂，最后带上 #B站省流助手 的标签，注意文字要用中文的：';
   const HTML_PPT_PROMPT_TEXT = '请基于以下视频摘要生成一个可直接保存为 .html 的完整可视化总结页面。\n\n硬性要求：\n1. 只输出完整 HTML 文档，从 <!doctype html> 或 <html> 开始，不要 Markdown 代码块，不要解释。\n2. {layoutInstruction}\n3. 页面必须信息密度高，不能只有空白卡片、空标题、占位符或无正文。\n4. 必须图文并茂：使用 CSS 图形、SVG、图标、流程图、卡片、对比表、时间线、指标块等视觉元素。\n5. 可以使用内联 CSS、内联 SVG、emoji、少量内联 JS；如使用外部图片/字体/CDN，必须有纯 CSS/SVG 降级，不能依赖外部资源才能看。\n6. 视觉风格要现代、清晰、适合全屏查看，不要输出普通文章排版。\n\n视频标题：{title}\nUP主：{upName}\n视频链接：{url}\n\n视频摘要：\n{summary}';
   const HTML_PPT_SINGLE_PROMPT_TEXT = HTML_PPT_PROMPT_TEXT;
   const HTML_PPT_SLIDES_PROMPT_TEXT = '请基于以下视频摘要生成一个可直接保存为 .html 的完整 HTML PPT。\n\n硬性要求：\n1. 只输出完整 HTML 文档，从 <!doctype html> 或 <html> 开始，不要 Markdown 代码块，不要解释。\n2. {layoutInstruction}\n3. 必须做成真正的翻页演示稿，不要输出普通文章排版。\n4. 每页必须图文并茂：使用 CSS 图形、SVG、图标、流程图、卡片、对比表、时间线、指标块等视觉元素。\n5. 可以使用内联 CSS、内联 SVG、emoji、少量内联 JS；如使用外部图片/字体/CDN，必须有纯 CSS/SVG 降级，不能依赖外部资源才能看。\n6. 视觉风格要现代、清晰、适合全屏演示。\n\n视频标题：{title}\nUP主：{upName}\n视频链接：{url}\n\n视频摘要：\n{summary}';
@@ -115,6 +899,9 @@
     imageGenModel: 'gemini-3.1-flash-image-preview',
     imageGenSize: '1024x1024',
     enableImageAutoDownload: true,
+    imageGenMode: 'api',
+    flowProjectUrl: DEFAULT_FLOW_PROJECT_URL,
+    enableFlowBackgroundOpen: true,
     imageGenPromptText: IMAGE_GEN_PROMPT_TEXT,
     htmlPptPromptText: HTML_PPT_PROMPT_TEXT,
     htmlPptSkillText: '',
@@ -578,8 +1365,135 @@
     const summaryForImage = String(textContent || '').slice(0, IMAGE_GEN_SUMMARY_MAX_LEN).replace(/[#*_\[\]()]/g, '');
     const promptTemplate = CONFIG.imageGenPromptText || IMAGE_GEN_PROMPT_TEXT;
     return promptTemplate.includes('{summary}')
-      ? promptTemplate.replace('{summary}', summaryForImage)
+      ? promptTemplate.replace(/\{summary\}/g, summaryForImage)
       : promptTemplate + '\n\n' + summaryForImage;
+  }
+
+  function getImageGenMode() {
+    return CONFIG.imageGenMode === 'flow' ? 'flow' : 'api';
+  }
+
+  function isFlowImageGenMode() {
+    return getImageGenMode() === 'flow';
+  }
+
+  function getFlowProjectUrl() {
+    return String(CONFIG.flowProjectUrl || DEFAULT_FLOW_PROJECT_URL || '').trim();
+  }
+
+  function getFlowReceiverHeartbeat() {
+    if (typeof GM_getValue !== 'function') return null;
+    return parseFlowPromptJob(GM_getValue(FLOW_HEARTBEAT_KEY, ''));
+  }
+
+  function normalizeFlowUrlForCompare(url) {
+    return String(url || '').replace(/[?#].*$/, '').replace(/\/+$/, '');
+  }
+
+  function isFlowReceiverAlive(flowUrl) {
+    const heartbeat = getFlowReceiverHeartbeat();
+    if (!heartbeat || !heartbeat.ts) return false;
+
+    const age = Date.now() - Number(heartbeat.ts);
+    if (!isFinite(age) || age < 0 || age > FLOW_HEARTBEAT_MAX_AGE_MS) return false;
+
+    const expected = normalizeFlowUrlForCompare(flowUrl);
+    const actual = normalizeFlowUrlForCompare(heartbeat.url);
+    return !expected || !actual || expected === actual;
+  }
+
+  function openFlowProjectInBackground(flowUrl) {
+    if (!flowUrl || CONFIG.enableFlowBackgroundOpen === false) return false;
+
+    try {
+      if (typeof GM_openInTab === 'function') {
+        const tab = GM_openInTab(flowUrl, {
+          active: false,
+          insert: true,
+          setParent: true
+        });
+        return !!tab;
+      }
+    } catch(e) {
+      console.warn('[省流助手-Flow] GM_openInTab 后台打开失败:', e.message);
+    }
+
+    try {
+      return !!window.open(flowUrl, '_blank', 'noopener,noreferrer');
+    } catch(e) {
+      return false;
+    }
+  }
+
+  function sendPromptToFlowProject(imagePrompt, videoInfo) {
+    if (!imagePrompt || !imagePrompt.trim()) {
+      throw new Error('没有可发送的生图提示词');
+    }
+    if (typeof GM_setValue !== 'function') {
+      throw new Error('当前脚本缺少 GM_setValue 授权，请重新安装脚本');
+    }
+
+    const job = {
+      id: 'flow_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8),
+      text: imagePrompt,
+      options: { id: '' },
+      source: 'bili-summary',
+      title: videoInfo && videoInfo.title ? videoInfo.title : '',
+      pageUrl: location.href,
+      createdAt: Date.now()
+    };
+    job.options.id = job.id;
+    GM_setValue(FLOW_PROMPT_JOB_KEY, JSON.stringify(job));
+
+    const flowUrl = getFlowProjectUrl();
+    let opened = false;
+    const receiverAlive = isFlowReceiverAlive(flowUrl);
+    if (flowUrl && !receiverAlive) {
+      opened = openFlowProjectInBackground(flowUrl);
+    }
+    return { job: job, opened: opened, flowUrl: flowUrl, receiverAlive: receiverAlive };
+  }
+
+  function renderFlowDispatchResult(contentDiv, dispatchResult) {
+    const imageSlot = contentDiv && (contentDiv.querySelector('.tabbit-image-slot') || contentDiv.querySelector('.tabbit-result'));
+    if (!imageSlot) return;
+    const flowUrl = dispatchResult && dispatchResult.flowUrl ? dispatchResult.flowUrl : getFlowProjectUrl();
+    imageSlot.innerHTML =
+      '<div class="tabbit-img-wrap" style="text-align:left;margin-bottom:12px;padding:14px;background:linear-gradient(135deg,#eef6ff 0%,#f7fbff 100%);border:1px solid #bfdbfe;border-radius:10px;color:#1d4ed8;font-size:13px;line-height:1.6;">' +
+        '<div style="font-weight:800;margin-bottom:4px;">已发送到 Google Flow 生图</div>' +
+        '<div>本模式只发送提示词，不等待图片回传。图片由 Flow 页面脚本自动下载到本地。</div>' +
+        '<div style="margin-top:4px;color:#475569;">' + (dispatchResult && dispatchResult.receiverAlive ? '已检测到后台 Flow 接收页。' : (dispatchResult && dispatchResult.opened ? '未检测到接收页，已后台打开 Flow。' : '未检测到接收页，请确认 Flow 页面已打开。')) + '</div>' +
+        (flowUrl ? '<div style="margin-top:6px;color:#64748b;word-break:break-all;">Flow: ' + escapeHtml(flowUrl) + '</div>' : '') +
+      '</div>';
+  }
+
+  async function triggerFlowImageGen(contentDiv, summaryText, videoInfo, btn) {
+    const originalText = btn ? btn.textContent : '';
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = '发送中...';
+    }
+    try {
+      const imagePrompt = buildImagePrompt(summaryText || '');
+      const dispatchResult = sendPromptToFlowProject(imagePrompt, videoInfo);
+      renderFlowDispatchResult(contentDiv, dispatchResult);
+      if (btn) {
+        btn.textContent = '已发送到 Flow';
+        setTimeout(function() {
+          btn.textContent = '发送到 Flow';
+          btn.disabled = false;
+        }, 1800);
+      }
+      return dispatchResult;
+    } catch (err) {
+      console.error('[省流助手-Flow] 发送失败:', err);
+      alert('发送到 Flow 失败: ' + err.message);
+      if (btn) {
+        btn.textContent = originalText || '发送到 Flow';
+        btn.disabled = false;
+      }
+      return null;
+    }
   }
 
   function addUniqueImageCandidate(candidates, kind, url) {
@@ -763,7 +1677,8 @@
   function getVideoInfo() {
     let cid = null, bvid = null, aid = null, title = '', upName = '', desc = '', duration = 0;
     try {
-      const state = window.__INITIAL_STATE__;
+      const pageWindow = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+      const state = pageWindow.__INITIAL_STATE__ || window.__INITIAL_STATE__;
       if (state?.videoData) {
         bvid = state.videoData.bvid;
         aid = state.aid || state.videoData.aid;
@@ -4001,6 +4916,11 @@
 
   // ==================== 手动生图功能 ====================
   async function triggerManualImageGen(contentDiv, summaryText, videoInfo, btn) {
+    if (isFlowImageGenMode()) {
+      await triggerFlowImageGen(contentDiv, summaryText, videoInfo, btn);
+      return;
+    }
+
     const apiUrl = CONFIG.imageGenApiUrl || CONFIG.apiUrl;
     const apiKey = CONFIG.imageGenApiKey || CONFIG.apiKey;
     const model = CONFIG.imageGenModel || 'gemini-2.0-flash-preview-image-generation';
@@ -4116,7 +5036,7 @@
       flomoBtn.addEventListener('click', function() { sendToFlomo(rawMarkdownResult, this); });
       const genImgBtn = document.createElement('button');
       genImgBtn.className = 'tabbit-copy-btn';
-      genImgBtn.textContent = '🖼️ 生成配图';
+      genImgBtn.textContent = isFlowImageGenMode() ? '发送到 Flow' : '🖼️ 生成配图';
       genImgBtn.addEventListener('click', function() {
         triggerManualImageGen(contentDiv, getCurrentSummaryText(contentDiv, result), videoInfo, genImgBtn);
       });
@@ -4138,8 +5058,7 @@
       copyImagePromptBtn.textContent = '复制 生图提示词';
       copyImagePromptBtn.title = '一键复制生图提示词+摘要到剪贴板，粘贴到任意AI生图';
       copyImagePromptBtn.addEventListener('click', function() {
-        const summaryPlain = markdownToPlainText(getCurrentSummaryText(contentDiv, result));
-        const copyText = COPY_IMAGE_PROMPT_PRESET + '\n\n' + summaryPlain;
+        const copyText = buildImagePrompt(getCurrentSummaryText(contentDiv, result));
         copyToClipboard(copyText);
         copyImagePromptBtn.textContent = '✅ 已复制';
         setTimeout(function() { copyImagePromptBtn.textContent = '复制 生图提示词'; }, 2000);
@@ -4825,7 +5744,7 @@
         });
         const genImgBtn = document.createElement('button');
         genImgBtn.className = 'tabbit-copy-btn';
-        genImgBtn.textContent = imageDataUrl && imageDataUrl !== 'ERROR' ? '🔁 重新生成配图' : '🖼️ 生成配图';
+        genImgBtn.textContent = isFlowImageGenMode() ? '发送到 Flow' : (imageDataUrl && imageDataUrl !== 'ERROR' ? '🔁 重新生成配图' : '🖼️ 生成配图');
         genImgBtn.addEventListener('click', function() {
           triggerManualImageGen(contentDiv, getCurrentSummaryText(contentDiv, textContent), videoInfo, genImgBtn);
         });
@@ -4835,8 +5754,7 @@
         copyImagePromptBtn.textContent = '复制 生图提示词';
         copyImagePromptBtn.title = '一键复制生图提示词+摘要到剪贴板，粘贴到任意AI生图';
         copyImagePromptBtn.addEventListener('click', function() {
-          const summaryPlain = markdownToPlainText(getCurrentSummaryText(contentDiv, textContent));
-          const copyText = COPY_IMAGE_PROMPT_PRESET + '\n\n' + summaryPlain;
+          const copyText = buildImagePrompt(getCurrentSummaryText(contentDiv, textContent));
           copyToClipboard(copyText);
           copyImagePromptBtn.textContent = '✅ 已复制';
           setTimeout(function() { copyImagePromptBtn.textContent = '复制 生图提示词'; }, 2000);
@@ -5157,6 +6075,11 @@
   }
 
   function startAsyncImageGeneration(contentDiv, textContent, videoInfo) {
+    if (isFlowImageGenMode()) {
+      triggerFlowImageGen(contentDiv, textContent, videoInfo, null);
+      return;
+    }
+
     const imageSeq = nextImageGenerationSeq(contentDiv);
     const imgWrap = contentDiv.querySelector('.tabbit-image-slot .tabbit-img-wrap.tabbit-img-loading') || contentDiv.querySelector('.tabbit-img-wrap.tabbit-img-loading');
     let imgAbortBtnWrap = null;
@@ -6224,6 +7147,29 @@
                 </label>
               </div>
               <div class="tabbit-settings-group">
+                <div class="tabbit-settings-label">生图模式</div>
+                <select class="tabbit-settings-input" id="ts-imageGenMode">
+                  <option value="api" ${CONFIG.imageGenMode !== 'flow' ? 'selected' : ''}>API 生图（回传图片）</option>
+                  <option value="flow" ${CONFIG.imageGenMode === 'flow' ? 'selected' : ''}>发送到 Google Flow（不回传图片）</option>
+                </select>
+                <div class="tabbit-settings-hint">Flow 模式会把生图提示词发送到已打开/将打开的 Flow 项目页，由 Flow 页面脚本负责提交和下载。</div>
+              </div>
+              <div class="tabbit-settings-group">
+                <div class="tabbit-settings-label">Flow 项目页 URL</div>
+                <input class="tabbit-settings-input" id="ts-flowProjectUrl" type="text" value="${escapeHtml(CONFIG.flowProjectUrl || DEFAULT_FLOW_PROJECT_URL)}" placeholder="https://labs.google/fx/zh/tools/flow/project/..." />
+                <div class="tabbit-settings-hint">Flow 模式使用。建议让该项目页保持打开，右下角接收端会自动填词、生图并监控下载。</div>
+              </div>
+              <div class="tabbit-switch-row" style="margin-top:10px;padding:10px 12px;background:white;border:1px solid #e2e6f2;border-radius:8px;">
+                <div>
+                  <div class="tabbit-settings-label">发送时后台打开 Flow</div>
+                  <div class="tabbit-settings-hint" style="margin-top:2px;">开启后，如果没检测到后台 Flow 接收页，会自动后台打开上面的项目页；已打开时不会重复打开。</div>
+                </div>
+                <label class="tabbit-switch">
+                  <input type="checkbox" id="ts-enableFlowBackgroundOpen" ${CONFIG.enableFlowBackgroundOpen !== false ? 'checked' : ''} />
+                  <span class="tabbit-slider"></span>
+                </label>
+              </div>
+              <div class="tabbit-settings-group">
                 <div class="tabbit-settings-label">生图模型 API URL</div>
                 <input class="tabbit-settings-input" id="ts-imageGenApiUrl" type="text" value="${escapeHtml(CONFIG.imageGenApiUrl || '')}" placeholder="https://your-api/v1（留空复用上方 API URL）" />
                 <div class="tabbit-settings-hint">可填 /v1、/v1/images/generations、/v1/responses 或 /v1/chat/completions；脚本会自动尝试兼容格式</div>
@@ -6747,6 +7693,11 @@
       CONFIG.skipDuration = isNaN(newSkipDuration) ? 60 : newSkipDuration;
       CONFIG.autoParse = newAutoParse;
       CONFIG.enableImageGen = overlay.querySelector('#ts-enableImageGen').checked;
+      CONFIG.imageGenMode = overlay.querySelector('#ts-imageGenMode').value === 'flow' ? 'flow' : 'api';
+      CONFIG.flowProjectUrl = (overlay.querySelector('#ts-flowProjectUrl').value || '').trim() || DEFAULT_FLOW_PROJECT_URL;
+      CONFIG.enableFlowBackgroundOpen = overlay.querySelector('#ts-enableFlowBackgroundOpen')
+        ? overlay.querySelector('#ts-enableFlowBackgroundOpen').checked
+        : true;
       CONFIG.imageGenApiUrl = (overlay.querySelector('#ts-imageGenApiUrl').value || '').trim();
       CONFIG.imageGenApiKey = (overlay.querySelector('#ts-imageGenApiKey').value || '').trim();
       CONFIG.imageGenModel = (overlay.querySelector('#ts-imageGenModel').value || '').trim() || DEFAULT_CONFIG.imageGenModel;
@@ -6849,6 +7800,9 @@
             if (imported.skipDuration !== undefined) overlay.querySelector('#ts-skipDuration').value = imported.skipDuration;
             if (imported.autoParse !== undefined) overlay.querySelector('#ts-autoParse').checked = !!imported.autoParse;
             if (imported.enableImageGen !== undefined) overlay.querySelector('#ts-enableImageGen').checked = !!imported.enableImageGen;
+            if (imported.imageGenMode !== undefined) { var igModeEl = overlay.querySelector('#ts-imageGenMode'); if (igModeEl) igModeEl.value = imported.imageGenMode === 'flow' ? 'flow' : 'api'; }
+            if (imported.flowProjectUrl !== undefined) { var flowProjectUrlEl = overlay.querySelector('#ts-flowProjectUrl'); if (flowProjectUrlEl) flowProjectUrlEl.value = imported.flowProjectUrl || DEFAULT_FLOW_PROJECT_URL; }
+            if (imported.enableFlowBackgroundOpen !== undefined) { var flowBackgroundEl = overlay.querySelector('#ts-enableFlowBackgroundOpen'); if (flowBackgroundEl) flowBackgroundEl.checked = !!imported.enableFlowBackgroundOpen; }
             if (imported.imageGenApiUrl !== undefined) overlay.querySelector('#ts-imageGenApiUrl').value = imported.imageGenApiUrl;
             if (imported.imageGenApiKey !== undefined) overlay.querySelector('#ts-imageGenApiKey').value = imported.imageGenApiKey;
             if (imported.imageGenModel) overlay.querySelector('#ts-imageGenModel').value = imported.imageGenModel;
@@ -6924,6 +7878,9 @@
       overlay.querySelector('#ts-skipDuration').value = DEFAULT_CONFIG.skipDuration;
       overlay.querySelector('#ts-autoParse').checked = DEFAULT_CONFIG.autoParse;
       overlay.querySelector('#ts-enableImageGen').checked = false;
+      var imageGenModeReset = overlay.querySelector('#ts-imageGenMode'); if (imageGenModeReset) imageGenModeReset.value = DEFAULT_CONFIG.imageGenMode;
+      var flowProjectUrlReset = overlay.querySelector('#ts-flowProjectUrl'); if (flowProjectUrlReset) flowProjectUrlReset.value = DEFAULT_CONFIG.flowProjectUrl;
+      var flowBackgroundReset = overlay.querySelector('#ts-enableFlowBackgroundOpen'); if (flowBackgroundReset) flowBackgroundReset.checked = DEFAULT_CONFIG.enableFlowBackgroundOpen;
       overlay.querySelector('#ts-imageGenApiUrl').value = '';
       overlay.querySelector('#ts-imageGenApiKey').value = '';
       overlay.querySelector('#ts-imageGenModel').value = DEFAULT_CONFIG.imageGenModel;
