@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Folo 网站增强工具
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      13.8.1
+// @version      13.8.2
 // @description  Folo 增强：Jina Reader + Readability + 启发式三级抓取 + AI 总结 + 自动总结 + 手动列表全量预加载 + 后续对话 + 多配置管理 + 坚果云 WebDAV 同步 + 复制对话 + 保存到 flomo
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
@@ -1384,6 +1384,8 @@
                 </div>
                 <div class="preload-resize-handle" title="从左下角锚定拉伸"></div>`;
             document.body.appendChild(panel);
+            panel.classList.add('is-minimized');
+            panel.querySelector('.preload-toggle').innerText = '展开';
             applyPreloadPanelLayout(panel);
             enablePreloadPanelDragResize(panel);
             panel.querySelector('.preload-toggle').onclick = () => {
@@ -2193,7 +2195,7 @@
             border-color: rgba(124, 58, 237, 0.5);
         }
         #my-ai-preload-panel.is-minimized .preload-scan-mini {
-            display: inline-block;
+            display: none;
         }
         #my-ai-preload-panel .preload-toggle {
             border: 1px solid rgba(139, 92, 246, 0.25);
@@ -2215,15 +2217,15 @@
             border-color: rgba(139, 92, 246, 0.4);
         }
         #my-ai-preload-panel.is-minimized {
-            width: min(420px, calc(100vw - 36px)) !important;
-            min-height: 58px;
-            height: 58px !important;
+            width: min(260px, calc(100vw - 36px)) !important;
+            min-height: 40px;
+            height: 40px !important;
             overflow: hidden;
             resize: none;
         }
         #my-ai-preload-panel.is-minimized .preload-head {
-            height: 58px;
-            padding: 10px 12px;
+            height: 40px;
+            padding: 6px 10px;
             gap: 8px;
             box-sizing: border-box;
             border-bottom: none;
@@ -2232,21 +2234,28 @@
             flex: 0 0 auto;
             white-space: nowrap;
             font-size: 12px;
-            max-width: 76px;
             overflow: hidden;
         }
         #my-ai-preload-panel.is-minimized .preload-mini {
             text-align: left;
-            font-size: 13px;
-            font-weight: 800;
+            font-size: 11px;
+            font-weight: 700;
             color: #334155;
-            min-width: 120px;
+            min-width: 60px;
         }
         .dark #my-ai-preload-panel.is-minimized .preload-mini {
             color: #e5e7eb;
         }
         #my-ai-preload-panel.is-minimized .preload-resize-handle {
             display: none;
+        }
+        #my-ai-preload-panel.is-minimized .preload-toggle {
+            min-width: 36px;
+            height: 24px;
+            padding: 0 6px;
+            font-size: 10px;
+            line-height: 22px;
+            border-radius: 999px;
         }
         #my-ai-preload-panel.is-minimized .preload-body {
             display: none;
