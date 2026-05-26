@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name        网页浏览记录助手
 // @namespace   https://github.com/moonjoin/tampermonkey-scripts
-// @version     1.6
+// @version     1.6.1
 // @description  浏览记录自动存储 + 多渠道网页推送 + AI 浏览行为分析（多时间段），支持坚果云增量云同步（和饺子AI网页摘要助手+Folo网站增强工具数据互通）
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
@@ -82,6 +82,7 @@
       lastSyncAt: 0,
       lastSyncDirection: '',
       autoSyncHours: 4,
+      autoSyncMinutes: 240,
     },
     extractMaxChars: 16000,
     analysisTemplates: [],
@@ -120,7 +121,14 @@
   function loadConfig() {
     try {
       const raw = (typeof GM_getValue === 'function') ? GM_getValue(CONFIG_KEY, '') : '';
-      if (raw) return deepMerge(DEFAULT_CONFIG, JSON.parse(raw));
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        const merged = deepMerge(DEFAULT_CONFIG, parsed);
+        if (parsed.cloudSync && parsed.cloudSync.autoSyncMinutes === undefined && parsed.cloudSync.autoSyncHours !== undefined) {
+          merged.cloudSync.autoSyncMinutes = Math.max(0, Math.round(Number(parsed.cloudSync.autoSyncHours || 0) * 60));
+        }
+        return merged;
+      }
     } catch (e) { toast('⚠️ 配置数据损坏，已恢复默认设置'); }
     return JSON.parse(JSON.stringify(DEFAULT_CONFIG));
   }
@@ -151,6 +159,10 @@
   }
 
   let historyStore = loadHistory();
+
+  function historyRecordKey(url, ts) {
+    return String(url || '') + '|' + Number(ts || 0);
+  }
 
   /******************************************************************
    * 1. Markdown 渲染器
@@ -409,6 +421,10 @@
   function isUnread(record) { return record.ts > historyStore.lastReadAt; }
   function getUnreadCount() { return historyStore.records.filter(r => isUnread(r)).length; }
   function markAllAsRead() { historyStore.lastReadAt = Date.now(); saveHistory(historyStore); }
+  function markRecordSyncDirty(record, at) {
+    if (!record) return;
+    record.syncUpdatedAt = Math.max(Number(record.syncUpdatedAt || 0), Number(at || Date.now()));
+  }
   function isDomainExcluded(domain) { return (cfg.history?.excludeDomains || DEFAULT_EXCLUDE_DOMAINS).some(d => domain.includes(d)); }
   function normalizeUrlForBlock(url) {
     try { const u = new URL(url); u.hash = ''; return u.href; } catch { return String(url || '').trim(); }
@@ -425,6 +441,7 @@
   function setBlacklistedUrls(urls) {
     cfg.history = cfg.history || {};
     cfg.history.blacklistedUrls = mergeBlacklistedUrls(urls);
+    cfg.history.blacklistUpdatedAt = Date.now();
     saveConfig(cfg);
   }
   function isUrlBlacklisted(url) { return getBlacklistedUrls().includes(normalizeUrlForBlock(url)); }
@@ -433,6 +450,37 @@
     if (!blocked.size) return 0;
     const before = historyStore.records.length;
     historyStore.records = historyStore.records.filter(r => !blocked.has(normalizeUrlForBlock(r.url)));
+    return before - historyStore.records.length;
+  }
+  function mergeDeletedHistoryRecords() {
+    const map = new Map();
+    Array.from(arguments).flat().forEach(item => {
+      if (!item || !item.url || !item.ts) return;
+      const deletedAt = Number(item.deletedAt || Date.now());
+      const key = historyRecordKey(item.url, item.ts);
+      const prev = map.get(key);
+      if (!prev || deletedAt > Number(prev.deletedAt || 0)) {
+        map.set(key, { url: item.url, ts: Number(item.ts), deletedAt });
+      }
+    });
+    return Array.from(map.values()).sort((a, b) => Number(b.deletedAt || 0) - Number(a.deletedAt || 0)).slice(0, 50000);
+  }
+  function getDeletedHistoryRecords() {
+    return mergeDeletedHistoryRecords(historyStore.deletedRecords || []);
+  }
+  function setDeletedHistoryRecords(records) {
+    historyStore.deletedRecords = mergeDeletedHistoryRecords(records);
+  }
+  function addDeletedHistoryRecords(records, deletedAt) {
+    const tombstones = (records || []).map(r => ({ url: r.url, ts: r.ts, deletedAt: deletedAt || Date.now() }));
+    setDeletedHistoryRecords(mergeDeletedHistoryRecords(getDeletedHistoryRecords(), tombstones));
+    return tombstones.length;
+  }
+  function applyDeletedHistoryRecords() {
+    const deleted = new Set(getDeletedHistoryRecords().map(d => historyRecordKey(d.url, d.ts)));
+    if (!deleted.size) return 0;
+    const before = historyStore.records.length;
+    historyStore.records = historyStore.records.filter(r => !deleted.has(historyRecordKey(r.url, r.ts)));
     return before - historyStore.records.length;
   }
 
@@ -506,6 +554,7 @@
       const record = findDwellRecord();
       if (record) {
         record.dwellSec = getRecordDwellSec(record) + addSec;
+        markRecordSyncDirty(record);
         _dwellSession.pendingMs -= addSec * 1000;
         if (forceSave) saveHistory(historyStore); else saveHistoryDeferred();
       }
@@ -534,7 +583,7 @@
 
     // 冷却内同 URL 不重复记录（5分钟）
     const existing = records.find(r => r.url === url && (now - r.ts) < 5 * 60 * 1000);
-    if (existing) { existing.lastVisit = now; existing.visits = (existing.visits || 1) + 1; bindDwellRecord(existing, url, now); saveHistory(historyStore); return; }
+    if (existing) { existing.lastVisit = now; existing.visits = (existing.visits || 1) + 1; markRecordSyncDirty(existing, now); bindDwellRecord(existing, url, now); saveHistory(historyStore); return; }
 
     // 如果需要停留检测且不是跳过检测的情况
     if (minDwell > 0 && !skipDwellCheck) {
@@ -564,8 +613,8 @@
     if (isUrlBlacklisted(url)) return;
     const records = historyStore.records;
     const existing = records.find(r => r.url === url && (ts - r.ts) < 5 * 60 * 1000);
-    if (existing) { existing.lastVisit = ts; existing.visits = (existing.visits || 1) + 1; bindDwellRecord(existing, url, ts); saveHistory(historyStore); return existing; }
-    const record = { url, title, domain, ts, lastVisit: ts, visits: 1 };
+    if (existing) { existing.lastVisit = ts; existing.visits = (existing.visits || 1) + 1; markRecordSyncDirty(existing, ts); bindDwellRecord(existing, url, ts); saveHistory(historyStore); return existing; }
+    const record = { url, title, domain, ts, lastVisit: ts, visits: 1, syncUpdatedAt: Date.now() };
     records.push(record);
     bindDwellRecord(record, url, ts);
     enforceMaxRecords(); saveHistory(historyStore);
@@ -622,7 +671,11 @@
     };
     input.click();
   }
-  function clearAllRecords() { historyStore = { records: [], lastReadAt: 0 }; saveHistory(historyStore); }
+  function clearAllRecords() {
+    const deletedRecords = mergeDeletedHistoryRecords(getDeletedHistoryRecords(), historyStore.records.map(r => ({ url: r.url, ts: r.ts, deletedAt: Date.now() })));
+    historyStore = { records: [], lastReadAt: 0, deletedRecords };
+    saveHistory(historyStore);
+  }
   function getDomainStats(records) {
     const map = {};
     records.forEach(r => { if (!map[r.domain]) map[r.domain] = { count: 0, visits: 0, dwellSec: 0 }; map[r.domain].count++; map[r.domain].visits += (r.visits || 1); map[r.domain].dwellSec += getRecordDwellSec(r); });
@@ -862,8 +915,9 @@ ${lines}`;
   async function jgyMkcolIfNeeded(dirPath) { try { await jgyRequest('MKCOL', jgyUrl(dirPath), { allow404: true, allow405: true }); } catch (e) { if (e.message?.includes('401')) throw e; } }
   async function jgyDownloadJson(filePath) { const res = await jgyRequest('GET', jgyUrl(filePath), { allow404: true }); if (res.status === 404) return null; try { return JSON.parse(res.responseText); } catch { return null; } }
   async function jgyUploadJson(filePath, payload) { await jgyRequest('PUT', jgyUrl(filePath), { headers: { 'Content-Type': 'application/json' }, data: JSON.stringify(payload, null, 2) }); }
+  async function jgyDeleteIfExists(filePath) { try { await jgyRequest('DELETE', jgyUrl(filePath), { allow404: true }); } catch (e) {} }
   function mergeProfiles(local, remote) { const map = new Map(); [...remote, ...local].forEach(p => map.set(p.id, p)); return Array.from(map.values()); }
-  async function jgyListJsonFiles(dirPath) {
+  async function jgyListChildNames(dirPath) {
     const body = '<?xml version="1.0" encoding="utf-8"?><d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>';
     try {
       const res = await jgyRequest('PROPFIND', jgyUrl(dirPath), { headers: { Depth: '1', 'Content-Type': 'application/xml' }, data: body });
@@ -873,17 +927,21 @@ ${lines}`;
         ...Array.from(doc.getElementsByTagName('href')),
         ...Array.from(doc.getElementsByTagNameNS('*', 'href'))
       ];
-      const files = [];
+      const names = [];
+      const selfName = (dirPath || '').split('/').filter(Boolean).pop() || '';
       hrefNodes.forEach(node => {
         const href = node.textContent || '';
         let name = (href.split('/').filter(Boolean).pop() || '').trim();
         try { name = decodeURIComponent(name); } catch (e) {}
-        if (name.endsWith('.json') && !files.includes(name)) files.push(name);
+        if (name && name !== selfName && !names.includes(name)) names.push(name);
       });
-      return files;
+      return names;
     } catch (e) {
       return [];
     }
+  }
+  async function jgyListJsonFiles(dirPath) {
+    return (await jgyListChildNames(dirPath)).filter(name => name.endsWith('.json'));
   }
   function mergeHistoryRecordFields(a, b) {
     const out = { ...a, ...b };
@@ -894,13 +952,15 @@ ${lines}`;
     out.dwellSec = Math.max(getRecordDwellSec(a), getRecordDwellSec(b));
     return out;
   }
-  function mergeHistoryRecords(local, remote) {
+  function mergeHistoryRecords(local, remote, deletedRecords) {
     const blocked = new Set(getBlacklistedUrls());
+    const deleted = new Set(mergeDeletedHistoryRecords(deletedRecords || getDeletedHistoryRecords()).map(d => historyRecordKey(d.url, d.ts)));
     const map = new Map();
     [...(remote || []), ...(local || [])].forEach(r => {
       if (!r || !r.url || !r.ts) return;
       if (blocked.has(normalizeUrlForBlock(r.url))) return;
-      const key = r.url + '|' + r.ts;
+      const key = historyRecordKey(r.url, r.ts);
+      if (deleted.has(key)) return;
       map.set(key, map.has(key) ? mergeHistoryRecordFields(map.get(key), r) : r);
     });
     return Array.from(map.values()).sort((a, b) => b.ts - a.ts);
@@ -922,7 +982,8 @@ ${lines}`;
     if (rp?.profiles) { const m = mergeProfiles(normalizeProfiles(cfg.profiles), normalizeProfiles(rp.profiles)); cfg.profiles = m; if (rp.currentProfileId && m.some(p => p.id === rp.currentProfileId)) cfg.currentProfileId = rp.currentProfileId; }
     const rh = await jgyDownloadJson(JGY_HISTORY_DIR + JGY_HISTORY_FILE);
     if (rh?.blacklistedUrls) setBlacklistedUrls(mergeBlacklistedUrls(getBlacklistedUrls(), rh.blacklistedUrls));
-    if (rh?.records) { historyStore.records = mergeHistoryRecords(historyStore.records, rh.records); if (rh.lastReadAt > historyStore.lastReadAt) historyStore.lastReadAt = rh.lastReadAt; pruneBlacklistedRecords(); }
+    if (rh?.deletedRecords) setDeletedHistoryRecords(mergeDeletedHistoryRecords(getDeletedHistoryRecords(), rh.deletedRecords));
+    if (rh?.records) { historyStore.records = mergeHistoryRecords(historyStore.records, rh.records); if (rh.lastReadAt > historyStore.lastReadAt) historyStore.lastReadAt = rh.lastReadAt; pruneBlacklistedRecords(); applyDeletedHistoryRecords(); }
     cfg.cloudSync.lastSyncAt = Date.now(); cfg.cloudSync.lastSyncDirection = 'pull'; saveConfig(cfg); saveHistory(historyStore);
   }
   async function cloudPushAll() {
@@ -931,15 +992,16 @@ ${lines}`;
     await jgyUploadJson(JGY_SHARED_DIR + JGY_PROFILES_FILE, { version: 1, schema: PROFILES_SCHEMA, updatedAt: Date.now(), profiles: mp, currentProfileId: cfg.currentProfileId }); cfg.profiles = mp;
     await jgyMkcolIfNeeded(JGY_HISTORY_DIR); let rh = null; try { rh = await jgyDownloadJson(JGY_HISTORY_DIR + JGY_HISTORY_FILE); } catch (e) {}
     if (rh?.blacklistedUrls) setBlacklistedUrls(mergeBlacklistedUrls(getBlacklistedUrls(), rh.blacklistedUrls));
-    let mh = historyStore.records; if (rh?.records) mh = mergeHistoryRecords(mh, rh.records); historyStore.records = mh; pruneBlacklistedRecords(); mh = historyStore.records;
-    await jgyUploadJson(JGY_HISTORY_DIR + JGY_HISTORY_FILE, { version: 2, updatedAt: Date.now(), records: mh, lastReadAt: historyStore.lastReadAt, blacklistedUrls: getBlacklistedUrls(), checksum: calcHistoryChecksum(mh, getBlacklistedUrls()) });
+    if (rh?.deletedRecords) setDeletedHistoryRecords(mergeDeletedHistoryRecords(getDeletedHistoryRecords(), rh.deletedRecords));
+    let mh = historyStore.records; if (rh?.records) mh = mergeHistoryRecords(mh, rh.records); historyStore.records = mh; pruneBlacklistedRecords(); applyDeletedHistoryRecords(); mh = historyStore.records;
+    await jgyUploadJson(JGY_HISTORY_DIR + JGY_HISTORY_FILE, { version: 2, updatedAt: Date.now(), records: mh, lastReadAt: historyStore.lastReadAt, blacklistedUrls: getBlacklistedUrls(), deletedRecords: getDeletedHistoryRecords(), checksum: calcHistoryChecksum(mh, getBlacklistedUrls()) });
     cfg.cloudSync.lastSyncAt = Date.now(); cfg.cloudSync.lastSyncDirection = 'push'; saveConfig(cfg); saveHistory(historyStore);
   }
   async function cloudForcePushAll() {
     await jgyMkcolIfNeeded(JGY_SHARED_DIR); await jgyMkcolIfNeeded(JGY_HISTORY_DIR);
     await jgyUploadJson(JGY_SHARED_DIR + JGY_PROFILES_FILE, { version: 1, schema: PROFILES_SCHEMA, updatedAt: Date.now(), profiles: normalizeProfiles(cfg.profiles), currentProfileId: cfg.currentProfileId, forcePush: true });
     pruneBlacklistedRecords();
-    await jgyUploadJson(JGY_HISTORY_DIR + JGY_HISTORY_FILE, { version: 2, updatedAt: Date.now(), forcePush: true, records: historyStore.records, lastReadAt: historyStore.lastReadAt, blacklistedUrls: getBlacklistedUrls(), checksum: calcHistoryChecksum(historyStore.records, getBlacklistedUrls()) });
+    await jgyUploadJson(JGY_HISTORY_DIR + JGY_HISTORY_FILE, { version: 2, updatedAt: Date.now(), forcePush: true, records: historyStore.records, lastReadAt: historyStore.lastReadAt, blacklistedUrls: getBlacklistedUrls(), deletedRecords: getDeletedHistoryRecords(), checksum: calcHistoryChecksum(historyStore.records, getBlacklistedUrls()) });
     cfg.cloudSync.lastSyncAt = Date.now(); cfg.cloudSync.lastSyncDirection = 'force-push'; saveConfig(cfg); saveHistory(historyStore);
   }
 
@@ -950,6 +1012,7 @@ ${lines}`;
   const JGY_HISTORY_SYNC_META = 'meta.json';
   const JGY_HISTORY_SYNC_BATCHES = 'batches/';
   const JGY_HISTORY_SYNC_CLIENTS = 'clients/';
+  const AUTO_SYNC_BASELINE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 
   function loadHistorySyncMeta() {
     try {
@@ -977,6 +1040,164 @@ ${lines}`;
     }
   }
 
+  function getLatestHistoryRecordTs(records) {
+    return (records || []).length ? Math.max(...records.map(r => Number(r.ts || 0))) : 0;
+  }
+
+  function getRecordSyncUpdatedAt(record) {
+    return Number(record?.syncUpdatedAt || record?.lastVisit || record?.ts || 0);
+  }
+
+  function getLatestRecordSyncUpdatedAt(records) {
+    return (records || []).length ? Math.max(...records.map(getRecordSyncUpdatedAt)) : 0;
+  }
+
+  function formatSyncBatchDay(ts) {
+    const d = new Date(ts || Date.now());
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${y}-${m}-${day}`;
+  }
+
+  async function listHistorySyncBatchFiles() {
+    const entries = await jgyListChildNames(JGY_HISTORY_SYNC_DIR + JGY_HISTORY_SYNC_BATCHES);
+    const files = entries
+      .filter(name => name.endsWith('.json'))
+      .map(name => ({ name, path: JGY_HISTORY_SYNC_DIR + JGY_HISTORY_SYNC_BATCHES + name }));
+    const dirs = entries.filter(name => !name.endsWith('.json'));
+    for (const dir of dirs) {
+      const childFiles = await jgyListJsonFiles(JGY_HISTORY_SYNC_DIR + JGY_HISTORY_SYNC_BATCHES + dir + '/');
+      childFiles.forEach(name => files.push({ name: `${dir}/${name}`, path: JGY_HISTORY_SYNC_DIR + JGY_HISTORY_SYNC_BATCHES + dir + '/' + name }));
+    }
+    return files;
+  }
+
+  function getHistorySyncSnapshot(records, blacklistedUrls) {
+    const list = records || historyStore.records;
+    const blocked = blacklistedUrls || getBlacklistedUrls();
+    return {
+      syncedCount: list.length,
+      recordCount: list.length,
+      lastRecordTs: getLatestHistoryRecordTs(list),
+      lastReadAt: historyStore.lastReadAt || 0,
+      blacklistedCount: blocked.length,
+      checksum: calcHistoryChecksum(list, blocked)
+    };
+  }
+
+  function sameHistorySyncSnapshot(a, b) {
+    if (!a || !b || !a.checksum || !b.checksum) return false;
+    const bCount = Number(b.syncedCount ?? b.recordCount ?? b.count ?? 0);
+    const bLastTs = Number(b.lastRecordTs ?? b.latestRecordTs ?? 0);
+    return a.checksum === b.checksum
+      && Number(a.syncedCount || 0) === bCount
+      && Number(a.lastRecordTs || 0) === bLastTs
+      && Number(a.lastReadAt || 0) === Number(b.lastReadAt || 0);
+  }
+
+  async function historySyncAutoUploadDelta() {
+    const now = Date.now();
+    const clientId = getHistorySyncClientId();
+    const localMeta = loadHistorySyncMeta();
+    const baselineAt = Number(localMeta.lastAutoUploadRecordUpdatedAt || localMeta.lastSyncAt || 0);
+    const lastReadBaseline = Number(localMeta.lastAutoUploadLastReadAt ?? localMeta.lastReadAt ?? 0);
+    const blacklistBaseline = Number(localMeta.lastAutoUploadBlacklistAt || 0);
+
+    if (!baselineAt && !localMeta.checksum) {
+      const latestUpdatedAt = getLatestRecordSyncUpdatedAt(historyStore.records);
+      saveHistorySyncMeta({
+        ...localMeta,
+        lastAutoUploadRecordUpdatedAt: Math.max(0, latestUpdatedAt - AUTO_SYNC_BASELINE_WINDOW_MS),
+        lastAutoUploadLastReadAt: historyStore.lastReadAt || 0,
+        lastAutoUploadBlacklistAt: Number(cfg.history?.blacklistUpdatedAt || 0),
+        lastSyncAt: now,
+        lastCheckedAt: now,
+        lastDirection: 'auto-baseline',
+        skipped: true
+      });
+      cfg.cloudSync.lastSyncAt = now;
+      cfg.cloudSync.lastSyncDirection = 'auto-baseline';
+      saveConfig(cfg);
+      return { skipped: true, baseline: true, finalCount: historyStore.records.length };
+    }
+
+    const changedRecords = historyStore.records.filter(r => getRecordSyncUpdatedAt(r) > baselineAt);
+    const changedDeletedRecords = getDeletedHistoryRecords().filter(r => Number(r.deletedAt || 0) > baselineAt);
+    const lastReadChanged = Number(historyStore.lastReadAt || 0) > lastReadBaseline;
+    const blacklistChanged = Number(cfg.history?.blacklistUpdatedAt || 0) > blacklistBaseline;
+    if (!changedRecords.length && !changedDeletedRecords.length && !lastReadChanged && !blacklistChanged) {
+      saveHistorySyncMeta({ ...localMeta, lastSyncAt: now, lastCheckedAt: now, lastDirection: 'auto-delta-check', skipped: true });
+      cfg.cloudSync.lastSyncAt = now;
+      cfg.cloudSync.lastSyncDirection = 'auto-delta-check';
+      saveConfig(cfg);
+      return { skipped: true, finalCount: historyStore.records.length };
+    }
+
+    await jgyMkcolIfNeeded(JGY_HISTORY_DIR);
+    await jgyMkcolIfNeeded(JGY_HISTORY_SYNC_DIR);
+    await jgyMkcolIfNeeded(JGY_HISTORY_SYNC_DIR + JGY_HISTORY_SYNC_BATCHES);
+    await jgyMkcolIfNeeded(JGY_HISTORY_SYNC_DIR + JGY_HISTORY_SYNC_CLIENTS);
+    const dayDir = formatSyncBatchDay(now) + '/';
+    await jgyMkcolIfNeeded(JGY_HISTORY_SYNC_DIR + JGY_HISTORY_SYNC_BATCHES + dayDir);
+
+    const lastRecordUpdatedAt = Math.max(
+      baselineAt,
+      changedRecords.length ? Math.max(...changedRecords.map(getRecordSyncUpdatedAt)) : 0,
+      changedDeletedRecords.length ? Math.max(...changedDeletedRecords.map(r => Number(r.deletedAt || 0))) : 0
+    );
+    const batchId = `${clientId}-${now}-${makeId('delta')}`;
+    const payload = {
+      version: 3,
+      mode: 'delta',
+      batchId,
+      clientId,
+      createdAt: now,
+      baseRecordUpdatedAt: baselineAt,
+      records: changedRecords,
+      deletedRecords: changedDeletedRecords,
+      recordCount: changedRecords.length,
+      deletedCount: changedDeletedRecords.length,
+      lastRecordUpdatedAt,
+      latestRecordTs: getLatestHistoryRecordTs(changedRecords),
+      ...(lastReadChanged ? { lastReadAt: historyStore.lastReadAt } : {}),
+      ...(blacklistChanged ? { blacklistedUrls: getBlacklistedUrls() } : {})
+    };
+    await jgyUploadJson(JGY_HISTORY_SYNC_DIR + JGY_HISTORY_SYNC_BATCHES + dayDir + batchId + '.json', payload);
+    await jgyUploadJson(JGY_HISTORY_SYNC_DIR + JGY_HISTORY_SYNC_CLIENTS + clientId + '.json', {
+      version: 3,
+      clientId,
+      updatedAt: now,
+      mode: 'auto-delta',
+      lastBatchId: batchId,
+      uploadedRecordCount: changedRecords.length,
+      uploadedDeleteCount: changedDeletedRecords.length,
+      localRecordCount: historyStore.records.length,
+      latestRecordTs: getLatestHistoryRecordTs(historyStore.records),
+      lastRecordUpdatedAt,
+      lastReadAt: historyStore.lastReadAt || 0,
+      blacklistedCount: getBlacklistedUrls().length
+    });
+
+    saveHistorySyncMeta({
+      ...localMeta,
+      lastSyncAt: now,
+      lastCheckedAt: now,
+      lastBatchId: batchId,
+      lastDirection: 'auto-delta',
+      lastAutoUploadAt: now,
+      lastAutoUploadRecordUpdatedAt: Math.max(baselineAt, lastRecordUpdatedAt),
+      lastAutoUploadLastReadAt: historyStore.lastReadAt || 0,
+      lastAutoUploadBlacklistAt: Number(cfg.history?.blacklistUpdatedAt || 0),
+      syncedCount: historyStore.records.length,
+      recordCount: historyStore.records.length
+    });
+    cfg.cloudSync.lastSyncAt = now;
+    cfg.cloudSync.lastSyncDirection = 'auto-delta';
+    saveConfig(cfg);
+    return { skipped: false, uploaded: changedRecords.length, finalCount: historyStore.records.length, batchId };
+  }
+
   async function historySyncReconcile() {
     const now = Date.now();
     const localBefore = historyStore.records.length;
@@ -990,42 +1211,53 @@ ${lines}`;
     let remoteRecords = [];
     let remoteLastReadAt = 0;
     let remoteBlockedUrls = [];
+    let remoteDeletedRecords = [];
 
     const remoteFull = await jgyDownloadJson(JGY_HISTORY_DIR + JGY_HISTORY_FILE);
     if (remoteFull?.records) remoteRecords.push(...remoteFull.records);
     if (remoteFull?.lastReadAt) remoteLastReadAt = Math.max(remoteLastReadAt, remoteFull.lastReadAt);
     remoteBlockedUrls = mergeBlacklistedUrls(remoteBlockedUrls, remoteFull?.blacklistedUrls || []);
+    remoteDeletedRecords = mergeDeletedHistoryRecords(remoteDeletedRecords, remoteFull?.deletedRecords || []);
 
     const remoteMeta = await jgyDownloadJson(JGY_HISTORY_SYNC_DIR + JGY_HISTORY_SYNC_META);
     if (remoteMeta?.lastReadAt) remoteLastReadAt = Math.max(remoteLastReadAt, remoteMeta.lastReadAt);
     remoteBlockedUrls = mergeBlacklistedUrls(remoteBlockedUrls, remoteMeta?.blacklistedUrls || []);
+    remoteDeletedRecords = mergeDeletedHistoryRecords(remoteDeletedRecords, remoteMeta?.deletedRecords || []);
 
-    const batchFiles = await jgyListJsonFiles(JGY_HISTORY_SYNC_DIR + JGY_HISTORY_SYNC_BATCHES);
-    for (const name of batchFiles) {
-      const batchData = await jgyDownloadJson(JGY_HISTORY_SYNC_DIR + JGY_HISTORY_SYNC_BATCHES + name);
+    const batchFiles = await listHistorySyncBatchFiles();
+    for (const item of batchFiles) {
+      const batchData = await jgyDownloadJson(item.path);
       if (batchData?.records) remoteRecords.push(...batchData.records);
       if (batchData?.lastReadAt) remoteLastReadAt = Math.max(remoteLastReadAt, batchData.lastReadAt);
       remoteBlockedUrls = mergeBlacklistedUrls(remoteBlockedUrls, batchData?.blacklistedUrls || []);
+      remoteDeletedRecords = mergeDeletedHistoryRecords(remoteDeletedRecords, batchData?.deletedRecords || []);
     }
 
     const clientFiles = await jgyListJsonFiles(JGY_HISTORY_SYNC_DIR + JGY_HISTORY_SYNC_CLIENTS);
 
     setBlacklistedUrls(mergeBlacklistedUrls(getBlacklistedUrls(), remoteBlockedUrls));
-    historyStore.records = mergeHistoryRecords(historyStore.records, remoteRecords);
+    const deletedRecords = mergeDeletedHistoryRecords(getDeletedHistoryRecords(), remoteDeletedRecords);
+    setDeletedHistoryRecords(deletedRecords);
+    historyStore.records = mergeHistoryRecords(historyStore.records, remoteRecords, deletedRecords);
     if (remoteLastReadAt > historyStore.lastReadAt) historyStore.lastReadAt = remoteLastReadAt;
     pruneBlacklistedRecords();
     enforceMaxRecords();
+    applyDeletedHistoryRecords();
 
     const blacklistedUrls = getBlacklistedUrls();
-    const latestRecordTs = historyStore.records.length ? Math.max(...historyStore.records.map(r => r.ts)) : 0;
-    const checksum = calcHistoryChecksum(historyStore.records, blacklistedUrls);
+    const finalDeletedRecords = getDeletedHistoryRecords();
+    const snapshot = getHistorySyncSnapshot(historyStore.records, blacklistedUrls);
+    const latestRecordTs = snapshot.lastRecordTs;
+    const checksum = snapshot.checksum;
     const payload = {
       version: 2,
       updatedAt: now,
       records: historyStore.records,
       lastReadAt: historyStore.lastReadAt,
       blacklistedUrls,
+      deletedRecords: finalDeletedRecords,
       count: historyStore.records.length,
+      deletedCount: finalDeletedRecords.length,
       checksum
     };
 
@@ -1048,11 +1280,12 @@ ${lines}`;
       lastRecordTs: latestRecordTs,
       syncedCount: historyStore.records.length,
       lastReadAt: historyStore.lastReadAt,
-      pendingBatches: Array.isArray(remoteMeta?.pendingBatches) ? remoteMeta.pendingBatches.slice(-100) : [],
+      pendingBatches: [],
       blacklistedUrls,
+      deletedCount: finalDeletedRecords.length,
       checksum,
       reconcile: true,
-      mode: 'single-full-with-client-summaries',
+      mode: 'full-reconcile-with-delta-batches',
       clientId,
       clientCount: clientFiles.length + (clientFiles.includes(clientId + '.json') ? 0 : 1)
     });
@@ -1061,13 +1294,20 @@ ${lines}`;
       lastSyncAt: now,
       lastBatchId: clientId,
       lastRecordTs: latestRecordTs,
-      syncedCount: historyStore.records.length,
+      syncedCount: snapshot.syncedCount,
+      recordCount: snapshot.recordCount,
+      lastReadAt: snapshot.lastReadAt,
+      lastReconcileAt: now,
+      lastAutoUploadRecordUpdatedAt: getLatestRecordSyncUpdatedAt(historyStore.records),
+      lastAutoUploadLastReadAt: historyStore.lastReadAt || 0,
+      lastAutoUploadBlacklistAt: Number(cfg.history?.blacklistUpdatedAt || 0),
       checksum
     });
     saveHistory(historyStore);
     cfg.cloudSync.lastSyncAt = now;
     cfg.cloudSync.lastSyncDirection = 'reconcile';
     saveConfig(cfg);
+    await Promise.allSettled(batchFiles.map(item => jgyDeleteIfExists(item.path)));
 
     return {
       localBefore,
@@ -1082,9 +1322,15 @@ ${lines}`;
     };
   }
 
-  // 旧入口保留给自动同步调用，实际执行安全对账同步。
+  // 手动入口保留“对账同步”语义：读取云端全量和增量批次后合并。
   async function historySyncIncremental() {
     return historySyncReconcile();
+  }
+
+  function getAutoSyncIntervalMs() {
+    const minutes = Number(cfg.cloudSync?.autoSyncMinutes ?? 0);
+    if (minutes <= 0) return 0;
+    return Math.max(60 * 1000, minutes * 60 * 1000);
   }
 
   // 强制覆盖：本地全量覆盖远端
@@ -1139,11 +1385,18 @@ ${lines}`;
     });
 
     // 更新本地 sync meta
+    const snapshot = getHistorySyncSnapshot(historyStore.records, blacklistedUrls);
     saveHistorySyncMeta({
       lastSyncAt: now,
       lastBatchId: clientId,
       lastRecordTs: latestRecordTs,
-      syncedCount: historyStore.records.length,
+      syncedCount: snapshot.syncedCount,
+      recordCount: snapshot.recordCount,
+      lastReadAt: snapshot.lastReadAt,
+      lastReconcileAt: now,
+      lastAutoUploadRecordUpdatedAt: getLatestRecordSyncUpdatedAt(historyStore.records),
+      lastAutoUploadLastReadAt: historyStore.lastReadAt || 0,
+      lastAutoUploadBlacklistAt: Number(cfg.history?.blacklistUpdatedAt || 0),
       checksum
     });
 
@@ -1581,7 +1834,10 @@ ${lines}`;
           <button data-filter="month">📆 本月</button>
           <button data-filter="unread">🆕 未读</button>
         </div>
-        <input class="mpush-search" id="history-search" placeholder="搜索标题或域名…">
+        <input class="mpush-search" id="history-search" placeholder="搜索标题、域名或链接…">
+        <div class="mpush-btns" style="margin-top:8px;">
+          <button class="mpush-btn danger" id="history-delete-filtered" disabled>🗑️ 删除当前筛选结果</button>
+        </div>
       </div>
       <div class="mpush-history-list" id="history-list"></div>
       <div class="mpush-cloud-status" id="history-sync-status" style="margin:6px 0;font-size:11px;color:#888;"></div>
@@ -1598,6 +1854,7 @@ ${lines}`;
       </div>`;
     pane.querySelector('#history-filters').addEventListener('click', e => { const btn = e.target.closest('[data-filter]'); if (!btn) return; currentHistoryFilter = btn.dataset.filter; pane.querySelectorAll('#history-filters button').forEach(b => b.classList.remove('active')); btn.classList.add('active'); refreshHistoryTab(); });
     pane.querySelector('#history-search').addEventListener('input', e => { currentHistorySearch = e.target.value.trim().toLowerCase(); refreshHistoryTab(); });
+    pane.querySelector('#history-delete-filtered').addEventListener('click', deleteFilteredHistoryRecords);
     pane.querySelector('#history-mark-read').addEventListener('click', () => { markAllAsRead(); updateBadge(); refreshHistoryTab(); toast('✅ 已全部标为已读'); });
     pane.querySelector('#history-export').addEventListener('click', exportRecordsAsJson);
     pane.querySelector('#history-import').addEventListener('click', importRecordsFromJson);
@@ -1621,18 +1878,34 @@ ${lines}`;
     });
     return pane;
   }
-  function refreshHistoryTab() {
-    if (!historyTabEl) return;
-    const stats = historyTabEl.querySelector('#history-stats'), list = historyTabEl.querySelector('#history-list');
-    if (!stats || !list) return;
-    const total = historyStore.records.length, unread = getUnreadCount(), todayRecords = getTodayRecords(), todayCount = todayRecords.length;
+  function getCurrentFilteredHistoryRecords() {
     let filtered = historyStore.records;
     if (currentHistoryFilter === 'today') filtered = getTodayRecords();
     else if (currentHistoryFilter === 'week') filtered = getThisWeekRecords();
     else if (currentHistoryFilter === 'month') filtered = getThisMonthRecords();
     else if (currentHistoryFilter === 'unread') filtered = historyStore.records.filter(r => isUnread(r));
-    if (currentHistorySearch) { const q = currentHistorySearch; filtered = filtered.filter(r => (r.title && r.title.toLowerCase().includes(q)) || (r.domain && r.domain.toLowerCase().includes(q))); }
-    filtered = [...filtered].sort((a, b) => b.ts - a.ts);
+    if (currentHistorySearch) {
+      const q = currentHistorySearch;
+      filtered = filtered.filter(r =>
+        (r.title && r.title.toLowerCase().includes(q)) ||
+        (r.domain && r.domain.toLowerCase().includes(q)) ||
+        (r.url && r.url.toLowerCase().includes(q))
+      );
+    }
+    return [...filtered].sort((a, b) => b.ts - a.ts);
+  }
+
+  function refreshHistoryTab() {
+    if (!historyTabEl) return;
+    const stats = historyTabEl.querySelector('#history-stats'), list = historyTabEl.querySelector('#history-list');
+    if (!stats || !list) return;
+    const total = historyStore.records.length, unread = getUnreadCount(), todayRecords = getTodayRecords(), todayCount = todayRecords.length;
+    const filtered = getCurrentFilteredHistoryRecords();
+    const bulkBtn = historyTabEl.querySelector('#history-delete-filtered');
+    if (bulkBtn) {
+      bulkBtn.disabled = !filtered.length || (!currentHistorySearch && currentHistoryFilter === 'all');
+      bulkBtn.textContent = `🗑️ 删除当前筛选结果${filtered.length ? `（${filtered.length}）` : ''}`;
+    }
     const totalDwell = historyStore.records.reduce((sum, r) => sum + getRecordDwellSec(r), 0);
     const todayDwell = todayRecords.reduce((sum, r) => sum + getRecordDwellSec(r), 0);
     stats.innerHTML = `<div>📋 总计 ${total.toLocaleString()} 条 · 今日新增 ${todayCount} 条${totalDwell ? ` · 总停留 ${formatDuration(totalDwell)}` : ''}${todayDwell ? ` · 今日 ${formatDuration(todayDwell)}` : ''}</div>${unread > 0 ? `<div style="color:#ef4444;font-weight:600;">📢 ${unread} 条新记录</div>` : '<div style="color:#16a34a;">✅ 全部已查阅</div>'}`;
@@ -1670,7 +1943,7 @@ ${lines}`;
     if (!statusEl) return;
     const syncMeta = loadHistorySyncMeta();
     if (syncMeta.lastSyncAt) {
-      const dirMap = { reconcile: '对账同步', incremental: '对账同步', 'force-push': '强制覆盖', pull: '拉取', push: '上传' };
+      const dirMap = { reconcile: '对账同步', incremental: '对账同步', 'auto-delta': '自动增量上传', 'auto-delta-check': '自动检查', 'auto-baseline': '自动基线', 'force-push': '强制覆盖', pull: '拉取', push: '上传' };
       const dir = dirMap[cfg.cloudSync?.lastSyncDirection] || '';
       statusEl.textContent = `☁️ 上次同步：${formatDate(syncMeta.lastSyncAt)} ${formatTime(syncMeta.lastSyncAt)}（${dir}，${syncMeta.syncedCount || 0} 条${syncMeta.checksum ? `，校验 ${syncMeta.checksum}` : ''}）`;
     } else {
@@ -1800,11 +2073,11 @@ ${lines}`;
     pushSection.body.innerHTML = `
       <div class="mpush-field"><div class="mpush-field-inline"><input type="checkbox" data-path="common.autoSendOnLoad"><span>自动在页面打开后推送</span></div><small>需至少启用一个推送渠道才会实际发送</small></div>
       <div class="mpush-row-2">
-        <div class="mpush-field"><div class="mpush-field-label">最小停留（ms）</div><input type="number" data-path="common.minDwellMs" min="0" max="60000" value="2000"><small>页面停留不足此时间不记录/推送，过滤中转页</small></div>
-        <div class="mpush-field"><div class="mpush-field-label">推送延迟（ms）</div><input type="number" data-path="common.delayMs" min="0" max="600000"><small>标题稳定等待时间</small></div>
+        <div class="mpush-field"><div class="mpush-field-label">最小停留（秒）</div><input type="number" data-path="common.minDwellMs" min="0" max="60" step="1" value="2" data-scale="1000"><small>页面停留不足此时间不记录/推送，过滤中转页</small></div>
+        <div class="mpush-field"><div class="mpush-field-label">推送延迟（秒）</div><input type="number" data-path="common.delayMs" min="0" max="600" step="1" value="3" data-scale="1000"><small>标题稳定等待时间</small></div>
       </div>
       <div class="mpush-row-2">
-        <div class="mpush-field"><div class="mpush-field-label">同URL冷却（秒）</div><input type="number" data-path="common.cooldownMs" min="0" max="86400000" data-scale="1000"><small>冷却内不重复记录/推送</small></div>
+        <div class="mpush-field"><div class="mpush-field-label">同URL冷却（秒）</div><input type="number" data-path="common.cooldownMs" min="0" max="86400" step="1" data-scale="1000"><small>冷却内不重复记录/推送</small></div>
         <div class="mpush-field"><div class="mpush-field-inline"><input type="checkbox" data-path="common.includeTitle"><span>推送包含标题</span></div></div>
       </div>
       <div class="mpush-field"><div class="mpush-field-inline"><input type="checkbox" data-path="common.includeUrl"><span>推送包含链接</span></div></div>`;
@@ -2107,7 +2380,7 @@ ${lines}`;
         <div class="mpush-field"><div class="mpush-field-label">应用密码</div><input type="password" data-path="cloudSync.appPassword" placeholder="坚果云应用密码"></div>
       </div>
       <div class="mpush-row-2">
-        <div class="mpush-field"><div class="mpush-field-label">自动同步间隔（小时）</div><input type="number" data-path="cloudSync.autoSyncHours" min="0" max="168" value="4"><small>0=关闭自动同步</small></div>
+        <div class="mpush-field"><div class="mpush-field-label">自动同步间隔（分钟）</div><input type="number" data-path="cloudSync.autoSyncMinutes" min="0" max="10080" step="1" value="240"><small>建议 15-30；0=关闭。自动只上传增量，手动对账才全量合并</small></div>
         <div class="mpush-field"></div>
       </div>
       <div class="mpush-cloud-status" id="set-cloud-status">尚未同步</div>
@@ -2200,7 +2473,12 @@ ${lines}`;
     const ed = pane.querySelector('#set-exclude-domains');
     if (ed && cfg.history) cfg.history.excludeDomains = ed.value.split('\n').map(s => s.trim()).filter(Boolean);
     const bu = pane.querySelector('#set-blacklisted-urls');
-    if (bu && cfg.history) cfg.history.blacklistedUrls = mergeBlacklistedUrls(bu.value.split('\n').map(s => s.trim()).filter(Boolean));
+    if (bu && cfg.history) {
+      const nextBlocked = mergeBlacklistedUrls(bu.value.split('\n').map(s => s.trim()).filter(Boolean));
+      const oldBlocked = getBlacklistedUrls();
+      cfg.history.blacklistedUrls = nextBlocked;
+      if (nextBlocked.join('\n') !== oldBlocked.join('\n')) cfg.history.blacklistUpdatedAt = Date.now();
+    }
   }
 
   function fillSettingsTab() {
@@ -2229,15 +2507,39 @@ ${lines}`;
     const bu = pane.querySelector('#set-blacklisted-urls');
     if (bu) bu.value = getBlacklistedUrls().join('\n');
     const cs = pane.querySelector('#set-cloud-status');
-    if (cs) { const t = cfg.cloudSync?.lastSyncAt; if (t) { const dirMap = { reconcile: '对账同步', incremental: '对账同步', pull: '拉取', push: '上传', 'force-push': '覆盖' }; cs.textContent = `上次：${formatDate(t)}（${dirMap[cfg.cloudSync.lastSyncDirection] || ''}）`; } else cs.textContent = '尚未同步'; }
+    if (cs) { const t = cfg.cloudSync?.lastSyncAt; if (t) { const dirMap = { reconcile: '对账同步', incremental: '对账同步', 'auto-delta': '自动增量上传', 'auto-delta-check': '自动检查', 'auto-baseline': '自动基线', pull: '拉取', push: '上传', 'force-push': '覆盖' }; cs.textContent = `上次：${formatDate(t)}（${dirMap[cfg.cloudSync.lastSyncDirection] || ''}）`; } else cs.textContent = '尚未同步'; }
   }
 
   /******************************************************************
    * 11. 初始化
    ******************************************************************/
+  function deleteHistoryRecords(records, toastText) {
+    const list = Array.isArray(records) ? records.filter(r => r && r.url && r.ts) : [];
+    if (!list.length) return 0;
+    const deletedKeys = new Set(list.map(r => historyRecordKey(r.url, r.ts)));
+    addDeletedHistoryRecords(list);
+    historyStore.records = historyStore.records.filter(r => !deletedKeys.has(historyRecordKey(r.url, r.ts)));
+    saveHistory(historyStore);
+    updateBadge();
+    refreshHistoryTab();
+    toast(toastText || `已删除 ${list.length} 条`);
+    return list.length;
+  }
+
   function deleteHistoryRecord(url, ts) {
-    historyStore.records = historyStore.records.filter(r => !(r.url === url && r.ts === ts));
-    saveHistory(historyStore); updateBadge(); refreshHistoryTab(); toast('已删除');
+    const record = historyStore.records.find(r => r.url === url && r.ts === ts);
+    deleteHistoryRecords(record ? [record] : [{ url, ts }], '已删除');
+  }
+  function deleteFilteredHistoryRecords() {
+    const filtered = getCurrentFilteredHistoryRecords();
+    if (!filtered.length) return;
+    if (!currentHistorySearch && currentHistoryFilter === 'all') {
+      alert('请先输入关键词或选择一个筛选条件，避免误删全部记录。');
+      return;
+    }
+    const desc = currentHistorySearch ? `关键词「${currentHistorySearch}」` : `当前筛选「${currentHistoryFilter}」`;
+    if (!confirm(`确定删除 ${desc} 下的 ${filtered.length} 条历史记录？\n\n删除会作为增量同步到云端。`)) return;
+    deleteHistoryRecords(filtered, `已删除 ${filtered.length} 条`);
   }
   function blacklistHistoryUrl(url) {
     const normalized = normalizeUrlForBlock(url);
@@ -2287,16 +2589,22 @@ ${lines}`;
     setInterval(async () => {
       try {
         cfg = loadConfig();
-        const hours = Number(cfg.cloudSync?.autoSyncHours || 0);
-        if (hours <= 0) return; // 关闭自动同步
+        const intervalMs = getAutoSyncIntervalMs();
+        if (intervalMs <= 0) return; // 关闭自动同步
         if (!cfg.cloudSync?.account || !cfg.cloudSync?.appPassword) return;
         const syncMeta = loadHistorySyncMeta();
-        const intervalMs = hours * 60 * 60 * 1000;
+        if (syncMeta.backoffUntil && Date.now() < syncMeta.backoffUntil) return;
         if (syncMeta.lastSyncAt && (Date.now() - syncMeta.lastSyncAt) < intervalMs) return;
-        await historySyncIncremental();
+        await historySyncAutoUploadDelta();
         if (historyTabEl) updateSyncStatus();
-      } catch (e) { /* 静默失败，不打扰用户 */ }
-    }, 10 * 60 * 1000); // 每10分钟检查一次是否到了同步时间
+      } catch (e) {
+        const msg = String(e?.message || e || '');
+        if (/(429|503|507|509|频率|流量|quota|limit)/i.test(msg)) {
+          const syncMeta = loadHistorySyncMeta();
+          saveHistorySyncMeta({ ...syncMeta, backoffUntil: Date.now() + 30 * 60 * 1000, lastError: msg.slice(0, 120) });
+        }
+      }
+    }, 60 * 1000); // 每分钟本地检查一次是否到了同步时间
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init); else init();
