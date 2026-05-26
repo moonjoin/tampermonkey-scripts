@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name        网页浏览记录助手
 // @namespace   https://github.com/moonjoin/tampermonkey-scripts
-// @version     1.6.1
+// @version     1.6.2
 // @description  浏览记录自动存储 + 多渠道网页推送 + AI 浏览行为分析（多时间段），支持坚果云增量云同步（和饺子AI网页摘要助手+Folo网站增强工具数据互通）
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
@@ -429,6 +429,19 @@
   function normalizeUrlForBlock(url) {
     try { const u = new URL(url); u.hash = ''; return u.href; } catch { return String(url || '').trim(); }
   }
+  function escapeRegExp(str) {
+    return String(str || '').replace(/[.+?^${}()|[\]\\]/g, '\\$&');
+  }
+  function isUrlMatchingBlacklistRule(url, rule) {
+    const target = normalizeUrlForBlock(url);
+    const pattern = String(rule || '').trim();
+    if (!target || !pattern) return false;
+    if (pattern.includes('*')) {
+      const re = new RegExp('^' + escapeRegExp(pattern).replace(/\*/g, '.*') + '$');
+      return re.test(target);
+    }
+    return target === normalizeUrlForBlock(pattern);
+  }
   function mergeBlacklistedUrls() {
     const out = [];
     Array.from(arguments).flat().forEach(url => {
@@ -444,12 +457,11 @@
     cfg.history.blacklistUpdatedAt = Date.now();
     saveConfig(cfg);
   }
-  function isUrlBlacklisted(url) { return getBlacklistedUrls().includes(normalizeUrlForBlock(url)); }
+  function isUrlBlacklisted(url) { return getBlacklistedUrls().some(rule => isUrlMatchingBlacklistRule(url, rule)); }
   function pruneBlacklistedRecords() {
-    const blocked = new Set(getBlacklistedUrls());
-    if (!blocked.size) return 0;
+    if (!getBlacklistedUrls().length) return 0;
     const before = historyStore.records.length;
-    historyStore.records = historyStore.records.filter(r => !blocked.has(normalizeUrlForBlock(r.url)));
+    historyStore.records = historyStore.records.filter(r => !isUrlBlacklisted(r.url));
     return before - historyStore.records.length;
   }
   function mergeDeletedHistoryRecords() {
@@ -647,6 +659,8 @@
   function cleanExpiredRecords() { const days = cfg.history?.autoCleanDays || 0; if (days <= 0) return; const cutoff = Date.now() - days * 24 * 60 * 60 * 1000; historyStore.records = historyStore.records.filter(r => r.ts >= cutoff); saveHistory(historyStore); }
   function getRecordsByTimeRange(start, end) { return historyStore.records.filter(r => r.ts >= start && r.ts < end); }
   function getTodayRecords() { const now = new Date(); const start = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime(); return getRecordsByTimeRange(start, start + 86400000); }
+  function getYesterdayRecords() { const now = new Date(); const start = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1).getTime(); return getRecordsByTimeRange(start, start + 86400000); }
+  function getRecentDaysRecords(days) { return getRecordsByTimeRange(Date.now() - days * 86400000, Date.now() + 1); }
   function getThisWeekRecords() { const now = new Date(); const day = now.getDay() || 7; const start = new Date(now.getFullYear(), now.getMonth(), now.getDate() - day + 1).getTime(); return getRecordsByTimeRange(start, start + 7 * 86400000); }
   function getThisMonthRecords() { const now = new Date(); const start = new Date(now.getFullYear(), now.getMonth(), 1).getTime(); return getRecordsByTimeRange(start, start + 32 * 86400000); }
   function prepareRecordsForAI(records) { return records.map(r => { const time = formatTime(r.ts); const visits = r.visits > 1 ? ` (×${r.visits})` : ''; const dwell = formatDuration(getRecordDwellSec(r)); const dwellText = dwell ? ` · 停留${dwell}` : ''; return `[${time}] ${r.domain} — ${r.title}${visits}${dwellText}`; }).join('\n'); }
@@ -953,12 +967,11 @@ ${lines}`;
     return out;
   }
   function mergeHistoryRecords(local, remote, deletedRecords) {
-    const blocked = new Set(getBlacklistedUrls());
     const deleted = new Set(mergeDeletedHistoryRecords(deletedRecords || getDeletedHistoryRecords()).map(d => historyRecordKey(d.url, d.ts)));
     const map = new Map();
     [...(remote || []), ...(local || [])].forEach(r => {
       if (!r || !r.url || !r.ts) return;
-      if (blocked.has(normalizeUrlForBlock(r.url))) return;
+      if (isUrlBlacklisted(r.url)) return;
       const key = historyRecordKey(r.url, r.ts);
       if (deleted.has(key)) return;
       map.set(key, map.has(key) ? mergeHistoryRecordFields(map.get(key), r) : r);
@@ -1491,6 +1504,23 @@ ${lines}`;
     .mpush-history-item:hover .mpush-history-del,.mpush-history-item:hover .mpush-history-block { opacity:1; }
     .mpush-history-del:hover { color:#ef4444; }
     .mpush-history-block:hover { color:#f59e0b; }
+    .mpush-rule-overlay { position:fixed; inset:0; z-index:2147483647; display:flex; align-items:center; justify-content:center; padding:20px; background:rgba(17,24,39,.35); font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif; }
+    .mpush-rule-dialog { width:560px; max-width:calc(100vw - 32px); max-height:calc(100vh - 32px); overflow:auto; background:#fbfbfd; color:#26262b; border-radius:14px; box-shadow:0 24px 70px rgba(15,23,42,.28); border:1px solid rgba(124,58,237,.16); padding:18px; box-sizing:border-box; }
+    .mpush-rule-head { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:14px; }
+    .mpush-rule-title { color:#5a43c8; font-size:18px; font-weight:800; line-height:1.25; }
+    .mpush-rule-close { width:32px; height:32px; border:none; border-radius:8px; background:#ececf1; color:#333; cursor:pointer; font-size:18px; line-height:1; }
+    .mpush-rule-close:hover { background:#e2e2e8; }
+    .mpush-rule-url { width:100%; box-sizing:border-box; border:1px solid #dedee7; border-radius:10px; background:#f4f4f7; color:#444; padding:11px 12px; font-size:13px; outline:none; margin-bottom:14px; }
+    .mpush-rule-url:focus { border-color:#8b5cf6; background:#fff; }
+    .mpush-rule-options { display:flex; flex-direction:column; gap:10px; }
+    .mpush-rule-option { width:100%; border:1px solid #e2e2ea; border-radius:12px; background:#fff; color:#222; padding:14px 16px; cursor:pointer; text-align:left; display:grid; grid-template-columns:1fr auto; gap:8px 12px; align-items:start; transition:background .15s,border-color .15s,box-shadow .15s; }
+    .mpush-rule-option:hover { background:#faf7ff; border-color:#c4b5fd; box-shadow:0 8px 24px rgba(124,58,237,.08); }
+    .mpush-rule-option-title { font-size:15px; font-weight:800; line-height:1.3; }
+    .mpush-rule-option-note { color:#777; font-size:12px; white-space:nowrap; }
+    .mpush-rule-pattern { grid-column:1 / -1; font-family:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace; font-size:12px; color:#be185d; background:#fdf2f8; border-radius:6px; padding:3px 6px; word-break:break-all; }
+    .mpush-rule-impact { grid-column:1 / -1; color:#888; font-size:12px; }
+    .mpush-rule-tip { margin-top:14px; padding-top:12px; border-top:1px dashed #dedee7; color:#888; font-size:12px; line-height:1.6; }
+    .mpush-rule-tip code { background:#fdf2f8; color:#be185d; border-radius:5px; padding:1px 5px; }
     /* ── 分析对话 ── */
     .mpush-msg { margin:12px 0; }
     .mpush-msg-role { font-size:12px; font-weight:600; color:#6b7280; margin-bottom:4px; }
@@ -1830,12 +1860,13 @@ ${lines}`;
         <div class="mpush-history-filters" id="history-filters">
           <button data-filter="all" class="active">🔍 全部</button>
           <button data-filter="today">📅 今天</button>
+          <button data-filter="yesterday">📆 昨天</button>
           <button data-filter="week">📈 本周</button>
           <button data-filter="month">📆 本月</button>
           <button data-filter="unread">🆕 未读</button>
         </div>
         <input class="mpush-search" id="history-search" placeholder="搜索标题、域名或链接…">
-        <div class="mpush-btns" style="margin-top:8px;">
+        <div class="mpush-btns" id="history-bulk-actions" style="margin-top:8px;display:none;">
           <button class="mpush-btn danger" id="history-delete-filtered" disabled>🗑️ 删除当前筛选结果</button>
         </div>
       </div>
@@ -1881,6 +1912,7 @@ ${lines}`;
   function getCurrentFilteredHistoryRecords() {
     let filtered = historyStore.records;
     if (currentHistoryFilter === 'today') filtered = getTodayRecords();
+    else if (currentHistoryFilter === 'yesterday') filtered = getYesterdayRecords();
     else if (currentHistoryFilter === 'week') filtered = getThisWeekRecords();
     else if (currentHistoryFilter === 'month') filtered = getThisMonthRecords();
     else if (currentHistoryFilter === 'unread') filtered = historyStore.records.filter(r => isUnread(r));
@@ -1902,8 +1934,10 @@ ${lines}`;
     const total = historyStore.records.length, unread = getUnreadCount(), todayRecords = getTodayRecords(), todayCount = todayRecords.length;
     const filtered = getCurrentFilteredHistoryRecords();
     const bulkBtn = historyTabEl.querySelector('#history-delete-filtered');
+    const bulkActions = historyTabEl.querySelector('#history-bulk-actions');
+    if (bulkActions) bulkActions.style.display = currentHistorySearch ? 'flex' : 'none';
     if (bulkBtn) {
-      bulkBtn.disabled = !filtered.length || (!currentHistorySearch && currentHistoryFilter === 'all');
+      bulkBtn.disabled = !currentHistorySearch || !filtered.length;
       bulkBtn.textContent = `🗑️ 删除当前筛选结果${filtered.length ? `（${filtered.length}）` : ''}`;
     }
     const totalDwell = historyStore.records.reduce((sum, r) => sum + getRecordDwellSec(r), 0);
@@ -1960,6 +1994,10 @@ ${lines}`;
     switch (range) {
       case 'unread': return { records: historyStore.records.filter(r => isUnread(r)), desc: `未读记录（${formatDate(Date.now())}）` };
       case 'today': return { records: getTodayRecords(), desc: `今天（${formatDate(Date.now())}）` };
+      case 'yesterday': return { records: getYesterdayRecords(), desc: `昨天` };
+      case 'recent3': return { records: getRecentDaysRecords(3), desc: `最近3天` };
+      case 'recent7': return { records: getRecentDaysRecords(7), desc: `最近7天` };
+      case 'recent30': return { records: getRecentDaysRecords(30), desc: `最近1个月` };
       case 'week': return { records: getThisWeekRecords(), desc: `本周` };
       case 'month': return { records: getThisMonthRecords(), desc: `本月` };
       case 'all': return { records: historyStore.records, desc: `全部记录` };
@@ -1985,6 +2023,10 @@ ${lines}`;
         <select id="analysis-range-select" style="padding:6px 8px;border-radius:6px;border:1px solid #e5e5ea;font-size:11px;background:#f5f5f7;cursor:pointer;max-width:100px;">
           <option value="unread">🆕 未读</option>
           <option value="today">📅 今天</option>
+          <option value="yesterday">📆 昨天</option>
+          <option value="recent3">🕒 最近3天</option>
+          <option value="recent7">📈 最近7天</option>
+          <option value="recent30">🗓️ 最近1个月</option>
           <option value="week">📈 本周</option>
           <option value="month">📆 本月</option>
           <option value="all">📋 全部</option>
@@ -2366,7 +2408,7 @@ ${lines}`;
         <div class="mpush-field"><div class="mpush-field-label">自动清理（天）</div><input type="number" data-path="history.autoCleanDays" min="0" max="3650" value="180"><small>0=不清理</small></div>
       </div>
       <div class="mpush-field"><div class="mpush-field-label">排除域名（每行一个）</div><textarea id="set-exclude-domains" rows="3"></textarea></div>
-      <div class="mpush-field"><div class="mpush-field-label">拉黑网址（每行一个，精确匹配）</div><textarea id="set-blacklisted-urls" rows="3"></textarea><small>列表里的完整网址不会再写入浏览记录；历史列表点 🚫 会自动加入这里。</small></div>
+      <div class="mpush-field"><div class="mpush-field-label">拉黑网址规则（每行一个）</div><textarea id="set-blacklisted-urls" rows="3"></textarea><small>支持完整网址和通配符 *；历史列表点 🚫 可快速生成规则。</small></div>
       <div class="mpush-btns">
         <button class="mpush-btn danger" id="set-history-clear">🗑️ 清理全部</button>
         <button class="mpush-btn" id="set-history-export">📦 导出</button>
@@ -2533,26 +2575,91 @@ ${lines}`;
   function deleteFilteredHistoryRecords() {
     const filtered = getCurrentFilteredHistoryRecords();
     if (!filtered.length) return;
-    if (!currentHistorySearch && currentHistoryFilter === 'all') {
-      alert('请先输入关键词或选择一个筛选条件，避免误删全部记录。');
+    if (!currentHistorySearch) {
+      alert('请先输入关键词，避免误删。');
       return;
     }
-    const desc = currentHistorySearch ? `关键词「${currentHistorySearch}」` : `当前筛选「${currentHistoryFilter}」`;
+    const desc = `关键词「${currentHistorySearch}」`;
     if (!confirm(`确定删除 ${desc} 下的 ${filtered.length} 条历史记录？\n\n删除会作为增量同步到云端。`)) return;
     deleteHistoryRecords(filtered, `已删除 ${filtered.length} 条`);
+  }
+  function getBlacklistRuleOptions(url) {
+    const normalized = normalizeUrlForBlock(url);
+    if (!normalized) return [];
+    try {
+      const u = new URL(normalized);
+      const path = u.pathname || '/';
+      const dirPath = path.endsWith('/') ? path : (path.slice(0, path.lastIndexOf('/') + 1) || '/');
+      return [
+        { key: 'exact', title: '只这个页面', note: '当前精确路径', rule: normalized },
+        { key: 'dir', title: '当前目录下全部', note: '推荐', rule: u.origin + dirPath + '*' },
+        { key: 'site', title: '整站全部页面', note: '范围最大', rule: u.origin + '/*' }
+      ];
+    } catch (e) {
+      return [{ key: 'exact', title: '只这个页面', note: '当前精确路径', rule: normalized }];
+    }
+  }
+  function countHistoryMatchesRule(rule) {
+    return historyStore.records.filter(r => isUrlMatchingBlacklistRule(r.url, rule)).length;
+  }
+  function closeBlacklistRuleDialog() {
+    document.getElementById('mpush-rule-overlay')?.remove();
+  }
+  function renderBlacklistRuleOptions(box, input, sourceUrl) {
+    const options = getBlacklistRuleOptions(input.value);
+    box.innerHTML = options.map(opt => {
+      const count = countHistoryMatchesRule(opt.rule);
+      return `<button class="mpush-rule-option" type="button" data-rule="${escapeAttr(opt.rule)}" data-source-url="${escapeAttr(sourceUrl)}">
+        <span class="mpush-rule-option-title">${escapeAttr(opt.title)}</span>
+        <span class="mpush-rule-option-note">${escapeAttr(opt.note)}${opt.key === 'dir' ? ' ★' : ''}</span>
+        <span class="mpush-rule-pattern">${escapeAttr(opt.rule)}</span>
+        <span class="mpush-rule-impact">当前会移除 ${count} 条历史记录</span>
+      </button>`;
+    }).join('');
+    box.querySelectorAll('.mpush-rule-option').forEach(btn => {
+      btn.addEventListener('click', () => applyBlacklistRule(btn.dataset.rule, btn.dataset.sourceUrl));
+    });
   }
   function blacklistHistoryUrl(url) {
     const normalized = normalizeUrlForBlock(url);
     if (!normalized) return;
-    const title = getDisplayPath(normalized);
-    if (!confirm(`拉黑这个网址？\n\n${title}\n\n之后不会再记录，并会移除已有同网址记录。`)) return;
-    setBlacklistedUrls(mergeBlacklistedUrls(getBlacklistedUrls(), [normalized]));
-    removePendingRecord(url);
-    const removed = pruneBlacklistedRecords();
-    saveHistory(historyStore);
-    updateBadge();
-    refreshHistoryTab();
-    toast(`已拉黑${removed ? `，移除 ${removed} 条` : ''}`);
+    closeBlacklistRuleDialog();
+    const overlay = el('div', { id: 'mpush-rule-overlay', class: 'mpush-rule-overlay' });
+    overlay.innerHTML = `<div class="mpush-rule-dialog" role="dialog" aria-modal="true" aria-label="把当前网址加入规则">
+      <div class="mpush-rule-head">
+        <div class="mpush-rule-title">📌 把当前网址加入规则</div>
+        <button class="mpush-rule-close" type="button" title="关闭">×</button>
+      </div>
+      <input class="mpush-rule-url" id="mpush-rule-url" type="text" value="${escapeAttr(normalized)}">
+      <div class="mpush-rule-options" id="mpush-rule-options"></div>
+      <div class="mpush-rule-tip">提示：支持通配符 <code>*</code>。规则会加入设置里的拉黑网址列表，匹配到的历史会被删除并作为增量同步。</div>
+    </div>`;
+    document.body.appendChild(overlay);
+    const input = overlay.querySelector('#mpush-rule-url');
+    const optionsBox = overlay.querySelector('#mpush-rule-options');
+    const close = () => closeBlacklistRuleDialog();
+    overlay.querySelector('.mpush-rule-close').addEventListener('click', close);
+    overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
+    input.addEventListener('input', () => renderBlacklistRuleOptions(optionsBox, input, normalized));
+    renderBlacklistRuleOptions(optionsBox, input, normalized);
+    input.focus();
+    input.select();
+  }
+  function applyBlacklistRule(rule, sourceUrl) {
+    const normalizedRule = normalizeUrlForBlock(rule);
+    if (!normalizedRule) return;
+    const affected = historyStore.records.filter(r => isUrlMatchingBlacklistRule(r.url, normalizedRule));
+    setBlacklistedUrls(mergeBlacklistedUrls(getBlacklistedUrls(), [normalizedRule]));
+    removePendingRecord(sourceUrl);
+    closeBlacklistRuleDialog();
+    if (affected.length) {
+      deleteHistoryRecords(affected, `已加入规则，移除 ${affected.length} 条`);
+    } else {
+      saveHistory(historyStore);
+      updateBadge();
+      refreshHistoryTab();
+      toast('已加入规则');
+    }
   }
   function exportAnalysisAsMarkdown() {
     const lines = conversation.filter(m => m.role !== 'system' && !m.meta?.hidden).map(m => {
