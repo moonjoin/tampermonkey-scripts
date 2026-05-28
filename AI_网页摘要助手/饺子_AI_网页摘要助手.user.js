@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         饺子 AI 网页摘要助手
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      2.8.4
+// @version      2.8.5
 // @description  指定网站自动弹出 AI 网页摘要，支持连续对话、多预设、多模板、SPA路由、摘要生图、flomo、坚果云双文件云同步。Shadow DOM 隔离样式。
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
@@ -1259,7 +1259,10 @@
       }
     });
     bindMessageImageActions();
-    body.scrollTop = body.scrollHeight;
+    // 流式输出时不自动滚动，让用户自己控制
+    if (!conversation.some(m => m.meta?.streaming)) {
+      body.scrollTop = body.scrollHeight;
+    }
   }
 
   function appendMessage(role, content, meta) {
