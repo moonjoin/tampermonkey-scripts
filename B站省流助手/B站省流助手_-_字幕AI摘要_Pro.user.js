@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站省流助手 - 字幕AI摘要 Pro
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      4.2.0
+// @version      4.2.1
 // @description  自动提取B站视频字幕，通过自定义AI API生成极简摘要，支持模型切换、持续对话和评论区总结；支持自动解析开关、自动获取模型列表、flomo自动加标签，新增总结生图功能；v3.9.0 新增html PPT模式；v4.0.0 新增新手引导和API兜底功能（无API时仍可下载字幕、一键复制提示词+字幕到其他AI）
 // @author       次元饺子
 // @match        https://www.bilibili.com/video/*
@@ -889,6 +889,7 @@
     fullAnalysisPresets: DEFAULT_FULL_ANALYSIS_PRESETS,
     activeFullAnalysisPresetId: 'fullpreset_video_review',
     fullDataMaxChars: 64000,
+    summaryMaxTokens: 4000,
     skipDuration: 60,
     autoParse: true,
     promptPresets: DEFAULT_PRESETS,
@@ -915,6 +916,9 @@
     commentMaxDelay: 3800,
     autoSubmitCommentSummary: false
   };
+
+  const SUMMARY_LENGTH_ERROR_MESSAGE = 'AI 输出被截断：finish_reason=length。请在设置中调大「普通摘要最大输出 tokens」，或换支持更大输出上限的模型/API。';
+  const HTML_PPT_LENGTH_ERROR_MESSAGE = 'AI 输出被截断：finish_reason=length。请调大 HTML PPT 最大输出 tokens，或换支持更大输出上限的模型/API。';
 
   function loadConfig() {
     try {
@@ -1248,6 +1252,20 @@
   // 🆕 当前正在进行的 AI 任务的 AbortController（用于打断流式输出）
   let currentAbortController = null;
   let currentSubtitleManualFallback = null;
+
+  function getSummaryMaxTokens() {
+    const n = parseInt(CONFIG.summaryMaxTokens, 10);
+    return isNaN(n) ? DEFAULT_CONFIG.summaryMaxTokens : Math.max(500, Math.min(30000, n));
+  }
+
+  function buildSummaryStreamOptions(signal, extraOptions) {
+    const opts = Object.assign({
+      maxTokens: getSummaryMaxTokens(),
+      errorMessageOverride: SUMMARY_LENGTH_ERROR_MESSAGE
+    }, extraOptions || {});
+    if (signal) opts.signal = signal;
+    return opts;
+  }
 
   // ==================== 视频信息获取 ====================
   function cleanVideoDescription(text) {
@@ -4873,7 +4891,8 @@
         model: currentModel,
         temperature: 0.35,
         maxTokens: CONFIG.htmlPptMaxTokens || 8000,
-        signal: options.signal
+        signal: options.signal,
+        errorMessageOverride: HTML_PPT_LENGTH_ERROR_MESSAGE
       });
       let html = extractHtmlDocument(reply);
       const check = validateHtmlPpt(html, CONFIG.htmlPptLayoutMode || 'single');
@@ -5409,7 +5428,7 @@
    * 🆕 流式 AI 调用（真正支持 AbortSignal 打断）
    * @param {Array} messages - 消息列表
    * @param {Function} onDelta - 每收到一段时回调，参数 (fullText, deltaText)
-   * @param {Object} options - { apiUrl, apiKey, model, signal, temperature, maxTokens } 自定义参数（可选）
+   * @param {Object} options - { apiUrl, apiKey, model, signal, temperature, maxTokens, errorMessageOverride } 自定义参数（可选）
    * @returns {Promise<string>} 完整文本
    */
   async function callAIStream(messages, onDelta, options) {
@@ -5420,6 +5439,7 @@
     const signal = options.signal; // 🆕 AbortSignal
     const temperature = options.temperature !== undefined ? options.temperature : 0.7;
     const maxTokens = options.maxTokens || 2000;
+    const lengthErrorMessage = options.errorMessageOverride || HTML_PPT_LENGTH_ERROR_MESSAGE;
 
     if (!apiUrl || !apiKey || !model) {
       throw new Error('请点击右上角 ⚙️ 设置按钮，填写 apiUrl、apiKey 和 model');
@@ -5463,7 +5483,7 @@
       const data = await res.json();
       const fullText = data.choices?.[0]?.message?.content || '';
       if (data.choices?.[0]?.finish_reason === 'length') {
-        const lengthErr = new Error('AI 输出被截断：finish_reason=length。请调大 HTML PPT 最大输出 tokens，或换支持更大输出上限的模型/API。');
+        const lengthErr = new Error(lengthErrorMessage);
         lengthErr.name = 'LengthFinishError';
         throw lengthErr;
       }
@@ -5567,7 +5587,7 @@
       throw new Error('AI 未返回任何内容');
     }
     if (finishReason === 'length') {
-      const lengthErr = new Error('AI 输出被截断：finish_reason=length。请调大 HTML PPT 最大输出 tokens，或换支持更大输出上限的模型/API。');
+      const lengthErr = new Error(lengthErrorMessage);
       lengthErr.name = 'LengthFinishError';
       throw lengthErr;
     }
@@ -5616,7 +5636,7 @@
     const textContent = await callAIStream(
       [{ role: 'user', content: prompt }],
       onDelta,
-      { apiUrl: summaryApiUrl, apiKey: summaryApiKey, model: summaryModel }
+      buildSummaryStreamOptions(null, { apiUrl: summaryApiUrl, apiKey: summaryApiKey, model: summaryModel })
     );
     console.log('[省流助手-生图] 文字总结完成，长度:', textContent.length);
     if (!textContent.trim()) {
@@ -6289,7 +6309,7 @@
         const textContent = await callAIStream(
           [{ role: 'user', content: fullPrompt }],
           onDelta,
-          { apiUrl: summaryApiUrl, apiKey: summaryApiKey, model: summaryModel, signal: localController.signal }
+          buildSummaryStreamOptions(localController.signal, { apiUrl: summaryApiUrl, apiKey: summaryApiKey, model: summaryModel })
         );
 
         // 🆕 文字总结结束后，先清理"文字总结阶段"的打断按钮
@@ -6326,7 +6346,7 @@
           resultContainer.appendChild(cursor);
         });
 
-        const reply = await callAIStream(messages, onDelta, { signal: localController.signal });
+        const reply = await callAIStream(messages, onDelta, buildSummaryStreamOptions(localController.signal));
 
         conversationHistory = [
           { role: 'user', content: fullPrompt },
@@ -6460,7 +6480,7 @@
         resultEl.appendChild(cursor);
       });
 
-      const reply = await callAIStream(messages, onDelta, { signal: localController.signal });
+      const reply = await callAIStream(messages, onDelta, buildSummaryStreamOptions(localController.signal));
 
       commentConversationHistory = [
         { role: 'user', content: fullPrompt },
@@ -6603,7 +6623,7 @@
         resultEl.appendChild(cursor);
       });
 
-      const reply = await callAIStream(messages, onDelta, { signal: localController.signal });
+      const reply = await callAIStream(messages, onDelta, buildSummaryStreamOptions(localController.signal));
 
       resultEl.innerHTML = parseMarkdown(reply);
 
@@ -6777,7 +6797,7 @@
         resultEl.appendChild(cursor);
       });
 
-      const reply = await callAIStream(messages, onDelta, { signal: localController.signal });
+      const reply = await callAIStream(messages, onDelta, buildSummaryStreamOptions(localController.signal));
 
       resultEl.innerHTML = parseMarkdown(reply);
 
@@ -6922,7 +6942,7 @@
         aiMsg.appendChild(cursor);
       });
 
-      const reply = await callAIStream(sentMessages, onDelta, { signal: localController.signal });
+      const reply = await callAIStream(sentMessages, onDelta, buildSummaryStreamOptions(localController.signal));
       conversationHistory.push({ role: 'assistant', content: reply });
 
       aiMsg.innerHTML = parseMarkdown(reply);
@@ -7001,6 +7021,11 @@
                 <div class="tabbit-settings-label">默认模型</div>
                 <input class="tabbit-settings-input" id="ts-model" type="text" value="${escapeHtml(CONFIG.model || '')}" placeholder="gpt-4o" />
                 <div class="tabbit-settings-hint">启动时默认选中的模型名称</div>
+              </div>
+              <div class="tabbit-settings-group">
+                <div class="tabbit-settings-label">普通摘要最大输出 tokens</div>
+                <input class="tabbit-settings-input" id="ts-summaryMaxTokens" type="number" min="500" max="30000" step="500" value="${CONFIG.summaryMaxTokens || DEFAULT_CONFIG.summaryMaxTokens}" placeholder="4000" />
+                <div class="tabbit-settings-hint">影响视频摘要、评论总结、弹幕分析、全面分析和对话。详细笔记版容易超，可调到 6000-10000，前提是你的 API/模型支持。</div>
               </div>
               <div class="tabbit-settings-group">
                 <div class="tabbit-settings-label">候选模型列表</div>
@@ -7244,7 +7269,7 @@
               <div class="tabbit-settings-group">
                 <div class="tabbit-settings-label">HTML PPT 最大输出 tokens</div>
                 <input class="tabbit-settings-input" id="ts-htmlPptMaxTokens" type="number" min="2000" max="30000" step="500" value="${CONFIG.htmlPptMaxTokens || 8000}" placeholder="8000" />
-                <div class="tabbit-settings-hint">普通摘要仍用默认 2000；这里只控制 HTML PPT。8000 通常够单页，复杂翻页可调到 12000-16000，前提是你的 API/模型支持。</div>
+                <div class="tabbit-settings-hint">仅影响 HTML PPT 生成。8000 通常够单页，复杂翻页可调到 12000-16000，前提是你的 API/模型支持。</div>
               </div>
               <div class="tabbit-settings-group">
                 <div class="tabbit-settings-label">HTML PPT 生成提示词</div>
@@ -7608,6 +7633,7 @@
       const newApiUrl = overlay.querySelector('#ts-apiUrl').value.trim();
       const newApiKey = overlay.querySelector('#ts-apiKey').value.trim();
       const newModel = overlay.querySelector('#ts-model').value.trim();
+      const newSummaryMaxTokens = parseInt(overlay.querySelector('#ts-summaryMaxTokens').value, 10);
       const newModelListRaw = overlay.querySelector('#ts-modelList').value;
       const newModelList = newModelListRaw.split('\n').map(function(s) { return s.trim(); }).filter(function(s) { return s.length > 0; });
 
@@ -7645,6 +7671,7 @@
       CONFIG.apiUrl = newApiUrl;
       CONFIG.apiKey = newApiKey;
       CONFIG.model = newModel || CONFIG.model;
+      CONFIG.summaryMaxTokens = isNaN(newSummaryMaxTokens) ? DEFAULT_CONFIG.summaryMaxTokens : Math.max(500, Math.min(30000, newSummaryMaxTokens));
       CONFIG.flomoApiUrl = newFlomoApiUrl;
       CONFIG.flomoTags = newFlomoTags;
       CONFIG.modelList = newModelList.length > 0 ? newModelList : DEFAULT_CONFIG.modelList;
@@ -7768,6 +7795,10 @@
             if (imported.apiUrl) overlay.querySelector('#ts-apiUrl').value = imported.apiUrl;
             if (imported.apiKey) overlay.querySelector('#ts-apiKey').value = imported.apiKey;
             if (imported.model) overlay.querySelector('#ts-model').value = imported.model;
+            if (imported.summaryMaxTokens !== undefined) {
+              var summaryMaxTokensEl = overlay.querySelector('#ts-summaryMaxTokens');
+              if (summaryMaxTokensEl) summaryMaxTokensEl.value = imported.summaryMaxTokens;
+            }
             if (Array.isArray(imported.modelList)) {
               overlay.querySelector('#ts-modelList').value = imported.modelList.join('\n');
             }
@@ -7864,6 +7895,7 @@
       overlay.querySelector('#ts-apiUrl').value = DEFAULT_CONFIG.apiUrl;
       overlay.querySelector('#ts-apiKey').value = DEFAULT_CONFIG.apiKey;
       overlay.querySelector('#ts-model').value = DEFAULT_CONFIG.model;
+      var summaryMaxTokensReset = overlay.querySelector('#ts-summaryMaxTokens'); if (summaryMaxTokensReset) summaryMaxTokensReset.value = DEFAULT_CONFIG.summaryMaxTokens;
       overlay.querySelector('#ts-modelList').value = DEFAULT_CONFIG.modelList.join('\n');
       overlay.querySelector('#ts-flomoApiUrl').value = '';
       overlay.querySelector('#ts-flomoTags').value = DEFAULT_CONFIG.flomoTags;
