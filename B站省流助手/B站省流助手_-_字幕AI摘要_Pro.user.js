@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站省流助手 - 字幕AI摘要 Pro
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      4.2.1
+// @version      4.2.2
 // @description  自动提取B站视频字幕，通过自定义AI API生成极简摘要，支持模型切换、持续对话和评论区总结；支持自动解析开关、自动获取模型列表、flomo自动加标签，新增总结生图功能；v3.9.0 新增html PPT模式；v4.0.0 新增新手引导和API兜底功能（无API时仍可下载字幕、一键复制提示词+字幕到其他AI）
 // @author       次元饺子
 // @match        https://www.bilibili.com/video/*
@@ -2580,14 +2580,7 @@
       }
     }
 
-    // --- 超限时截断：从末尾（评论区）开始砍，保留视频信息和字幕核心 ---
-    var result = lines.join('\n');
-    var maxChars = (typeof CONFIG !== 'undefined' && CONFIG.fullDataMaxChars) || FULL_DATA_MAX_CHARS_DEFAULT;
-    if (result.length > maxChars) {
-      // 砍掉超限部分，保留前 FULL_DATA_MAX_CHARS 字符
-      result = result.substring(0, maxChars) + '\n\n...（数据量超限，后续内容已截断）';
-    }
-    return result;
+    return lines.join("\n");
   }
 
   // ==================== Markdown 处理 ====================
@@ -6163,12 +6156,19 @@
     const activePreset = (CONFIG.promptPresets || []).find(p => p.id === activePresetId);
     const activePrompt = (activePreset && activePreset.prompt) || CONFIG.promptText || PROMPT_TEXT;
     const videoDesc = limitText(videoInfo.desc || '', 1500);
+    const _subMaxChars = (typeof CONFIG !== 'undefined' && CONFIG.fullDataMaxChars) || 64000;
+    let _subTruncated = false;
+    let _subTranscript = transcript;
+    if (transcript.length > _subMaxChars) {
+      _subTranscript = transcript.substring(0, _subMaxChars);
+      _subTruncated = true;
+    }
     const fullPrompt = activePrompt
       + '\n\n视频URL: ' + pageUrl
       + '\n视频标题: ' + (videoInfo.title || '')
       + '\nUP主: ' + (videoInfo.upName || '')
       + (videoDesc ? '\n视频简介: ' + videoDesc : '')
-      + '\n\n字幕内容:\n' + transcript;
+      + '\n\n字幕内容:\n' + _subTranscript;
 
     const presetBarHtml = renderPresetBarHtml();
     const useImageGen = isImageGenEnabled();
@@ -6176,6 +6176,15 @@
     const cacheKey = buildSummaryCacheKey(videoInfo, currentModel, activePresetId, activePrompt, transcript);
 
     renderSummaryShell(panel, contentDiv, presetBarHtml, videoInfo, pageUrl);
+    if (_subTruncated) {
+      const resultContainer = contentDiv.querySelector('.tabbit-result');
+      if (resultContainer) {
+        const warnDiv = document.createElement('div');
+        warnDiv.style.cssText = 'background:#fff3cd;color:#856404;padding:6px 10px;border-radius:6px;font-size:12px;margin-bottom:8px;';
+        warnDiv.textContent = '⚠️ 字幕数据量（' + transcript.length.toLocaleString() + '字符）超过上限（' + _subMaxChars.toLocaleString() + '字符），AI 仅分析了前 ' + _subMaxChars.toLocaleString() + ' 字符。点击「💾 下载字幕」可获取完整字幕。';
+        resultContainer.parentNode.insertBefore(warnDiv, resultContainer);
+      }
+    }
     contentDiv._tabbitSummaryCacheKey = cacheKey;
     contentDiv._tabbitSummaryPresetId = activePresetId;
     contentDiv._tabbitSummaryTitle = videoInfo.title;
@@ -6451,13 +6460,24 @@
         abortBtn = null;
       }
 
-      const commentsText = formatCommentsText(comments);
-      rawCommentsChatContext = '\n\n[评论区原文数据（' + comments.length + '条，格式：[序号] 用户名 (👍点赞): 内容）]\n' + commentsText;
+            const commentsText = formatCommentsText(comments);
+      const _cmtMaxChars = (typeof CONFIG !== 'undefined' && CONFIG.fullDataMaxChars) || 64000;
+      let _cmtTruncated = false;
+      let _cmtText = commentsText;
+      if (commentsText.length > _cmtMaxChars) {
+        _cmtText = commentsText.substring(0, _cmtMaxChars);
+        _cmtTruncated = true;
+      }
+      rawCommentsChatContext = '\n\n[评论区原文数据（' + comments.length + '条，格式：[序号] 用户名 (👍点赞): 内容）]\n' + _cmtText;
       const activeCommentPrompt = CONFIG.commentPromptText || COMMENT_PROMPT_TEXT;
-      const fullPrompt = activeCommentPrompt + '\n\n评论内容如下：\n' + commentsText;
+      const fullPrompt = activeCommentPrompt + '\n\n评论内容如下：\n' + _cmtText;
 
+      const _cmtWarnHtml = _cmtTruncated
+        ? '<div style="background:#fff3cd;color:#856404;padding:6px 10px;border-radius:6px;font-size:12px;margin-bottom:8px;">⚠️ 评论数据量（' + commentsText.length.toLocaleString() + '字符）超过上限（' + _cmtMaxChars.toLocaleString() + '字符），AI 仅分析了前 ' + _cmtMaxChars.toLocaleString() + ' 字符。</div>'
+        : '';
       commentSection.innerHTML = `
-        <div class="tabbit-comment-section-title">💬 评论区总结 <span style="font-size:11px;color:#999;font-weight:400;">（${comments.length}条评论）</span></div>
+        <div class="tabbit-comment-section-title">💬 评论区总结 <span style="font-size:11px;color:#999;font-weight:400;">${comments.length}条评论</span></div>
+        ${_cmtWarnHtml}
         <div class="tabbit-comment-result"><span class="tabbit-typing-cursor"></span></div>
       `;
       const resultEl = commentSection.querySelector('.tabbit-comment-result');
@@ -6490,10 +6510,11 @@
       resultEl.innerHTML = parseMarkdown(reply);
 
       const actionsDiv = document.createElement('div');
-      actionsDiv.className = 'tabbit-comment-actions';
+            actionsDiv.className = 'tabbit-comment-actions';
       actionsDiv.innerHTML = `
         <button class="tabbit-copy-btn" id="tabbit-copy-comment">📋 复制评论总结</button>
         <button class="tabbit-copy-btn" id="tabbit-flomo-comment">发送 FLOMO</button>
+        <button class="tabbit-copy-btn" id="tabbit-export-comment">📄 导出原文</button>
         <span style="font-size:11px;color:#999;margin-left:auto;">🤖 ${currentModel}</span>
       `;
       commentSection.appendChild(actionsDiv);
@@ -6505,6 +6526,15 @@
       const flomoCommentBtn = commentSection.querySelector('#tabbit-flomo-comment');
       if (flomoCommentBtn) {
         flomoCommentBtn.addEventListener('click', function() { sendToFlomo(reply, this); });
+      }
+      const exportCommentBtn = commentSection.querySelector('#tabbit-export-comment');
+      if (exportCommentBtn) {
+        exportCommentBtn.addEventListener('click', function() {
+          var title = (videoInfo && videoInfo.title) || '评论总结';
+          var safeTitle = sanitizeFilename(title) || '评论总结';
+          var ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+          triggerDownload(commentsText, safeTitle + '__评论原文__' + ts + '.txt', 'text/plain;charset=utf-8');
+        });
       }
 
     } catch (err) {
@@ -6595,13 +6625,24 @@
         abortBtn = null;
       }
 
-      const danmakuText = formatDanmakuText(danmaku);
-      rawDanmakuChatContext = '\n\n[弹幕原文数据（' + danmaku.length + '条，格式：[时间] 内容）]\n' + danmakuText;
+            const danmakuText = formatDanmakuText(danmaku);
+      const _dmMaxChars = (typeof CONFIG !== 'undefined' && CONFIG.fullDataMaxChars) || 64000;
+      let _dmTruncated = false;
+      let _dmText = danmakuText;
+      if (danmakuText.length > _dmMaxChars) {
+        _dmText = danmakuText.substring(0, _dmMaxChars);
+        _dmTruncated = true;
+      }
+      rawDanmakuChatContext = '\n\n[弹幕原文数据（' + danmaku.length + '条，格式：[时间] 内容）]\n' + _dmText;
       const activeDanmakuPrompt = CONFIG.danmakuPromptText || DANMAKU_PROMPT_TEXT;
-      const fullPrompt = activeDanmakuPrompt + '\n\n弹幕内容如下：\n' + danmakuText;
+      const fullPrompt = activeDanmakuPrompt + '\n\n弹幕内容如下：\n' + _dmText;
 
+      const _dmWarnHtml = _dmTruncated
+        ? '<div style="background:#fff3cd;color:#856404;padding:6px 10px;border-radius:6px;font-size:12px;margin-bottom:8px;">⚠️ 弹幕数据量（' + danmakuText.length.toLocaleString() + '字符）超过上限（' + _dmMaxChars.toLocaleString() + '字符），AI 仅分析了前 ' + _dmMaxChars.toLocaleString() + ' 字符。</div>'
+        : '';
       danmakuSection.innerHTML = `
-        <div class="tabbit-danmaku-section-title">📡 弹幕分析 <span style="font-size:11px;color:#999;font-weight:400;">（${danmaku.length}条弹幕）</span></div>
+        <div class="tabbit-danmaku-section-title">📡 弹幕分析 <span style="font-size:11px;color:#999;font-weight:400;">${danmaku.length}条弹幕</span></div>
+        ${_dmWarnHtml}
         <div class="tabbit-danmaku-result"><span class="tabbit-typing-cursor"></span></div>
       `;
       const resultEl = danmakuSection.querySelector('.tabbit-danmaku-result');
@@ -6632,6 +6673,7 @@
       actionsDiv.innerHTML = `
         <button class="tabbit-copy-btn" id="tabbit-copy-danmaku">📋 复制弹幕分析</button>
         <button class="tabbit-copy-btn" id="tabbit-flomo-danmaku">发送 FLOMO</button>
+        <button class="tabbit-copy-btn" id="tabbit-export-danmaku">📄 导出原文</button>
         <span style="font-size:11px;color:#999;margin-left:auto;">🤖 ${currentModel}</span>
       `;
       danmakuSection.appendChild(actionsDiv);
@@ -6643,6 +6685,15 @@
       const flomoDanmakuBtn = danmakuSection.querySelector('#tabbit-flomo-danmaku');
       if (flomoDanmakuBtn) {
         flomoDanmakuBtn.addEventListener('click', function() { sendToFlomo(reply, this); });
+      }
+      const exportDanmakuBtn = danmakuSection.querySelector('#tabbit-export-danmaku');
+      if (exportDanmakuBtn) {
+        exportDanmakuBtn.addEventListener('click', function() {
+          var title = (videoInfo && videoInfo.title) || '弹幕分析';
+          var safeTitle = sanitizeFilename(title) || '弹幕分析';
+          var ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+          triggerDownload(danmakuText, safeTitle + '__弹幕原文__' + ts + '.txt', 'text/plain;charset=utf-8');
+        });
       }
 
     } catch (err) {
@@ -6768,14 +6819,22 @@
 
       // 4. 构建全面数据
       const fullDataText = formatFullData(videoInfo, rawSubtitleBody, danmaku, comments);
-      rawFullDataChatContext = '\n\n[全面分析原始数据]\n' + fullDataText;
+      const maxChars = (typeof CONFIG !== 'undefined' && CONFIG.fullDataMaxChars) || 64000;
+      let truncatedDataText = fullDataText;
+      let wasTruncated = false;
+      if (fullDataText.length > maxChars) {
+        truncatedDataText = fullDataText.substring(0, maxChars);
+        wasTruncated = true;
+      }
+      rawFullDataChatContext = '\n\n[全面分析原始数据]\n' + truncatedDataText;
       const activeFullPrompt = CONFIG.fullAnalysisPromptText || FULL_ANALYSIS_PROMPT;
-      const fullPrompt = activeFullPrompt + '\n\n以下是完整数据：\n' + fullDataText;
-      lastFullPromptText = fullPrompt;
+      const fullPrompt = activeFullPrompt + '\n\n以下是完整数据：\n' + truncatedDataText;
+      lastFullPromptText = activeFullPrompt + '\n\n以下是完整数据：\n' + fullDataText;
 
       const totalItems = (rawSubtitleBody.length || 0) + danmaku.length + comments.length;
       fullSection.innerHTML = `
         <div class="tabbit-full-section-title">🔍 全面分析 <span style="font-size:11px;color:#999;font-weight:400;">（字幕${rawSubtitleBody.length}句 + 弹幕${danmaku.length}条 + 评论${comments.length}条）</span></div>
+        ${wasTruncated ? '<div style="background:#fff3cd;color:#856404;padding:6px 10px;border-radius:6px;font-size:12px;margin-bottom:8px;">⚠️ 原文数据量（' + fullDataText.length.toLocaleString() + '字符）超过上限（' + maxChars.toLocaleString() + '字符），AI 仅分析了前 ' + maxChars.toLocaleString() + ' 字符。点击「📄 导出原文」可获取完整数据。</div>' : ''}
         <div class="tabbit-full-result"><span class="tabbit-typing-cursor"></span></div>
       `;
       const resultEl = fullSection.querySelector('.tabbit-full-result');
@@ -7135,9 +7194,9 @@
                 <div class="tabbit-settings-hint">发送给 AI 的弹幕分析指令。弹幕将作为数据附在提示词后面。</div>
               </div>
               <div class="tabbit-settings-group">
-                <div class="tabbit-settings-label">全面分析数据上限（字符）</div>
+                <div class="tabbit-settings-label">AI 分析数据上限（字符）</div>
                 <input class="tabbit-settings-input" id="ts-fullDataMaxChars" type="number" min="10000" max="200000" step="2000" value="${CONFIG.fullDataMaxChars || 64000}" placeholder="64000" />
-                <div class="tabbit-settings-hint">发送给 AI 的全面分析原始数据（字幕+弹幕+评论）最大字符数。超限自动截断。建议先用默认值测试，被 API 拒绝就调小。</div>
+                <div class="tabbit-settings-hint">所有分析（字幕摘要、评论总结、弹幕分析、全面分析）的原始数据最大字符数。超限时 AI 仅分析部分内容，页面会显示提示。可点「📄 导出原文」获取完整数据。建议先用默认值测试，被 API 拒绝就调小。</div>
               </div>
 
               <div class="tabbit-settings-group" style="border-top:1px solid #e8e8f0;padding-top:14px;margin-top:14px;">

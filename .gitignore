@@ -9,3 +9,4 @@ B站省流助手/tools/bili-summary.applescript
 B站省流助手/tools/bili-summarize.sh
 .gitignore
 B站省流助手/AGENTS.md
+.DS_Store
