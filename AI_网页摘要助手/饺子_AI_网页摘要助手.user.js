@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         饺子 AI 网页摘要助手
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      2.8.6
+// @version      2.9.0
 // @description  指定网站自动弹出 AI 网页摘要，支持连续对话、多预设、多模板、SPA路由、摘要生图、flomo、坚果云双文件云同步。Shadow DOM 隔离样式。
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
@@ -1276,6 +1276,7 @@
   const JGY_SHARED_DIR = 'tabbit-shared/';
   const JGY_PROFILES_FILE = 'ai-profiles.json';
   const PROFILES_SCHEMA = 'tabbit-ai-profiles-v1';
+  const JGY_USER_PROFILE_FILE = 'user-profile.json';
   const JGY_DIR = 'tabbit-ai-summary/';
   const JGY_FILE = 'config.json';
 
@@ -1321,6 +1322,7 @@
     });
   }
   async function downloadProfilesFile() { return jgyDownloadJson(JGY_SHARED_DIR + JGY_PROFILES_FILE); }
+  async function downloadUserProfileFile() { return jgyDownloadJson(JGY_SHARED_DIR + JGY_USER_PROFILE_FILE); }
   async function uploadProfilesFile(profiles, currentProfileId) {
     await jgyMkcolIfNeeded(JGY_SHARED_DIR);
     await jgyUploadJson(JGY_SHARED_DIR + JGY_PROFILES_FILE, {
@@ -1539,6 +1541,39 @@
     try { await cloudForcePush(scope); alert('✅ 已强制覆盖云端。'); }
     catch (err) { alert('❌ 强制覆盖失败：\n' + (err.message || err)); }
     finally { if (btn) { btn.disabled = false; btn.textContent = '⚠️ 强制覆盖上传'; } }
+  }
+
+  function extractUserProfileMarkdown(payload) {
+    if (!payload) return '';
+    if (typeof payload === 'string') return payload.trim();
+    return String(payload.markdown || payload.content || '').trim();
+  }
+
+  async function handleLoadUserProfileMd() {
+    pickCloudCredsFromForm();
+    if (!config.cloudSync?.account || !config.cloudSync?.appPassword) { alert('请先填写坚果云账号和应用密码'); return; }
+    const btn = settingsEl?.querySelector('#tabbit-md-load-profile');
+    if (btn) { btn.disabled = true; btn.textContent = '读取中…'; }
+    try {
+      const remote = await downloadUserProfileFile();
+      const markdown = extractUserProfileMarkdown(remote);
+      if (!markdown) { alert('云端还没有用户画像。'); return; }
+      const mdTextarea = settingsEl?.querySelector('#tabbit-set-system-md');
+      const mdCharsEl = settingsEl?.querySelector('#tabbit-md-chars');
+      const mdEnabled = settingsEl?.querySelector('#tabbit-set-md-enabled');
+      if (mdTextarea) mdTextarea.value = markdown;
+      if (mdCharsEl) mdCharsEl.textContent = '字数：' + markdown.length;
+      if (mdEnabled) mdEnabled.checked = true;
+      config.systemPromptMd = markdown;
+      config.systemPromptMdEnabled = true;
+      saveConfig();
+      setStatus('已从坚果云读取用户画像', 'ok', 1800);
+      alert('✅ 已从坚果云读取用户画像，并启用上下文注入。');
+    } catch (err) {
+      alert('❌ 从坚果云读取用户画像失败：\n' + (err.message || err));
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = '☁️ 从坚果云读取用户画像'; }
+    }
   }
 
   /******************************************************************
@@ -2071,7 +2106,7 @@
       .tabbit-sync-scope label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
 
       .tabbit-settings-actions { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0; }
-      .tabbit-md-actions { display: flex; gap: 8px; margin-bottom: 8px; }
+      .tabbit-md-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }
       .tabbit-md-textarea { width: 100%; min-height: 120px; padding: 8px; border: 1px solid #d9d9d9; border-radius: 6px; font-family: 'SF Mono', Monaco, Consolas, monospace; font-size: 12px; line-height: 1.5; resize: vertical; box-sizing: border-box; background: #fafafa; color: #333; }
       .tabbit-model-row {
         display: grid;
@@ -3316,8 +3351,9 @@
             <span class="tabbit-collapse-arrow">▶</span>
           </div>
           <div class="tabbit-collapse-content">
-            <small class="tabbit-help">此处填写的 Markdown 内容会插入到提示词最前面，作为 AI 的上下文。例如：用户偏好、Skill 指令、角色设定等。配合提示词模板使用，AI 会先读取这里的上下文再结合页面内容进行总结。</small>
+            <small class="tabbit-help">这里的 Markdown 会插入到提示词最前面。云端方式：先在浏览记录脚本生成用户画像，再点“从坚果云读取用户画像”。本地方式：导出画像 MD 后点“导入 .md 文件”。</small>
             <div class="tabbit-md-actions">
+              <button id="tabbit-md-load-profile" class="tabbit-secondary-btn" type="button">☁️ 从坚果云读取用户画像</button>
               <button id="tabbit-md-upload" class="tabbit-secondary-btn" type="button">📂 导入 .md 文件</button>
               <button id="tabbit-md-clear" class="tabbit-danger-btn" type="button">🗑️ 清空</button>
               <input id="tabbit-md-file" type="file" accept=".md,.txt,.markdown" style="display:none">
@@ -3344,6 +3380,7 @@
           <div class="tabbit-collapse-content">
             <small class="tabbit-help">
               • <code>tabbit-shared/ai-profiles.json</code> — API 预设（多脚本共享）<br>
+              • <code>tabbit-shared/user-profile.json</code> — 用户画像（浏览记录脚本生成）<br>
               • <code>tabbit-ai-summary/config.json</code> — 模板 + 网址规则（本脚本专属）<br>
               ⚠️ <b>API Key 会上传到云端</b>，请确保账号安全。
             </small>
@@ -3386,8 +3423,12 @@
     const mdUploadBtn = settingsEl.querySelector('#tabbit-md-upload');
     const mdFileInput = settingsEl.querySelector('#tabbit-md-file');
     const mdClearBtn = settingsEl.querySelector('#tabbit-md-clear');
+    const mdLoadProfileBtn = settingsEl.querySelector('#tabbit-md-load-profile');
     const mdTextarea = settingsEl.querySelector('#tabbit-set-system-md');
     const mdCharsEl = settingsEl.querySelector('#tabbit-md-chars');
+    if (mdLoadProfileBtn) {
+      mdLoadProfileBtn.addEventListener('click', handleLoadUserProfileMd);
+    }
     if (mdUploadBtn && mdFileInput) {
       mdUploadBtn.addEventListener('click', () => mdFileInput.click());
       mdFileInput.addEventListener('change', (e) => {

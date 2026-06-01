@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name        网页浏览记录助手
 // @namespace   https://github.com/moonjoin/tampermonkey-scripts
-// @version     1.6.2
+// @version     1.9.0
 // @description  浏览记录自动存储 + 多渠道网页推送 + AI 浏览行为分析（多时间段），支持坚果云增量云同步（和饺子AI网页摘要助手+Folo网站增强工具数据互通）
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
@@ -33,6 +33,8 @@
     '127.0.0.1',
     'file://'
   ];
+  const USER_PROFILE_TEMPLATE_ID = 'profile';
+  const USER_PROFILE_SCHEMA = 'tabbit-user-profile-v1';
 
   const DEFAULT_PROFILE = {
     id: 'default',
@@ -83,6 +85,9 @@
       lastSyncDirection: '',
       autoSyncHours: 4,
       autoSyncMinutes: 240,
+    },
+    userProfile: {
+      autoUploadToCloud: true,
     },
     extractMaxChars: 16000,
     analysisTemplates: [],
@@ -781,8 +786,7 @@
 - 只输出事实，不写分析过程、不写依据、不写建议
 - 没有数据支撑的维度直接跳过，不要编造
 - 判断"喜欢"的标准：访问次数多 + 停留时间长
-- 判断"深度阅读"的标准：单次停留超过 3 分钟
-- 判断"快速浏览"的标准：单次停留不足 1 分钟
+- 只输出下面格式里的三个模块，不要增加阅读偏好、工具偏好、时间模式、信息来源等额外模块
 
 输出格式：
 
@@ -790,17 +794,6 @@
 
 ## 兴趣领域
 - 领域名（具体关注内容）
-
-## 阅读偏好
-- 喜欢：xxx
-- 阅读深度：深度阅读型 / 快速浏览型
-
-## 工具偏好
-- 工具A > 工具B（按使用频率排序）
-
-## 时间模式
-- 高频活跃时段：HH:MM - HH:MM
-- 工作时段偏好 xxx，休闲时段偏好 xxx（无法区分则跳过此项）
 
 ## 内容优先级
 1. xxx
@@ -857,15 +850,33 @@ ${lines}`;
   async function runAnalysis(records, timeRangeDesc, templateId) {
     if (!checkApiConfig()) return;
     if (!records?.length) { toast('没有记录可分析'); return; }
+    const effectiveTemplateId = templateId || USER_PROFILE_TEMPLATE_ID;
     conversation = [];
-    conversation.push({ role: 'system', content: buildAnalysisPrompt(records, timeRangeDesc, templateId || 'summary') });
-    conversation.push({ role: 'user', content: `请分析以上 ${records.length} 条浏览记录，给出详细的分析报告。`, meta: { hidden: true } });
+    conversation.push({ role: 'system', content: buildAnalysisPrompt(records, timeRangeDesc, effectiveTemplateId) });
+    conversation.push({
+      role: 'user',
+      content: effectiveTemplateId === USER_PROFILE_TEMPLATE_ID
+        ? `请基于以上 ${records.length} 条浏览记录，按指定格式输出用户偏好画像。`
+        : `请分析以上 ${records.length} 条浏览记录，给出详细的分析报告。`,
+      meta: { hidden: true }
+    });
     renderConversation();
-    await streamChat({
+    const finalText = await streamChat({
       stopLabel: '⏹',
       onSuccess: () => { markAllAsRead(); updateBadge(); if (historyTabEl) refreshHistoryTab(); saveAnalysisHistory(); },
       onError: () => toast('分析失败')
     });
+    if (finalText && effectiveTemplateId === USER_PROFILE_TEMPLATE_ID) {
+      if (cfg.userProfile?.autoUploadToCloud === false) {
+        toast('画像已生成；自动上传已关闭');
+        return;
+      }
+      try {
+        await uploadUserProfileMarkdown(finalText, { timeRangeDesc, recordCount: records.length });
+      } catch (err) {
+        toast('画像同步失败：' + (err.message || err));
+      }
+    }
   }
   async function handleSendChat() {
     if (!checkApiConfig()) return;
@@ -913,7 +924,7 @@ ${lines}`;
   /******************************************************************
    * 8. 云同步
    ******************************************************************/
-  const JGY_BASE = 'https://dav.jianguoyun.com/dav/', JGY_SHARED_DIR = 'tabbit-shared/', JGY_PROFILES_FILE = 'ai-profiles.json', PROFILES_SCHEMA = 'tabbit-ai-profiles-v1', JGY_HISTORY_DIR = 'tabbit-history/', JGY_HISTORY_FILE = 'records.json';
+  const JGY_BASE = 'https://dav.jianguoyun.com/dav/', JGY_SHARED_DIR = 'tabbit-shared/', JGY_PROFILES_FILE = 'ai-profiles.json', PROFILES_SCHEMA = 'tabbit-ai-profiles-v1', JGY_USER_PROFILE_FILE = 'user-profile.json', JGY_HISTORY_DIR = 'tabbit-history/', JGY_HISTORY_FILE = 'records.json';
   function jgyUrl(path) { return JGY_BASE + (path || ''); }
   function jgyAuthHeader() { const cs = cfg.cloudSync || {}; return 'Basic ' + btoa(unescape(encodeURIComponent(cs.account + ':' + cs.appPassword))); }
   function jgyRequest(method, url, opts) {
@@ -930,6 +941,31 @@ ${lines}`;
   async function jgyDownloadJson(filePath) { const res = await jgyRequest('GET', jgyUrl(filePath), { allow404: true }); if (res.status === 404) return null; try { return JSON.parse(res.responseText); } catch { return null; } }
   async function jgyUploadJson(filePath, payload) { await jgyRequest('PUT', jgyUrl(filePath), { headers: { 'Content-Type': 'application/json' }, data: JSON.stringify(payload, null, 2) }); }
   async function jgyDeleteIfExists(filePath) { try { await jgyRequest('DELETE', jgyUrl(filePath), { allow404: true }); } catch (e) {} }
+  function normalizeUserProfileMarkdown(markdown) {
+    const text = String(markdown || '').trim();
+    if (!text) return '';
+    return text.replace(/\n{3,}/g, '\n\n');
+  }
+  async function uploadUserProfileMarkdown(markdown, meta) {
+    const clean = normalizeUserProfileMarkdown(markdown);
+    if (!clean) return false;
+    if (!cfg.cloudSync?.account || !cfg.cloudSync?.appPassword) {
+      toast('画像已生成；未配置坚果云，暂未同步');
+      return false;
+    }
+    await jgyMkcolIfNeeded(JGY_SHARED_DIR);
+    await jgyUploadJson(JGY_SHARED_DIR + JGY_USER_PROFILE_FILE, {
+      version: 1,
+      schema: USER_PROFILE_SCHEMA,
+      updatedAt: Date.now(),
+      source: 'browser-history',
+      timeRangeDesc: meta?.timeRangeDesc || '',
+      recordCount: Number(meta?.recordCount || 0),
+      markdown: clean
+    });
+    toast('✅ 用户画像已同步');
+    return true;
+  }
   function mergeProfiles(local, remote) { const map = new Map(); [...remote, ...local].forEach(p => map.set(p.id, p)); return Array.from(map.values()); }
   async function jgyListChildNames(dirPath) {
     const body = '<?xml version="1.0" encoding="utf-8"?><d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>';
@@ -2065,6 +2101,7 @@ ${lines}`;
       });
       // 恢复选择
       if (currentVal && allTemplates.some(t => t.id === currentVal)) tplSelect.value = currentVal;
+      else if (allTemplates.some(t => t.id === USER_PROFILE_TEMPLATE_ID)) tplSelect.value = USER_PROFILE_TEMPLATE_ID;
     }
     refreshAnalysisTemplateSelect();
 
@@ -2161,6 +2198,11 @@ ${lines}`;
     // ── AI 分析提示词 ──
     const tplSection = makeCollapseSection('📝 AI 分析提示词');
     tplSection.body.innerHTML = `
+      <div class="mpush-field">
+        <div class="mpush-field-label">用户画像流转</div>
+        <div class="mpush-field-inline"><input type="checkbox" data-path="userProfile.autoUploadToCloud"><span>画像生成成功后自动上传到坚果云</span></div>
+        <small>云端方式：生成用户画像后写入 tabbit-shared/user-profile.json，摘要助手点“从坚果云读取用户画像”。本地方式：点“导出MD”，再到摘要助手点“导入 .md 文件”。</small>
+      </div>
       <div class="mpush-field">
         <div class="mpush-field-label">当前模板列表</div>
         <div id="set-tpl-list" style="max-height:300px;overflow-y:auto;border:1px solid #eee;border-radius:8px;"></div>
