@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name        网页浏览记录助手
 // @namespace   https://github.com/moonjoin/tampermonkey-scripts
-// @version     1.9.1
+// @version     1.9.2
 // @description  浏览记录自动存储 + AI 浏览行为分析 + 用户画像生成，支持坚果云增量云同步（和饺子AI网页摘要助手+Folo网站增强工具数据互通）
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
@@ -1090,9 +1090,6 @@ ${lines}`;
     return ('00000000' + (hash >>> 0).toString(16)).slice(-8);
   }
   async function cloudPullAll() {
-    const rp = await jgyDownloadJson(JGY_SHARED_DIR + JGY_PROFILES_FILE);
-    const remoteProfiles = extractSharedProfiles(rp);
-    if (remoteProfiles.length) { const m = mergeProfiles(normalizeProfiles(cfg.profiles), remoteProfiles, 'remote'); cfg.profiles = m; if (rp?.currentProfileId && m.some(p => p.id === rp.currentProfileId)) cfg.currentProfileId = rp.currentProfileId; else if (!m.some(p => p.id === cfg.currentProfileId)) cfg.currentProfileId = m[0].id; }
     const rh = await jgyDownloadJson(JGY_HISTORY_DIR + JGY_HISTORY_FILE);
     if (rh?.blacklistedUrls) setBlacklistedUrls(mergeBlacklistedUrls(getBlacklistedUrls(), rh.blacklistedUrls));
     if (rh?.deletedRecords) setDeletedHistoryRecords(mergeDeletedHistoryRecords(getDeletedHistoryRecords(), rh.deletedRecords));
@@ -1100,9 +1097,6 @@ ${lines}`;
     cfg.cloudSync.lastSyncAt = Date.now(); cfg.cloudSync.lastSyncDirection = 'pull'; saveConfig(cfg); saveHistory(historyStore);
   }
   async function cloudPushAll() {
-    await jgyMkcolIfNeeded(JGY_SHARED_DIR); let rp = null; try { rp = await jgyDownloadJson(JGY_SHARED_DIR + JGY_PROFILES_FILE); } catch (e) {}
-    let mp = normalizeProfiles(cfg.profiles); const remoteProfiles = extractSharedProfiles(rp); if (remoteProfiles.length) mp = mergeProfiles(mp, remoteProfiles, 'local');
-    await uploadProfilesFile(mp, cfg.currentProfileId); cfg.profiles = mp;
     await jgyMkcolIfNeeded(JGY_HISTORY_DIR); let rh = null; try { rh = await jgyDownloadJson(JGY_HISTORY_DIR + JGY_HISTORY_FILE); } catch (e) {}
     if (rh?.blacklistedUrls) setBlacklistedUrls(mergeBlacklistedUrls(getBlacklistedUrls(), rh.blacklistedUrls));
     if (rh?.deletedRecords) setDeletedHistoryRecords(mergeDeletedHistoryRecords(getDeletedHistoryRecords(), rh.deletedRecords));
@@ -1111,8 +1105,7 @@ ${lines}`;
     cfg.cloudSync.lastSyncAt = Date.now(); cfg.cloudSync.lastSyncDirection = 'push'; saveConfig(cfg); saveHistory(historyStore);
   }
   async function cloudForcePushAll() {
-    await jgyMkcolIfNeeded(JGY_SHARED_DIR); await jgyMkcolIfNeeded(JGY_HISTORY_DIR);
-    await uploadProfilesFile(cfg.profiles, cfg.currentProfileId, { forcePush: true });
+    await jgyMkcolIfNeeded(JGY_HISTORY_DIR);
     pruneBlacklistedRecords();
     await jgyUploadJson(JGY_HISTORY_DIR + JGY_HISTORY_FILE, { version: 2, updatedAt: Date.now(), forcePush: true, records: historyStore.records, lastReadAt: historyStore.lastReadAt, blacklistedUrls: getBlacklistedUrls(), deletedRecords: getDeletedHistoryRecords(), checksum: calcHistoryChecksum(historyStore.records, getBlacklistedUrls()) });
     cfg.cloudSync.lastSyncAt = Date.now(); cfg.cloudSync.lastSyncDirection = 'force-push'; saveConfig(cfg); saveHistory(historyStore);
@@ -2077,7 +2070,7 @@ ${lines}`;
     if (!statusEl) return;
     const syncMeta = loadHistorySyncMeta();
     if (syncMeta.lastSyncAt) {
-      const dirMap = { reconcile: '对账同步', incremental: '对账同步', 'auto-delta': '自动增量上传', 'auto-delta-check': '自动检查', 'auto-baseline': '自动基线', 'force-push': '强制覆盖', pull: '拉取', push: '上传' };
+      const dirMap = { reconcile: '对账同步', incremental: '对账同步', 'auto-delta': '自动增量上传', 'auto-delta-check': '自动检查', 'auto-baseline': '自动基线', 'force-push': '强制覆盖历史', pull: '拉取历史', push: '上传历史' };
       const dir = dirMap[cfg.cloudSync?.lastSyncDirection] || '';
       statusEl.textContent = `☁️ 上次同步：${formatDate(syncMeta.lastSyncAt)} ${formatTime(syncMeta.lastSyncAt)}（${dir}，${syncMeta.syncedCount || 0} 条${syncMeta.checksum ? `，校验 ${syncMeta.checksum}` : ''}）`;
     } else {
@@ -2518,8 +2511,11 @@ ${lines}`;
     refreshTemplateList();
 
     // ── 云同步 ──
-    const cloudSection = makeCollapseSection('☁️ 坚果云云同步');
+    const cloudSection = makeCollapseSection('☁️ 坚果云账号与历史同步');
     cloudSection.body.innerHTML = `
+      <div class="mpush-cloud-status" style="line-height:1.6;margin-bottom:8px;">
+        这里用于填写坚果云账号和应用密码，并同步浏览历史。API 预设请用上方单独按钮，上传当前预设时按 ID 合并，同 ID 以本地覆盖；用户画像会在分析生成后按画像设置同步。
+      </div>
       <div class="mpush-row-2">
         <div class="mpush-field"><div class="mpush-field-label">账号（邮箱）</div><input type="text" data-path="cloudSync.account" placeholder="you@example.com"></div>
         <div class="mpush-field"><div class="mpush-field-label">应用密码</div><input type="password" data-path="cloudSync.appPassword" placeholder="坚果云应用密码"></div>
@@ -2531,10 +2527,10 @@ ${lines}`;
       <div class="mpush-cloud-status" id="set-cloud-status">尚未同步</div>
       <div class="mpush-btns">
         <button class="mpush-btn" id="set-cloud-test">🔌 测试</button>
-        <button class="mpush-btn primary" id="set-cloud-reconcile">🔁 对账同步</button>
-        <button class="mpush-btn" id="set-cloud-pull">⬇️ 拉取</button>
-        <button class="mpush-btn" id="set-cloud-push">⬆️ 上传</button>
-        <button class="mpush-btn danger" id="set-cloud-force">⚠️ 覆盖</button>
+        <button class="mpush-btn primary" id="set-cloud-reconcile">🔁 历史对账同步</button>
+        <button class="mpush-btn" id="set-cloud-pull">⬇️ 拉取历史</button>
+        <button class="mpush-btn" id="set-cloud-push">⬆️ 上传历史</button>
+        <button class="mpush-btn danger" id="set-cloud-force">⚠️ 覆盖历史</button>
       </div>`;
 
     // 组装面板
@@ -2593,10 +2589,10 @@ ${lines}`;
     pane.querySelector('#set-history-clear').addEventListener('click', () => { if (!confirm('清理全部记录？')) return; clearAllRecords(); updateBadge(); refreshHistoryTab(); toast('已清理'); });
     pane.querySelector('#set-history-export').addEventListener('click', exportRecordsAsJson);
     pane.querySelector('#set-cloud-test').addEventListener('click', async () => { readAllSettingsToConfig(); saveConfig(cfg); if (!cfg.cloudSync.account || !cfg.cloudSync.appPassword) { alert('请先填写账号和密码。'); return; } try { await jgyMkcolIfNeeded(JGY_SHARED_DIR); await jgyMkcolIfNeeded(JGY_HISTORY_DIR); await jgyMkcolIfNeeded(JGY_HISTORY_SYNC_DIR); await jgyMkcolIfNeeded(JGY_HISTORY_SYNC_DIR + JGY_HISTORY_SYNC_CLIENTS); toast('✅ 连接成功'); } catch (err) { alert('❌ ' + (err.message || err)); } });
-    pane.querySelector('#set-cloud-reconcile').addEventListener('click', async () => { readAllSettingsToConfig(); saveConfig(cfg); if (!cfg.cloudSync.account || !cfg.cloudSync.appPassword) { alert('请先填写账号和密码。'); return; } const btn = pane.querySelector('#set-cloud-reconcile'); btn.disabled = true; btn.textContent = '对账中…'; try { const result = await historySyncReconcile(); toast(`✅ 对账完成：${result.finalCount} 条，校验 ${result.checksum}`); fillSettingsTab(); refreshHistoryTab(); } catch (err) { alert('❌ ' + (err.message || err)); } finally { btn.disabled = false; btn.textContent = '🔁 对账同步'; } });
-    pane.querySelector('#set-cloud-pull').addEventListener('click', async () => { readAllSettingsToConfig(); saveConfig(cfg); if (!cfg.cloudSync.account || !cfg.cloudSync.appPassword) { alert('请先填写账号和密码。'); return; } if (!confirm('从云端拉取？')) return; try { await cloudPullAll(); toast('✅ 拉取完成'); fillSettingsTab(); refreshHistoryTab(); } catch (err) { alert('❌ ' + (err.message || err)); } });
-    pane.querySelector('#set-cloud-push').addEventListener('click', async () => { readAllSettingsToConfig(); saveConfig(cfg); if (!cfg.cloudSync.account || !cfg.cloudSync.appPassword) { alert('请先填写账号和密码。'); return; } try { await cloudPushAll(); toast('✅ 上传完成'); } catch (err) { alert('❌ ' + (err.message || err)); } });
-    pane.querySelector('#set-cloud-force').addEventListener('click', async () => { readAllSettingsToConfig(); saveConfig(cfg); if (!cfg.cloudSync.account || !cfg.cloudSync.appPassword) { alert('请先填写账号和密码。'); return; } if (!confirm('⚠️ 强制覆盖？')) return; if (!confirm('不可恢复，继续？')) return; try { await cloudForcePushAll(); toast('✅ 覆盖完成'); } catch (err) { alert('❌ ' + (err.message || err)); } });
+    pane.querySelector('#set-cloud-reconcile').addEventListener('click', async () => { readAllSettingsToConfig(); saveConfig(cfg); if (!cfg.cloudSync.account || !cfg.cloudSync.appPassword) { alert('请先填写账号和密码。'); return; } const btn = pane.querySelector('#set-cloud-reconcile'); btn.disabled = true; btn.textContent = '对账中…'; try { const result = await historySyncReconcile(); toast(`✅ 对账完成：${result.finalCount} 条，校验 ${result.checksum}`); fillSettingsTab(); refreshHistoryTab(); } catch (err) { alert('❌ ' + (err.message || err)); } finally { btn.disabled = false; btn.textContent = '🔁 历史对账同步'; } });
+    pane.querySelector('#set-cloud-pull').addEventListener('click', async () => { readAllSettingsToConfig(); saveConfig(cfg); if (!cfg.cloudSync.account || !cfg.cloudSync.appPassword) { alert('请先填写账号和密码。'); return; } if (!confirm('从云端拉取历史记录？')) return; try { await cloudPullAll(); toast('✅ 历史拉取完成'); fillSettingsTab(); refreshHistoryTab(); } catch (err) { alert('❌ ' + (err.message || err)); } });
+    pane.querySelector('#set-cloud-push').addEventListener('click', async () => { readAllSettingsToConfig(); saveConfig(cfg); if (!cfg.cloudSync.account || !cfg.cloudSync.appPassword) { alert('请先填写账号和密码。'); return; } try { await cloudPushAll(); toast('✅ 历史上传完成'); } catch (err) { alert('❌ ' + (err.message || err)); } });
+    pane.querySelector('#set-cloud-force').addEventListener('click', async () => { readAllSettingsToConfig(); saveConfig(cfg); if (!cfg.cloudSync.account || !cfg.cloudSync.appPassword) { alert('请先填写账号和密码。'); return; } if (!confirm('⚠️ 强制用本地历史覆盖云端历史？')) return; if (!confirm('不可恢复，继续？')) return; try { await cloudForcePushAll(); toast('✅ 历史覆盖完成'); } catch (err) { alert('❌ ' + (err.message || err)); } });
 
     return pane;
   }
@@ -2673,7 +2669,7 @@ ${lines}`;
     const bu = pane.querySelector('#set-blacklisted-urls');
     if (bu) bu.value = getBlacklistedUrls().join('\n');
     const cs = pane.querySelector('#set-cloud-status');
-    if (cs) { const t = cfg.cloudSync?.lastSyncAt; if (t) { const dirMap = { reconcile: '对账同步', incremental: '对账同步', 'auto-delta': '自动增量上传', 'auto-delta-check': '自动检查', 'auto-baseline': '自动基线', pull: '拉取', push: '上传', 'force-push': '覆盖' }; cs.textContent = `上次：${formatDate(t)}（${dirMap[cfg.cloudSync.lastSyncDirection] || ''}）`; } else cs.textContent = '尚未同步'; }
+    if (cs) { const t = cfg.cloudSync?.lastSyncAt; if (t) { const dirMap = { reconcile: '对账同步', incremental: '对账同步', 'auto-delta': '自动增量上传', 'auto-delta-check': '自动检查', 'auto-baseline': '自动基线', pull: '拉取历史', push: '上传历史', 'force-push': '覆盖历史' }; cs.textContent = `上次：${formatDate(t)}（${dirMap[cfg.cloudSync.lastSyncDirection] || ''}）`; } else cs.textContent = '尚未同步'; }
   }
 
   /******************************************************************
