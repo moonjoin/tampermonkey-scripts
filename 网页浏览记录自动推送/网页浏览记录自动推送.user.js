@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name        网页浏览记录助手
 // @namespace   https://github.com/moonjoin/tampermonkey-scripts
-// @version     1.9.0
-// @description  浏览记录自动存储 + 多渠道网页推送 + AI 浏览行为分析（多时间段），支持坚果云增量云同步（和饺子AI网页摘要助手+Folo网站增强工具数据互通）
+// @version     1.9.1
+// @description  浏览记录自动存储 + AI 浏览行为分析 + 用户画像生成，支持坚果云增量云同步（和饺子AI网页摘要助手+Folo网站增强工具数据互通）
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
 // @match        *://*/*
@@ -51,7 +51,7 @@
 
   const DEFAULT_CONFIG = {
     common: {
-      autoSendOnLoad: true,
+      autoSendOnLoad: false,
       delayMs: 3000,
       cooldownMs: 5 * 60 * 1000,
       minDwellMs: 2000,
@@ -60,7 +60,7 @@
       includeTime: false,
     },
     telegram: {
-      enabled: true,
+      enabled: false,
       botToken: '',
       chatId: '',
     },
@@ -92,6 +92,7 @@
     extractMaxChars: 16000,
     analysisTemplates: [],
     customAnalysisTemplates: [],
+    legacyPushMigratedToOptional: true,
   };
 
   function clone(obj) { return JSON.parse(JSON.stringify(obj)); }
@@ -131,6 +132,13 @@
         const merged = deepMerge(DEFAULT_CONFIG, parsed);
         if (parsed.cloudSync && parsed.cloudSync.autoSyncMinutes === undefined && parsed.cloudSync.autoSyncHours !== undefined) {
           merged.cloudSync.autoSyncMinutes = Math.max(0, Math.round(Number(parsed.cloudSync.autoSyncHours || 0) * 60));
+        }
+        if (parsed.legacyPushMigratedToOptional !== true) {
+          merged.common.autoSendOnLoad = false;
+          merged.telegram.enabled = false;
+          merged.feishu.enabled = false;
+          merged.legacyPushMigratedToOptional = true;
+          if (typeof GM_setValue === 'function') GM_setValue(CONFIG_KEY, JSON.stringify(merged));
         }
         return merged;
       }
@@ -622,7 +630,7 @@
 
   function _confirmHistoryRecord(url, title, domain, ts) {
     _confirmRecordToStore(url, title, domain, ts);
-    // 记录确认后触发推送（如果满足条件）
+    // 记录确认后触发旧版推送（如果启用）
     triggerPendingPush(url, title);
   }
 
@@ -646,7 +654,7 @@
     }
   }
 
-  // 待确认记录的推送触发
+  // 待确认记录的旧版推送触发
   async function triggerPendingPush(url, title) {
     cfg = loadConfig();
     if (!cfg.common.autoSendOnLoad) return;
@@ -710,7 +718,7 @@
   }
 
   /******************************************************************
-   * 5. 推送功能
+   * 5. 旧版推送功能（可选）
    ******************************************************************/
   const recentUrls = new Map();
   function isUrlInCooldown(url, cooldownMs) { const t = recentUrls.get(url); return t ? (Date.now() - t) < (cooldownMs || 0) : false; }
@@ -966,7 +974,62 @@ ${lines}`;
     toast('✅ 用户画像已同步');
     return true;
   }
-  function mergeProfiles(local, remote) { const map = new Map(); [...remote, ...local].forEach(p => map.set(p.id, p)); return Array.from(map.values()); }
+  function extractSharedProfiles(payload) {
+    if (!payload) return [];
+    let list = [];
+    if (Array.isArray(payload)) list = payload;
+    else if (Array.isArray(payload.profiles)) list = payload.profiles;
+    else if (Array.isArray(payload.data?.profiles)) list = payload.data.profiles;
+    else if (payload.profile && typeof payload.profile === 'object') list = [payload.profile];
+    else if (payload.apiUrl || payload.apiKey || payload.models) list = [payload];
+    return Array.isArray(list) && list.length ? normalizeProfiles(list) : [];
+  }
+  function mergeProfiles(local, remote, prefer) {
+    const map = new Map();
+    const order = prefer === 'remote' ? [local, remote] : [remote, local];
+    order.forEach(arr => (arr || []).forEach(p => map.set(p.id, p)));
+    return Array.from(map.values());
+  }
+  function buildSharedProfilesPayload(profiles, currentProfileId, extra) {
+    const normalized = normalizeProfiles(profiles);
+    return {
+      version: 1,
+      schema: PROFILES_SCHEMA,
+      updatedAt: Date.now(),
+      profiles: normalized,
+      currentProfileId: normalized.some(p => p.id === currentProfileId) ? currentProfileId : normalized[0]?.id || 'default',
+      ...(extra || {})
+    };
+  }
+  async function downloadProfilesFile() {
+    return jgyDownloadJson(JGY_SHARED_DIR + JGY_PROFILES_FILE);
+  }
+  async function uploadProfilesFile(profiles, currentProfileId, extra) {
+    await jgyMkcolIfNeeded(JGY_SHARED_DIR);
+    await jgyUploadJson(JGY_SHARED_DIR + JGY_PROFILES_FILE, buildSharedProfilesPayload(profiles, currentProfileId, extra));
+  }
+  async function pullApiProfilesFromCloud() {
+    const remote = await downloadProfilesFile();
+    const remoteProfiles = extractSharedProfiles(remote);
+    if (!remoteProfiles.length) return { hasProfiles: false, count: 0 };
+    const merged = mergeProfiles(normalizeProfiles(cfg.profiles), remoteProfiles, 'remote');
+    cfg.profiles = merged;
+    if (remote?.currentProfileId && merged.some(p => p.id === remote.currentProfileId)) cfg.currentProfileId = remote.currentProfileId;
+    else if (!merged.some(p => p.id === cfg.currentProfileId)) cfg.currentProfileId = merged[0].id;
+    saveConfig(cfg);
+    return { hasProfiles: true, count: merged.length };
+  }
+  async function pushCurrentApiProfileToCloud() {
+    await jgyMkcolIfNeeded(JGY_SHARED_DIR);
+    let remote = null; try { remote = await downloadProfilesFile(); } catch (e) {}
+    const current = clone(getCurrentProfile());
+    const remoteProfiles = extractSharedProfiles(remote);
+    const cloudProfiles = remoteProfiles.length ? mergeProfiles([current], remoteProfiles, 'local') : normalizeProfiles([current]);
+    await uploadProfilesFile(cloudProfiles, current.id);
+    cfg.profiles = remoteProfiles.length ? mergeProfiles(normalizeProfiles(cfg.profiles), remoteProfiles, 'local') : normalizeProfiles(cfg.profiles);
+    saveConfig(cfg);
+    return { count: cloudProfiles.length };
+  }
   async function jgyListChildNames(dirPath) {
     const body = '<?xml version="1.0" encoding="utf-8"?><d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/></d:prop></d:propfind>';
     try {
@@ -1028,7 +1091,8 @@ ${lines}`;
   }
   async function cloudPullAll() {
     const rp = await jgyDownloadJson(JGY_SHARED_DIR + JGY_PROFILES_FILE);
-    if (rp?.profiles) { const m = mergeProfiles(normalizeProfiles(cfg.profiles), normalizeProfiles(rp.profiles)); cfg.profiles = m; if (rp.currentProfileId && m.some(p => p.id === rp.currentProfileId)) cfg.currentProfileId = rp.currentProfileId; }
+    const remoteProfiles = extractSharedProfiles(rp);
+    if (remoteProfiles.length) { const m = mergeProfiles(normalizeProfiles(cfg.profiles), remoteProfiles, 'remote'); cfg.profiles = m; if (rp?.currentProfileId && m.some(p => p.id === rp.currentProfileId)) cfg.currentProfileId = rp.currentProfileId; else if (!m.some(p => p.id === cfg.currentProfileId)) cfg.currentProfileId = m[0].id; }
     const rh = await jgyDownloadJson(JGY_HISTORY_DIR + JGY_HISTORY_FILE);
     if (rh?.blacklistedUrls) setBlacklistedUrls(mergeBlacklistedUrls(getBlacklistedUrls(), rh.blacklistedUrls));
     if (rh?.deletedRecords) setDeletedHistoryRecords(mergeDeletedHistoryRecords(getDeletedHistoryRecords(), rh.deletedRecords));
@@ -1037,8 +1101,8 @@ ${lines}`;
   }
   async function cloudPushAll() {
     await jgyMkcolIfNeeded(JGY_SHARED_DIR); let rp = null; try { rp = await jgyDownloadJson(JGY_SHARED_DIR + JGY_PROFILES_FILE); } catch (e) {}
-    let mp = normalizeProfiles(cfg.profiles); if (rp?.profiles) mp = mergeProfiles(mp, normalizeProfiles(rp.profiles));
-    await jgyUploadJson(JGY_SHARED_DIR + JGY_PROFILES_FILE, { version: 1, schema: PROFILES_SCHEMA, updatedAt: Date.now(), profiles: mp, currentProfileId: cfg.currentProfileId }); cfg.profiles = mp;
+    let mp = normalizeProfiles(cfg.profiles); const remoteProfiles = extractSharedProfiles(rp); if (remoteProfiles.length) mp = mergeProfiles(mp, remoteProfiles, 'local');
+    await uploadProfilesFile(mp, cfg.currentProfileId); cfg.profiles = mp;
     await jgyMkcolIfNeeded(JGY_HISTORY_DIR); let rh = null; try { rh = await jgyDownloadJson(JGY_HISTORY_DIR + JGY_HISTORY_FILE); } catch (e) {}
     if (rh?.blacklistedUrls) setBlacklistedUrls(mergeBlacklistedUrls(getBlacklistedUrls(), rh.blacklistedUrls));
     if (rh?.deletedRecords) setDeletedHistoryRecords(mergeDeletedHistoryRecords(getDeletedHistoryRecords(), rh.deletedRecords));
@@ -1048,7 +1112,7 @@ ${lines}`;
   }
   async function cloudForcePushAll() {
     await jgyMkcolIfNeeded(JGY_SHARED_DIR); await jgyMkcolIfNeeded(JGY_HISTORY_DIR);
-    await jgyUploadJson(JGY_SHARED_DIR + JGY_PROFILES_FILE, { version: 1, schema: PROFILES_SCHEMA, updatedAt: Date.now(), profiles: normalizeProfiles(cfg.profiles), currentProfileId: cfg.currentProfileId, forcePush: true });
+    await uploadProfilesFile(cfg.profiles, cfg.currentProfileId, { forcePush: true });
     pruneBlacklistedRecords();
     await jgyUploadJson(JGY_HISTORY_DIR + JGY_HISTORY_FILE, { version: 2, updatedAt: Date.now(), forcePush: true, records: historyStore.records, lastReadAt: historyStore.lastReadAt, blacklistedUrls: getBlacklistedUrls(), deletedRecords: getDeletedHistoryRecords(), checksum: calcHistoryChecksum(historyStore.records, getBlacklistedUrls()) });
     cfg.cloudSync.lastSyncAt = Date.now(); cfg.cloudSync.lastSyncDirection = 'force-push'; saveConfig(cfg); saveHistory(historyStore);
@@ -2142,42 +2206,52 @@ ${lines}`;
   }
 
   /******************************************************************
-   * 10.3 设置 Tab（含推送设置，折叠面板）
+   * 10.3 设置 Tab
    ******************************************************************/
   function buildSettingsTab() {
     const pane = el('div', { class: 'mpush-tab-pane', 'data-pane': 'settings' });
 
-    // ── 记录与推送（合并）──
-    const pushSection = makeCollapseSection('📨 记录与推送', true);
-    pushSection.body.innerHTML = `
-      <div class="mpush-field"><div class="mpush-field-inline"><input type="checkbox" data-path="common.autoSendOnLoad"><span>自动在页面打开后推送</span></div><small>需至少启用一个推送渠道才会实际发送</small></div>
+    // ── 浏览记录 ──
+    const recordSection = makeCollapseSection('📦 浏览记录', true);
+    recordSection.body.innerHTML = `
+      <div class="mpush-field"><div class="mpush-field-inline"><input type="checkbox" data-path="history.enabled"><span>开启自动保存</span></div><small>记录是 AI 分析和用户画像的基础，推送功能已移到“旧版推送”。</small></div>
       <div class="mpush-row-2">
-        <div class="mpush-field"><div class="mpush-field-label">最小停留（秒）</div><input type="number" data-path="common.minDwellMs" min="0" max="60" step="1" value="2" data-scale="1000"><small>页面停留不足此时间不记录/推送，过滤中转页</small></div>
-        <div class="mpush-field"><div class="mpush-field-label">推送延迟（秒）</div><input type="number" data-path="common.delayMs" min="0" max="600" step="1" value="3" data-scale="1000"><small>标题稳定等待时间</small></div>
+        <div class="mpush-field"><div class="mpush-field-label">最小停留（秒）</div><input type="number" data-path="common.minDwellMs" min="0" max="60" step="1" value="2" data-scale="1000"><small>页面停留不足此时间不记录，过滤中转页</small></div>
+        <div class="mpush-field"><div class="mpush-field-label">存储上限（条）</div><input type="number" data-path="history.maxRecords" min="100" max="100000" value="50000"></div>
       </div>
       <div class="mpush-row-2">
-        <div class="mpush-field"><div class="mpush-field-label">同URL冷却（秒）</div><input type="number" data-path="common.cooldownMs" min="0" max="86400" step="1" data-scale="1000"><small>冷却内不重复记录/推送</small></div>
+        <div class="mpush-field"><div class="mpush-field-label">自动清理（天）</div><input type="number" data-path="history.autoCleanDays" min="0" max="3650" value="180"><small>0=不清理</small></div>
+        <div class="mpush-field"></div>
+      </div>
+      <div class="mpush-field"><div class="mpush-field-label">排除域名（每行一个）</div><textarea id="set-exclude-domains" rows="3"></textarea></div>
+      <div class="mpush-field"><div class="mpush-field-label">拉黑网址规则（每行一个）</div><textarea id="set-blacklisted-urls" rows="3"></textarea><small>支持完整网址和通配符 *；历史列表点 🚫 可快速生成规则。</small></div>
+      <div class="mpush-btns">
+        <button class="mpush-btn danger" id="set-history-clear">🗑️ 清理全部</button>
+        <button class="mpush-btn" id="set-history-export">📦 导出</button>
+      </div>`;
+
+    // ── 旧版推送 ──
+    const legacyPushSection = makeCollapseSection('📨 旧版推送（可选）');
+    legacyPushSection.body.innerHTML = `
+      <div class="mpush-field"><div class="mpush-field-inline"><input type="checkbox" data-path="common.autoSendOnLoad"><span>页面打开后自动推送</span></div><small>默认关闭。这个功能不影响浏览记录、AI 分析和用户画像。</small></div>
+      <div class="mpush-row-2">
+        <div class="mpush-field"><div class="mpush-field-label">同URL推送冷却（秒）</div><input type="number" data-path="common.cooldownMs" min="0" max="86400" step="1" data-scale="1000"><small>冷却内不重复推送</small></div>
         <div class="mpush-field"><div class="mpush-field-inline"><input type="checkbox" data-path="common.includeTitle"><span>推送包含标题</span></div></div>
       </div>
-      <div class="mpush-field"><div class="mpush-field-inline"><input type="checkbox" data-path="common.includeUrl"><span>推送包含链接</span></div></div>`;
-
-    // ── Telegram ──
-    const tgSection = makeCollapseSection('✈️ Telegram');
-    tgSection.body.innerHTML = `
+      <div class="mpush-field"><div class="mpush-field-inline"><input type="checkbox" data-path="common.includeUrl"><span>推送包含链接</span></div></div>
       <div class="mpush-field"><div class="mpush-field-inline"><input type="checkbox" data-path="telegram.enabled"><span>启用 Telegram 推送</span></div></div>
-      <div class="mpush-field"><div class="mpush-field-label">Bot Token</div><input type="password" data-path="telegram.botToken" autocomplete="off"></div>
-      <div class="mpush-field"><div class="mpush-field-label">Chat ID</div><input type="text" data-path="telegram.chatId"></div>`;
-
-    // ── 飞书 ──
-    const fsSection = makeCollapseSection('🔗 飞书');
-    fsSection.body.innerHTML = `
+      <div class="mpush-field"><div class="mpush-field-label">Telegram Bot Token</div><input type="password" data-path="telegram.botToken" autocomplete="off"></div>
+      <div class="mpush-field"><div class="mpush-field-label">Telegram Chat ID</div><input type="text" data-path="telegram.chatId"></div>
       <div class="mpush-field"><div class="mpush-field-inline"><input type="checkbox" data-path="feishu.enabled"><span>启用飞书推送</span></div></div>
-      <div class="mpush-field"><div class="mpush-field-label">Webhook URL</div><input type="text" data-path="feishu.webhookUrl"></div>
-      <div class="mpush-field"><div class="mpush-field-label">签名密钥（可选）</div><input type="password" data-path="feishu.secret" autocomplete="off"><small>开启签名校验时填写</small></div>`;
+      <div class="mpush-field"><div class="mpush-field-label">飞书 Webhook URL</div><input type="text" data-path="feishu.webhookUrl"></div>
+      <div class="mpush-field"><div class="mpush-field-label">飞书签名密钥（可选）</div><input type="password" data-path="feishu.secret" autocomplete="off"><small>开启签名校验时填写</small></div>`;
 
     // ── AI API ──
-    const aiSection = makeCollapseSection('🤖 AI API 配置');
+    const aiSection = makeCollapseSection('🤖 共享 AI API 预设');
     aiSection.body.innerHTML = `
+      <div class="mpush-field">
+        <small>和「饺子 AI 网页摘要助手」共用 <code>tabbit-shared/ai-profiles.json</code>。推荐主要在摘要助手里维护 API，这里读取后直接用于浏览记录分析。API Key 会随预设上传到坚果云。</small>
+      </div>
       <div class="mpush-field"><div class="mpush-field-label">预设选择</div><select id="set-profile-select"></select></div>
       <div class="mpush-field"><div class="mpush-field-label">预设名称</div><input type="text" id="set-profile-name" placeholder="如：DeepSeek、OpenAI"></div>
       <div class="mpush-field"><div class="mpush-field-label">API URL</div><input type="text" id="set-api-url" placeholder="https://api.openai.com/v1/chat/completions"></div>
@@ -2193,6 +2267,8 @@ ${lines}`;
         <button class="mpush-btn danger" id="set-profile-delete">🗑️ 删除</button>
         <button class="mpush-btn" id="set-test-api">⚡ 测试</button>
         <button class="mpush-btn" id="set-fetch-models">🔄 获取模型</button>
+        <button class="mpush-btn primary" id="set-profile-cloud-pull">☁️ 从坚果云读取 API 预设</button>
+        <button class="mpush-btn" id="set-profile-cloud-push">⬆️ 上传当前 API 预设到坚果云</button>
       </div>`;
 
     // ── AI 分析提示词 ──
@@ -2441,21 +2517,6 @@ ${lines}`;
     // 初始渲染
     refreshTemplateList();
 
-    // ── 浏览记录 ──
-    const histSection = makeCollapseSection('📦 浏览记录');
-    histSection.body.innerHTML = `
-      <div class="mpush-field"><div class="mpush-field-inline"><input type="checkbox" data-path="history.enabled"><span>开启自动保存</span></div></div>
-      <div class="mpush-row-2">
-        <div class="mpush-field"><div class="mpush-field-label">存储上限（条）</div><input type="number" data-path="history.maxRecords" min="100" max="100000" value="50000"></div>
-        <div class="mpush-field"><div class="mpush-field-label">自动清理（天）</div><input type="number" data-path="history.autoCleanDays" min="0" max="3650" value="180"><small>0=不清理</small></div>
-      </div>
-      <div class="mpush-field"><div class="mpush-field-label">排除域名（每行一个）</div><textarea id="set-exclude-domains" rows="3"></textarea></div>
-      <div class="mpush-field"><div class="mpush-field-label">拉黑网址规则（每行一个）</div><textarea id="set-blacklisted-urls" rows="3"></textarea><small>支持完整网址和通配符 *；历史列表点 🚫 可快速生成规则。</small></div>
-      <div class="mpush-btns">
-        <button class="mpush-btn danger" id="set-history-clear">🗑️ 清理全部</button>
-        <button class="mpush-btn" id="set-history-export">📦 导出</button>
-      </div>`;
-
     // ── 云同步 ──
     const cloudSection = makeCollapseSection('☁️ 坚果云云同步');
     cloudSection.body.innerHTML = `
@@ -2477,12 +2538,10 @@ ${lines}`;
       </div>`;
 
     // 组装面板
-    pane.appendChild(pushSection.container);
-    pane.appendChild(tgSection.container);
-    pane.appendChild(fsSection.container);
+    pane.appendChild(recordSection.container);
     pane.appendChild(aiSection.container);
     pane.appendChild(tplSection.container);
-    pane.appendChild(histSection.container);
+    pane.appendChild(legacyPushSection.container);
     pane.appendChild(cloudSection.container);
 
     // ── 保存按钮（统一保存所有设置）──
@@ -2498,6 +2557,29 @@ ${lines}`;
     pane.querySelector('#set-profile-clone').addEventListener('click', () => { const cur = getCurrentProfile(); const name = prompt('复制为：', cur.name + '（副本）'); if (!name) return; readAllSettingsToConfig(); const cp = clone(cur); cp.id = makeId('prof'); cp.name = name; cfg.profiles.push(cp); cfg.currentProfileId = cp.id; saveConfig(cfg); fillSettingsTab(); });
     pane.querySelector('#set-profile-delete').addEventListener('click', () => { if (cfg.profiles.length <= 1) { alert('至少保留一个预设。'); return; } if (!confirm(`删除「${getCurrentProfile().name}」？`)) return; readAllSettingsToConfig(); const idx = cfg.profiles.findIndex(p => p.id === cfg.currentProfileId); cfg.profiles.splice(idx, 1); cfg.currentProfileId = cfg.profiles[0].id; saveConfig(cfg); fillSettingsTab(); });
     pane.querySelector('#set-test-api').addEventListener('click', async () => { readAllSettingsToConfig(); saveConfig(cfg); if (!checkApiConfig()) return; const btn = pane.querySelector('#set-test-api'); btn.disabled = true; btn.textContent = '测试中…'; try { await callChatApi([{ role: 'user', content: '请只回复 OK' }]); toast('✅ 测试成功'); } catch (err) { alert('❌ 测试失败：\n' + (err.message || err)); } finally { btn.disabled = false; btn.textContent = '⚡ 测试'; } });
+    pane.querySelector('#set-profile-cloud-pull').addEventListener('click', async () => {
+      readAllSettingsToConfig(); saveConfig(cfg);
+      if (!cfg.cloudSync.account || !cfg.cloudSync.appPassword) { alert('请先在“坚果云云同步”里填写账号和密码。'); return; }
+      const btn = pane.querySelector('#set-profile-cloud-pull'); btn.disabled = true; btn.textContent = '读取中…';
+      try {
+        const result = await pullApiProfilesFromCloud();
+        fillSettingsTab();
+        alert(result.hasProfiles ? `✅ 已读取 API 预设，共 ${result.count} 个。` : '云端还没有 API 预设。');
+      } catch (err) { alert('❌ 读取失败：\n' + (err.message || err)); }
+      finally { btn.disabled = false; btn.textContent = '☁️ 从坚果云读取 API 预设'; }
+    });
+    pane.querySelector('#set-profile-cloud-push').addEventListener('click', async () => {
+      readAllSettingsToConfig(); saveConfig(cfg);
+      if (!cfg.cloudSync.account || !cfg.cloudSync.appPassword) { alert('请先在“坚果云云同步”里填写账号和密码。'); return; }
+      if (!confirm('上传当前 API 预设到坚果云？同 ID 预设会以本地为准。')) return;
+      const btn = pane.querySelector('#set-profile-cloud-push'); btn.disabled = true; btn.textContent = '上传中…';
+      try {
+        const result = await pushCurrentApiProfileToCloud();
+        fillSettingsTab();
+        alert(`✅ 已上传 API 预设，共 ${result.count} 个。`);
+      } catch (err) { alert('❌ 上传失败：\n' + (err.message || err)); }
+      finally { btn.disabled = false; btn.textContent = '⬆️ 上传当前 API 预设到坚果云'; }
+    });
     pane.querySelector('#set-fetch-models').addEventListener('click', () => {
       readAllSettingsToConfig(); saveConfig(cfg); const p = getCurrentProfile();
       if (!p.apiUrl || !p.apiKey) { alert('请先填写 API 地址和 Key。'); return; }
@@ -2730,7 +2812,6 @@ ${lines}`;
     checkStorageQuota();
     if (typeof GM_registerMenuCommand === 'function') {
       GM_registerMenuCommand('打开面板', () => { const panel = document.getElementById(UI.panelId); if (panel) { panel.classList.add('show'); cfg = loadConfig(); refreshHistoryTab(); updateBadge(); } });
-      GM_registerMenuCommand('立即推送当前页', () => pushCurrentPage({ force: true, showToast: true }));
       GM_registerMenuCommand('分析未读记录', () => { const panel = document.getElementById(UI.panelId); if (panel) panel.classList.add('show'); switchTab('analysis'); const unread = historyStore.records.filter(r => isUnread(r)); if (unread.length && cfg.profiles?.[0]?.apiKey) runAnalysis(unread, '最近未读记录', 'summary'); else toast(unread.length ? '请先配置 API' : '没有未读记录'); });
     }
     if (typeof requestIdleCallback === 'function') requestIdleCallback(() => cleanExpiredRecords()); else setTimeout(cleanExpiredRecords, 5000);
