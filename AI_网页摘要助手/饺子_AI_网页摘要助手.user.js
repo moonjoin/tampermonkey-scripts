@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         饺子 AI 网页摘要助手
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      2.9.0
+// @version      2.9.1
 // @description  指定网站自动弹出 AI 网页摘要，支持连续对话、多预设、多模板、SPA路由、摘要生图、flomo、坚果云双文件云同步。Shadow DOM 隔离样式。
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
@@ -280,6 +280,12 @@
   }
   function escapeRegExp(text) {
     return String(text || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+  function truncateText(text, maxLen) {
+    const s = String(text || '').trim();
+    const max = Number(maxLen || 0);
+    if (!max || s.length <= max) return s;
+    return s.slice(0, max) + `\n\n（已截断到 ${max} 字符）`;
   }
   function buildApiUrl(apiUrl, endpointPath) {
     const endpoint = String(endpointPath || '').replace(/^\/+/, '');
@@ -599,11 +605,57 @@
       let text = (mainNode.innerText || mainNode.textContent || '').trim();
       text = text.replace(/\n{3,}/g, '\n\n').replace(/[ \t]+/g, ' ');
       const max = Number(config.extractMaxChars || 16000);
-      if (text.length > max) text = text.substring(0, max) + `\n\n（已截断到 ${max} 字符）`;
-      return text;
+      return truncateText(text, max);
     } catch (err) {
       return document.body?.innerText || '';
     }
+  }
+
+  function cleanNodeText(node) {
+    if (!node) return '';
+    const cloned = node.cloneNode(true);
+    cloned.querySelectorAll('script, style, noscript, iframe, svg, nav, header, footer, aside, .ad, .ads').forEach(el => el.remove());
+    return (cloned.innerText || cloned.textContent || '')
+      .replace(/\n{3,}/g, '\n\n')
+      .replace(/[ \t]+/g, ' ')
+      .trim();
+  }
+
+  function getCommentText() {
+    const selectors = [
+      '#comments', '.comments', '.comment-list', '.commentlist', '.comment-area',
+      '.comment-section', '.comment-container', '.comment-content', '.comment',
+      '#replies', '.replies', '.reply-list', '.reply', '.discussion', '.discussions',
+      '[id*="comment" i]', '[class*="comment" i]',
+      '[id*="reply" i]', '[class*="reply" i]',
+      '[id*="discussion" i]', '[class*="discussion" i]',
+      '[data-testid*="comment" i]', '[aria-label*="comment" i]', '[aria-label*="评论"]'
+    ];
+    const candidates = [];
+    selectors.forEach(selector => {
+      try {
+        document.querySelectorAll(selector).forEach(node => {
+          if (
+            node &&
+            node !== document.body &&
+            node !== document.documentElement &&
+            !candidates.includes(node)
+          ) {
+            candidates.push(node);
+          }
+        });
+      } catch (e) {}
+    });
+    const topNodes = candidates.filter(node => !candidates.some(other => other !== node && other.contains(node)));
+    const seen = new Set();
+    const parts = [];
+    topNodes.forEach(node => {
+      const text = cleanNodeText(node);
+      if (text.length < 20 || seen.has(text)) return;
+      seen.add(text);
+      parts.push(text);
+    });
+    return truncateText(parts.join('\n\n---\n\n'), Math.min(Number(config.extractMaxChars || 16000), 12000));
   }
 
   /******************************************************************
@@ -1194,6 +1246,11 @@
       }
       const input = shadowRoot.querySelector('#tabbit-chat-input');
       if (input) input.value = '';
+      const presets = shadowRoot.querySelector('#tabbit-followup-presets');
+      if (presets) {
+        presets.classList.add('tabbit-hidden');
+        presets.innerHTML = '';
+      }
     }
   }
 
@@ -1226,6 +1283,88 @@
     pageContextLoaded = true;
   }
 
+  function isPageTitleQuestion() {
+    const title = String(document.title || '').trim();
+    return /[?？]/.test(title) || /^(为什么|为何|怎么|怎样|如何|是否|是不是|有没有|能不能|该不该|谁|什么|哪|几|多少|吗|如何看待)/.test(title);
+  }
+
+  function buildCommentFollowupPrompt() {
+    const comments = getCommentText();
+    if (!comments) {
+      return '请尝试总结这篇页面的评论区。当前脚本没有抓到明确的评论区文本；如果已有上下文里没有评论或讨论内容，请直接说“没抓到评论区”，不要编造。';
+    }
+    return (
+      '请专门总结这篇页面的评论区，不要重复正文摘要。\n\n' +
+      '请输出：\n' +
+      '1. 评论区主要观点\n' +
+      '2. 支持、反对、补充意见分别是什么\n' +
+      '3. 有没有反复出现的共识或高价值信息\n' +
+      '4. 对我理解正文有什么帮助\n\n' +
+      '==== 评论区文本 ====\n' +
+      comments
+    );
+  }
+
+  function buildTitleFollowupPrompt() {
+    const title = String(document.title || '').trim() || '（无标题）';
+    const questionTitle = isPageTitleQuestion();
+    return (
+      `${questionTitle ? '页面标题本身是一个问题' : '页面标题是'}：${title}\n\n` +
+      '请围绕这个标题继续追问并回答。' +
+      `${questionTitle ? '优先直接回答标题里的问题' : '先提炼这个标题真正想问的核心问题'}，` +
+      '结合页面正文和刚才的总结，用大白话输出：\n' +
+      '1. 直接结论\n' +
+      '2. 关键依据\n' +
+      '3. 还需要警惕的盲点或反例'
+    );
+  }
+
+  function hasCompletedInitialSummary() {
+    const hasInitialPrompt = conversation.some(m =>
+      m.role === 'user' &&
+      m.meta?.hidden &&
+      String(m.content || '').includes('请按以下要求总结当前页面')
+    );
+    const hasFinishedAssistant = conversation.some(m =>
+      m.role === 'assistant' &&
+      !m.meta?.hidden &&
+      !m.meta?.streaming &&
+      String(m.content || '').trim()
+    );
+    return hasInitialPrompt && hasFinishedAssistant;
+  }
+
+  function mapMessagesForApi() {
+    return conversation
+      .filter(m => !m.meta?.streaming)
+      .map(m => ({ role: m.role, content: m.meta?.apiContent || m.content }));
+  }
+
+  function setFollowupPresetsDisabled(disabled) {
+    shadowRoot?.querySelectorAll('.tabbit-followup-btn').forEach(btn => { btn.disabled = disabled; });
+  }
+
+  function renderFollowupPresets() {
+    const root = shadowRoot;
+    if (!root) return;
+    const wrap = root.querySelector('#tabbit-followup-presets');
+    if (!wrap) return;
+    if (!hasCompletedInitialSummary()) {
+      wrap.classList.add('tabbit-hidden');
+      wrap.innerHTML = '';
+      return;
+    }
+    const titleBtnText = isPageTitleQuestion() ? '回答标题问题' : '按标题追问';
+    wrap.classList.remove('tabbit-hidden');
+    wrap.innerHTML = `
+      <button class="tabbit-followup-btn" type="button" data-preset="comments">总结评论区</button>
+      <button class="tabbit-followup-btn" type="button" data-preset="title">${titleBtnText}</button>
+    `;
+    wrap.querySelectorAll('.tabbit-followup-btn').forEach(btn => {
+      btn.addEventListener('click', () => handlePresetFollowup(btn.dataset.preset));
+    });
+  }
+
   function renderConversation() {
     const root = shadowRoot;
     if (!root) return;
@@ -1236,6 +1375,7 @@
       .filter(item => item.m.role !== 'system' && !item.m.meta?.hidden);
     if (!visibleMsgs.length) {
       body.innerHTML = `<p class="tabbit-placeholder">点击「✨ 总结」开始，或在下方输入框直接提问。</p>`;
+      renderFollowupPresets();
       return;
     }
     body.innerHTML = visibleMsgs.map(({ m, index }) => {
@@ -1259,6 +1399,7 @@
       }
     });
     bindMessageImageActions();
+    renderFollowupPresets();
   }
 
   function appendMessage(role, content, meta) {
@@ -1793,6 +1934,25 @@
         padding: 8px 10px 10px;
         background: #fafafa;
       }
+      .tabbit-followup-presets {
+        display: flex;
+        gap: 6px;
+        flex-wrap: wrap;
+        margin-bottom: 7px;
+      }
+      .tabbit-followup-btn {
+        border: 1px solid #d8dce8;
+        background: #fff;
+        color: #374151;
+        border-radius: 999px;
+        padding: 5px 10px;
+        font-size: 12px;
+        cursor: pointer;
+        pointer-events: auto;
+        max-width: 100%;
+      }
+      .tabbit-followup-btn:hover { background: #f1f5ff; border-color: #bfcbff; }
+      .tabbit-followup-btn:disabled { opacity: .5; cursor: not-allowed; }
       .tabbit-input-row {
         display: flex; gap: 6px; align-items: flex-end;
       }
@@ -2516,6 +2676,7 @@
       </div>
 
       <div class="tabbit-input-area">
+        <div id="tabbit-followup-presets" class="tabbit-followup-presets tabbit-hidden"></div>
         <div class="tabbit-input-row">
           <textarea id="tabbit-chat-input" placeholder="追问或自由提问… (Enter 发送 / Shift+Enter 换行)" rows="1"></textarea>
           <button id="tabbit-send-btn" class="tabbit-send-btn">发送</button>
@@ -2981,9 +3142,7 @@
     };
 
     try {
-      const messagesForApi = conversation
-        .filter(m => !m.meta?.streaming)
-        .map(m => ({ role: m.role, content: m.content }));
+      const messagesForApi = mapMessagesForApi();
 
       const finalText = await callChatApi(messagesForApi, (delta, full) => {
         streamingMsg.content = full;
@@ -3052,9 +3211,7 @@
     };
 
     try {
-      const messagesForApi = conversation
-        .filter(m => !m.meta?.streaming)
-        .map(m => ({ role: m.role, content: m.content }));
+      const messagesForApi = mapMessagesForApi();
 
       const finalText = await callChatApi(messagesForApi, (delta, full) => {
         streamingMsg.content = full;
@@ -3086,21 +3243,27 @@
     }
   }
 
-  async function handleSendChat() {
+  async function sendChatText(text, displayText, userMeta) {
     const root = shadowRoot;
     if (!root) return;
     if (!checkApiConfig()) return;
     const input = root.querySelector('#tabbit-chat-input');
     const sendBtn = root.querySelector('#tabbit-send-btn');
-    const text = (input.value || '').trim();
-    if (!text) return;
+    const apiText = String(text || '').trim();
+    const visibleText = String(displayText || apiText).trim();
+    if (!apiText) return;
 
     ensurePageContext();
-    appendMessage('user', text);
-    input.value = '';
-    input.style.height = 'auto';
+    const meta = { ...(userMeta || {}) };
+    if (visibleText !== apiText) meta.apiContent = apiText;
+    appendMessage('user', visibleText, meta);
+    if (input) {
+      input.value = '';
+      input.style.height = 'auto';
+    }
 
-    sendBtn.disabled = true; sendBtn.textContent = '...';
+    if (sendBtn) { sendBtn.disabled = true; sendBtn.textContent = '...'; }
+    setFollowupPresetsDisabled(true);
     setStatus(`AI 思考中（${getCurrentModelDisplayName()}）…`, 'loading');
 
     const streamingMsg = { role: 'assistant', content: '', meta: { model: getCurrentModelDisplayName(), streaming: true } };
@@ -3114,9 +3277,7 @@
     };
 
     try {
-      const messagesForApi = conversation
-        .filter(m => !m.meta?.streaming)
-        .map(m => ({ role: m.role, content: m.content }));
+      const messagesForApi = mapMessagesForApi();
 
       const finalText = await callChatApi(messagesForApi, (delta, full) => {
         streamingMsg.content = full;
@@ -3139,9 +3300,27 @@
       renderConversation();
       setStatus('生成失败', 'error', 2500);
     } finally {
-      sendBtn.disabled = false; sendBtn.textContent = '发送';
-      input.focus();
+      if (sendBtn) { sendBtn.disabled = false; sendBtn.textContent = '发送'; }
+      setFollowupPresetsDisabled(false);
+      input?.focus();
     }
+  }
+
+  async function handlePresetFollowup(preset) {
+    if (preset === 'comments') {
+      return sendChatText(buildCommentFollowupPrompt(), '总结评论区');
+    }
+    if (preset === 'title') {
+      const title = String(document.title || '').replace(/\s+/g, ' ').trim();
+      const shortTitle = title.length > 80 ? title.slice(0, 80) + '...' : title;
+      const label = isPageTitleQuestion() ? '回答标题问题' : '按标题追问';
+      return sendChatText(buildTitleFollowupPrompt(), `${label}：${shortTitle || '当前页面标题'}`);
+    }
+  }
+
+  async function handleSendChat() {
+    const input = shadowRoot?.querySelector('#tabbit-chat-input');
+    return sendChatText(input?.value || '');
   }
 
   /******************************************************************
