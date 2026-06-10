@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站省流助手 - 字幕AI摘要 Pro
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      4.2.2
+// @version      4.3.0
 // @description  自动提取B站视频字幕，通过自定义AI API生成极简摘要，支持模型切换、持续对话和评论区总结；支持自动解析开关、自动获取模型列表、flomo自动加标签，新增总结生图功能；v3.9.0 新增html PPT模式；v4.0.0 新增新手引导和API兜底功能（无API时仍可下载字幕、一键复制提示词+字幕到其他AI）
 // @author       次元饺子
 // @match        https://www.bilibili.com/video/*
@@ -914,7 +914,8 @@
     commentLimit: 188,
     commentMinDelay: 1800,
     commentMaxDelay: 3800,
-    autoSubmitCommentSummary: false
+    autoSubmitCommentSummary: false,
+    enableAutoDownloadSubtitle: false
   };
 
   const SUMMARY_LENGTH_ERROR_MESSAGE = 'AI 输出被截断：finish_reason=length。请在设置中调大「普通摘要最大输出 tokens」，或换支持更大输出上限的模型/API。';
@@ -7358,6 +7359,16 @@
                 <input class="tabbit-settings-input" id="ts-skipDuration" type="number" min="0" value="${CONFIG.skipDuration || 60}" placeholder="60" />
                 <div class="tabbit-settings-hint">视频时长低于此秒数时自动跳过字幕获取，设为 0 则不跳过</div>
               </div>
+              <div class="tabbit-switch-row" style="padding:10px 12px;background:#f0f8ff;border:1px solid #d6e0ff;border-radius:8px;">
+                <div>
+                  <div class="tabbit-settings-label">💾 获取字幕后自动下载</div>
+                  <div class="tabbit-settings-hint" style="margin-top:2px;">开启后，字幕获取成功时自动下载 .txt 文件到本地。不影响AI摘要流程。</div>
+                </div>
+                <label class="tabbit-switch">
+                  <input type="checkbox" id="ts-enableAutoDownloadSubtitle" ${CONFIG.enableAutoDownloadSubtitle ? 'checked' : ''} />
+                  <span class="tabbit-slider"></span>
+                </label>
+              </div>
               <div class="tabbit-settings-group">
                 <div class="tabbit-settings-label">📍 位置和尺寸</div>
                 <button class="tabbit-settings-btn tabbit-settings-btn-secondary" id="ts-reset-pos">重置面板/悬浮窗位置和尺寸</button>
@@ -7767,6 +7778,7 @@
         if (activeFP) CONFIG.fullAnalysisPromptText = activeFP.prompt;
       }
       CONFIG.autoSubmitCommentSummary = overlay.querySelector('#ts-autoSubmitCommentSummary').checked;
+      CONFIG.enableAutoDownloadSubtitle = overlay.querySelector('#ts-enableAutoDownloadSubtitle').checked;
       const newCommentMaxPages = parseInt(overlay.querySelector('#ts-commentMaxPages').value, 10);
       CONFIG.commentMaxPages = isNaN(newCommentMaxPages) ? 8 : Math.max(1, Math.min(20, newCommentMaxPages));
       const newCommentLimit = parseInt(overlay.querySelector('#ts-commentLimit').value, 10);
@@ -7875,6 +7887,10 @@
               var autoSubmitEl = overlay.querySelector('#ts-autoSubmitCommentSummary');
               if (autoSubmitEl) autoSubmitEl.checked = !!imported.autoSubmitCommentSummary;
             }
+            if (imported.enableAutoDownloadSubtitle !== undefined) {
+              var autoDlSubEl = overlay.querySelector('#ts-enableAutoDownloadSubtitle');
+              if (autoDlSubEl) autoDlSubEl.checked = !!imported.enableAutoDownloadSubtitle;
+            }
             if (imported.danmakuPromptText !== undefined) overlay.querySelector('#ts-danmakuPromptText').value = imported.danmakuPromptText;
             if (imported.fullDataMaxChars !== undefined) { var fdcEl = overlay.querySelector('#ts-fullDataMaxChars'); if (fdcEl) fdcEl.value = imported.fullDataMaxChars; }
             if (Array.isArray(imported.fullAnalysisPresets) && imported.fullAnalysisPresets.length > 0) {
@@ -7962,6 +7978,7 @@
       overlay.querySelector('#ts-commentTextPresets').value = DEFAULT_CONFIG.commentTextPresets.join('\n');
       CONFIG.autoSubmitCommentSummary = false;
       var autoSubmitReset = overlay.querySelector('#ts-autoSubmitCommentSummary'); if (autoSubmitReset) autoSubmitReset.checked = false;
+      var autoDlSubReset = overlay.querySelector('#ts-enableAutoDownloadSubtitle'); if (autoDlSubReset) autoDlSubReset.checked = false;
       overlay.querySelector('#ts-commentMaxPages').value = DEFAULT_CONFIG.commentMaxPages;
       overlay.querySelector('#ts-commentLimit').value = DEFAULT_CONFIG.commentLimit;
       overlay.querySelector('#ts-commentMinDelay').value = DEFAULT_CONFIG.commentMinDelay;
@@ -8287,6 +8304,33 @@
       rawTranscript = fetchResult;
       console.log('[省流助手] 字幕获取完成');
       if (isStaleRoute(parsingGeneration)) return;
+
+      // 🆕 字幕获取成功后立即显示下载按钮（不等AI解析完）
+      if (panel && videoInfo) {
+        var contentDivForDL = panel.querySelector('.tabbit-panel-content');
+        if (contentDivForDL) {
+          var resultActionsForDL = contentDivForDL.querySelector('.tabbit-result-actions');
+          if (resultActionsForDL) {
+            var dlBtnEarly = document.createElement('button');
+            dlBtnEarly.className = 'tabbit-download-btn';
+            dlBtnEarly.textContent = '💾 下载字幕';
+            dlBtnEarly.addEventListener('click', function() {
+              downloadTranscript(rawTranscript, videoInfo.title, videoInfo.upName, videoInfo.bvid);
+            });
+            resultActionsForDL.appendChild(dlBtnEarly);
+          }
+        }
+        // 🆕 自动下载字幕
+        if (CONFIG.enableAutoDownloadSubtitle) {
+          try {
+            downloadTranscript(fetchResult, videoInfo.title, videoInfo.upName, videoInfo.bvid);
+            console.log('[省流助手] 已自动下载字幕');
+          } catch(e) {
+            console.warn('[省流助手] 自动下载字幕失败:', e.message);
+          }
+        }
+      }
+
       await runSummary(panel, fetchResult, videoInfo);
     } catch (err) {
       if (overallTimer) {
