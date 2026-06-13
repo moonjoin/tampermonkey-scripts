@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站省流助手 - 字幕AI摘要 Pro
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      4.3.0
+// @version      4.3.1
 // @description  自动提取B站视频字幕，通过自定义AI API生成极简摘要，支持模型切换、持续对话和评论区总结；支持自动解析开关、自动获取模型列表、flomo自动加标签，新增总结生图功能；v3.9.0 新增html PPT模式；v4.0.0 新增新手引导和API兜底功能（无API时仍可下载字幕、一键复制提示词+字幕到其他AI）
 // @author       次元饺子
 // @match        https://www.bilibili.com/video/*
@@ -844,6 +844,12 @@
       name: '行动清单版',
       icon: '✅',
       prompt: '请把视频内容转化为可执行的行动清单：\n1. 【核心收获】用一句话说清视频教了什么\n2. 【具体步骤】列出可立即执行的步骤（带数字编号）\n3. 【注意事项】容易踩的坑\n4. 【适用场景】什么情况下用得上\n5. 【预期效果】照做能达到什么\n保持简洁，重在可操作性。'
+    },
+    {
+      id: 'preset_timeline',
+      name: '时间轴定位版',
+      icon: '🕒',
+      prompt: '请基于带时间范围的字幕内容做一份“可定位”的视频摘要，方便我后续追问时快速跳到具体片段。按下面格式直接输出：\n1. 【一句话结论】这个视频核心在讲什么\n2. 【时间轴速览】列出 5-10 个关键片段，每条必须带输入里已有的 [开始-结束] 时间范围，再写这一段讲了什么\n3. 【重点结论】提炼 3-5 个最重要的信息点\n4. 【值得追问】列出 3 个适合继续追问的片段，也必须带输入里已有的 [开始-结束] 时间范围\n\n硬性要求：\n- 只能引用输入里已经出现的时间范围，禁止猜测、补写或改写时间。\n- 如果某个内容无法定位到明确时间范围，就直接写“未定位到明确时间范围”。\n- 不要空谈，不要寒暄，不要复述这些规则，直接开始输出。'
     }
   ];
 
@@ -921,17 +927,33 @@
   const SUMMARY_LENGTH_ERROR_MESSAGE = 'AI 输出被截断：finish_reason=length。请在设置中调大「普通摘要最大输出 tokens」，或换支持更大输出上限的模型/API。';
   const HTML_PPT_LENGTH_ERROR_MESSAGE = 'AI 输出被截断：finish_reason=length。请调大 HTML PPT 最大输出 tokens，或换支持更大输出上限的模型/API。';
 
+  function mergeBuiltInPromptPresets(presets) {
+    var savedPresets = Array.isArray(presets) ? presets : [];
+    var merged = savedPresets.slice();
+    for (var i = 0; i < DEFAULT_PRESETS.length; i++) {
+      var builtin = DEFAULT_PRESETS[i];
+      if (!merged.some(function(p) { return p && p.id === builtin.id; })) {
+        merged.push(JSON.parse(JSON.stringify(builtin)));
+      }
+    }
+    return merged;
+  }
+
   function loadConfig() {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
       if (raw) {
         const saved = JSON.parse(raw);
-        return Object.assign({}, DEFAULT_CONFIG, saved);
+        const merged = Object.assign({}, DEFAULT_CONFIG, saved);
+        merged.promptPresets = mergeBuiltInPromptPresets(merged.promptPresets);
+        return merged;
       }
     } catch(e) {
       console.warn('[省流助手] 读取配置失败，使用默认配置:', e.message);
     }
-    return Object.assign({}, DEFAULT_CONFIG);
+    return Object.assign({}, DEFAULT_CONFIG, {
+      promptPresets: mergeBuiltInPromptPresets(DEFAULT_CONFIG.promptPresets)
+    });
   }
 
   function saveConfig(cfg) {
@@ -1008,7 +1030,7 @@
   function buildSummaryCacheKey(videoInfo, model, presetId, promptText, transcript) {
     const bvid = videoInfo?.bvid || location.pathname;
     return [
-      'v1',
+      'v2',
       bvid,
       model || '',
       presetId || '',
@@ -1079,12 +1101,16 @@
   /**
    * 构建完整的"提示词+视频信息+字幕"文本，供用户一键复制到其他AI app
    */
-  function buildPromptWithTranscript(videoInfo, transcript) {
+  function buildPromptWithTranscript(videoInfo, transcript, subtitleBody) {
     var activePresetId = getCurrentPresetId();
     var activePreset = (CONFIG.promptPresets || []).find(function(p) { return p.id === activePresetId; });
     var activePrompt = (activePreset && activePreset.prompt) || CONFIG.promptText || PROMPT_TEXT;
     var videoDesc = limitText(videoInfo.desc || '', 1500);
     var pageUrl = window.location.href;
+    var aiTranscript = buildAiTranscript(subtitleBody, transcript);
+    var subtitleTitle = subtitleBody && subtitleBody.length > 0
+      ? '===== 📄 字幕内容（带时间轴） ====='
+      : '===== 📄 字幕内容 =====';
 
     var parts = [];
     parts.push('===== 📝 AI 提示词 =====');
@@ -1098,8 +1124,11 @@
       parts.push('视频简介: ' + videoDesc);
     }
     parts.push('');
-    parts.push('===== 📄 字幕内容 =====');
-    parts.push(transcript);
+    parts.push(subtitleTitle);
+    if (subtitleBody && subtitleBody.length > 0) {
+      parts.push('说明：下方先给出字幕覆盖范围总览，再给出每个片段的 [开始-结束] 时间范围。回答涉及具体片段时，请尽量带上对应时间范围。');
+    }
+    parts.push(aiTranscript);
     parts.push('');
     parts.push('===== 💡 使用说明 =====');
     parts.push('请将以上全部内容复制粘贴到任意 AI 对话（如 ChatGPT、DeepSeek、Kimi 等），即可生成视频摘要。');
@@ -1112,6 +1141,7 @@
   function showApiNotConfiguredFallback(contentDiv, videoInfo, reason) {
     var apiCheck = reason || isApiConfigured().reason;
     var actionsDiv = contentDiv.querySelector('.tabbit-result-actions');
+    var hasSrt = hasStructuredSubtitleData(rawSubtitleBody);
 
     var fallbackHtml =
       '<div style="background:linear-gradient(135deg,#fff3e0 0%,#fff8e1 100%);border:1px solid #ffe0b2;border-radius:10px;padding:14px;margin-bottom:10px;">' +
@@ -1125,6 +1155,7 @@
         '<div style="display:flex;gap:8px;flex-wrap:wrap;">' +
           '<button class="tabbit-copy-btn" id="tabbit-copy-prompt-transcript" style="background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:white;border:none;font-weight:600;">📋 一键复制 提示词+字幕</button>' +
           '<button class="tabbit-download-btn" id="tabbit-download-transcript-fallback">💾 下载字幕文件</button>' +
+          (hasSrt ? '<button class="tabbit-download-btn" id="tabbit-download-srt-fallback">🕒 下载 SRT</button>' : '') +
         '</div>' +
         '<div style="font-size:11px;color:#999;margin-top:8px;">💡 复制后打开 ChatGPT / DeepSeek / Kimi 等任意 AI，粘贴发送即可获得视频摘要</div>' +
       '</div>' +
@@ -1137,6 +1168,7 @@
 
     if (actionsDiv) {
       actionsDiv.innerHTML = '';
+      appendSubtitleDownloadButtons(actionsDiv, videoInfo);
       var modelTag = document.createElement('span');
       modelTag.style.cssText = 'font-size:11px;color:#999;margin-left:auto;';
       modelTag.textContent = '📌 v4.0 兜底模式';
@@ -1147,7 +1179,7 @@
     var copyBtn = contentDiv.querySelector('#tabbit-copy-prompt-transcript');
     if (copyBtn) {
       copyBtn.addEventListener('click', function() {
-        var promptText = buildPromptWithTranscript(videoInfo, rawTranscript);
+        var promptText = buildPromptWithTranscript(videoInfo, rawTranscript, rawSubtitleBody);
         copyToClipboard(promptText).then(function() {
           copyBtn.textContent = '✅ 已复制！去 AI 粘贴吧';
           copyBtn.style.background = 'linear-gradient(135deg,#43a047 0%,#2e7d32 100%)';
@@ -1159,11 +1191,20 @@
       });
     }
 
-    // 绑定下载字幕按钮
     var downloadBtn = contentDiv.querySelector('#tabbit-download-transcript-fallback');
     if (downloadBtn) {
       downloadBtn.addEventListener('click', function() {
         downloadTranscript(rawTranscript, videoInfo.title, videoInfo.upName, videoInfo.bvid);
+      });
+    }
+
+    var downloadSrtBtn = contentDiv.querySelector('#tabbit-download-srt-fallback');
+    if (downloadSrtBtn) {
+      downloadSrtBtn.addEventListener('click', function() {
+        var ok = downloadSubtitleSrt(rawSubtitleBody, videoInfo.title, videoInfo.upName, videoInfo.bvid);
+        if (!ok) {
+          alert('当前没有可导出的时间轴字幕');
+        }
       });
     }
 
@@ -1792,7 +1833,7 @@
       const res = await fetchWithTimeout(url, { signal: signal }, BILI_SUBTITLE_TIMEOUT_MS);
       if (!res.ok) throw new Error('HTTP ' + res.status);
       const data = await res.json();
-      return data.body || [];
+      return normalizeSubtitleSegments(data);
     } catch(e) {
       if (isAbortError(e)) throw e;
       console.log('[省流助手] 字幕内容获取失败:', e.message);
@@ -1800,11 +1841,266 @@
     }
   }
 
+  function normalizeSubtitleSegments(source) {
+    var list = Array.isArray(source) ? source : (source && Array.isArray(source.body) ? source.body : []);
+    var segments = [];
+    for (var i = 0; i < list.length; i++) {
+      var seg = list[i];
+      if (!seg || typeof seg !== 'object') continue;
+      var from = Number(seg.from != null ? seg.from : (seg.start_time != null ? seg.start_time : (seg.start != null ? seg.start : seg.st)));
+      if (!isFinite(from)) from = 0;
+      var to = Number(seg.to != null ? seg.to : (seg.end_time != null ? seg.end_time : (seg.end != null ? seg.end : null)));
+      if (!isFinite(to)) {
+        var duration = Number(seg.d);
+        to = from + (isFinite(duration) && duration > 0 ? duration : 2);
+      }
+      if (to < from) to = from;
+      var text = (seg.content || seg.text || seg.sentence || seg.t || seg.c || '').toString().replace(/\s+/g, ' ').trim();
+      if (!text) continue;
+      segments.push({ from: from, to: to, text: text });
+    }
+    segments.sort(function(a, b) {
+      if (a.from !== b.from) return a.from - b.from;
+      return a.to - b.to;
+    });
+    return segments;
+  }
+
   function formatTranscript(subtitles) {
     if (!subtitles || subtitles.length === 0) return '';
-    return subtitles.map(item => item.content || item.text || '')
+    return subtitles.map(function(item) { return item.content || item.text || item.sentence || item.t || item.c || ''; })
       .filter(text => text.trim())
       .join('\n');
+  }
+
+  function formatTimelineRange(from, to) {
+    var startLabel = formatTimelineTimestamp(from);
+    var endLabel = formatTimelineTimestamp(to);
+    if (!isFinite(Number(to)) || Number(to) <= Number(from) || startLabel === endLabel) {
+      return startLabel;
+    }
+    return startLabel + '-' + endLabel;
+  }
+
+  function formatTimelineTimestamp(sec) {
+    var totalSeconds = Math.max(0, Math.floor(Number(sec) || 0));
+    var hours = Math.floor(totalSeconds / 3600);
+    var minutes = Math.floor((totalSeconds % 3600) / 60);
+    var seconds = totalSeconds % 60;
+    if (hours > 0) {
+      return hours + ':' + String(minutes).padStart(2, '0') + ':' + String(seconds).padStart(2, '0');
+    }
+    return minutes + ':' + String(seconds).padStart(2, '0');
+  }
+
+  function buildSubtitleBlocks(subtitles, options) {
+    var segments = normalizeSubtitleSegments(subtitles);
+    if (!segments.length) return [];
+    options = options || {};
+    var pauseBreakSec = Number(options.pauseBreakSec);
+    if (!isFinite(pauseBreakSec) || pauseBreakSec < 0) pauseBreakSec = 1.2;
+    var maxChars = Number(options.maxChars);
+    if (!isFinite(maxChars) || maxChars < 20) maxChars = 110;
+
+    var blocks = [];
+    var current = {
+      from: segments[0].from,
+      to: segments[0].to,
+      text: segments[0].text
+    };
+    for (var i = 1; i < segments.length; i++) {
+      var seg = segments[i];
+      var gap = seg.from - current.to;
+      var mergedText = current.text + ' ' + seg.text;
+      if (gap <= pauseBreakSec && mergedText.length <= maxChars) {
+        current.to = Math.max(current.to, seg.to);
+        current.text = mergedText;
+      } else {
+        blocks.push(current);
+        current = {
+          from: seg.from,
+          to: seg.to,
+          text: seg.text
+        };
+      }
+    }
+    blocks.push(current);
+    return blocks;
+  }
+
+  function buildSubtitleTimelineMeta(subtitles) {
+    var segments = normalizeSubtitleSegments(subtitles);
+    if (!segments.length) return null;
+    var first = segments[0];
+    var last = segments[segments.length - 1];
+    var start = Number(first.from) || 0;
+    var end = Number(last.to != null ? last.to : last.from) || start;
+    if (end < start) end = start;
+    return {
+      start: start,
+      end: end,
+      segmentCount: segments.length,
+      blockCount: buildSubtitleBlocks(segments).length
+    };
+  }
+
+  function formatTranscriptWithTimeline(subtitles) {
+    var blocks = buildSubtitleBlocks(subtitles);
+    if (!blocks.length) return '';
+    return blocks.map(function(block) {
+      return '[' + formatTimelineRange(block.from, block.to) + '] ' + block.text;
+    }).join('\n');
+  }
+
+  function buildAiTranscript(subtitleBody, fallbackTranscript) {
+    var timelineTranscript = formatTranscriptWithTimeline(subtitleBody);
+    if (timelineTranscript) {
+      var meta = buildSubtitleTimelineMeta(subtitleBody);
+      if (meta) {
+        return [
+          '【字幕时间范围总览】',
+          '字幕覆盖范围: [' + formatTimelineRange(meta.start, meta.end) + ']',
+          '字幕段数: ' + meta.segmentCount,
+          '整理后时间块: ' + meta.blockCount,
+          '',
+          '【按时间范围整理的字幕】',
+          timelineTranscript
+        ].join('\n');
+      }
+      return timelineTranscript;
+    }
+    return fallbackTranscript || '';
+  }
+
+  function normalizeSubtitleSearchText(text) {
+    return String(text || '').toLowerCase().replace(/[^0-9a-z\u4e00-\u9fa5]+/g, '');
+  }
+
+  function extractSubtitleSearchTerms(text) {
+    var raw = String(text || '').toLowerCase();
+    var matches = raw.match(/[0-9a-z\u4e00-\u9fa5]{2,}/g) || [];
+    var terms = [];
+    var seen = {};
+    var compact = normalizeSubtitleSearchText(raw);
+    if (compact.length >= 2 && compact.length <= 48) {
+      seen[compact] = true;
+      terms.push(compact);
+    }
+    for (var i = 0; i < matches.length; i++) {
+      var term = normalizeSubtitleSearchText(matches[i]);
+      if (term.length < 2 || seen[term]) continue;
+      seen[term] = true;
+      terms.push(term);
+    }
+    return terms.slice(0, 12);
+  }
+
+  function buildSubtitleSearchBigrams(text) {
+    var compact = normalizeSubtitleSearchText(text);
+    var bigrams = [];
+    var seen = {};
+    for (var i = 0; i < compact.length - 1; i++) {
+      var gram = compact.slice(i, i + 2);
+      if (!seen[gram]) {
+        seen[gram] = true;
+        bigrams.push(gram);
+      }
+    }
+    return bigrams;
+  }
+
+  function scoreSubtitleSegmentForQuery(segmentText, compactQuery, terms, bigrams) {
+    var hay = normalizeSubtitleSearchText(segmentText);
+    if (!hay) return 0;
+    var score = 0;
+    if (compactQuery && compactQuery.length >= 2 && hay.indexOf(compactQuery) !== -1) {
+      score += 200 + Math.min(80, compactQuery.length * 2);
+    }
+    for (var i = 0; i < terms.length; i++) {
+      var term = terms[i];
+      if (hay.indexOf(term) !== -1) {
+        score += Math.min(60, term.length * 8);
+      }
+    }
+    for (var j = 0; j < bigrams.length; j++) {
+      if (hay.indexOf(bigrams[j]) !== -1) {
+        score += 3;
+      }
+    }
+    return score;
+  }
+
+  function buildSubtitleLocatorContext(question, subtitles) {
+    var segments = normalizeSubtitleSegments(subtitles);
+    if (!segments.length) return '';
+    var compactQuery = normalizeSubtitleSearchText(question);
+    var terms = extractSubtitleSearchTerms(question);
+    var bigrams = buildSubtitleSearchBigrams(question);
+    var meta = buildSubtitleTimelineMeta(segments);
+    var scored = [];
+    for (var i = 0; i < segments.length; i++) {
+      var score = scoreSubtitleSegmentForQuery(segments[i].text, compactQuery, terms, bigrams);
+      if (score > 0) {
+        scored.push({ idx: i, score: score });
+      }
+    }
+    if (!scored.length) return '';
+
+    scored.sort(function(a, b) {
+      if (b.score !== a.score) return b.score - a.score;
+      return a.idx - b.idx;
+    });
+
+    var selected = [];
+    for (var j = 0; j < scored.length && selected.length < 6; j++) {
+      var item = scored[j];
+      var tooClose = selected.some(function(existing) {
+        return Math.abs(existing.idx - item.idx) <= 1;
+      });
+      if (!tooClose) {
+        selected.push(item);
+      }
+    }
+    if (!selected.length) return '';
+
+    var windows = selected.map(function(item) {
+      return {
+        start: Math.max(0, item.idx - 1),
+        end: Math.min(segments.length - 1, item.idx + 1)
+      };
+    }).sort(function(a, b) {
+      return a.start - b.start;
+    });
+
+    var merged = [];
+    for (var k = 0; k < windows.length; k++) {
+      var current = windows[k];
+      var last = merged[merged.length - 1];
+      if (last && current.start <= last.end + 1) {
+        last.end = Math.max(last.end, current.end);
+      } else {
+        merged.push({ start: current.start, end: current.end });
+      }
+    }
+
+    var lines = [];
+    lines.push('【字幕定位参考】');
+    lines.push('以下是和当前问题最相关的原始字幕片段。回答定位问题时，只能引用这里已经出现的时间范围。');
+    if (meta) {
+      lines.push('当前字幕覆盖范围: [' + formatTimelineRange(meta.start, meta.end) + ']');
+    }
+    for (var m = 0; m < merged.length; m++) {
+      var windowItem = merged[m];
+      var startSeg = segments[windowItem.start];
+      var endSeg = segments[windowItem.end];
+      lines.push('');
+      lines.push('片段' + (m + 1) + ' [' + formatTimelineRange(startSeg.from, endSeg.to) + ']');
+      for (var n = windowItem.start; n <= windowItem.end; n++) {
+        var seg = segments[n];
+        lines.push('[' + formatTimelineRange(seg.from, seg.to) + '] ' + seg.text);
+      }
+    }
+    return lines.join('\n');
   }
 
   function sanitizeFilename(str) {
@@ -1830,6 +2126,70 @@
     const filename = safeUpName + '__' + safeTitle + '__' + safeBvid + '.txt';
     triggerDownload(text, filename, 'text/plain;charset=utf-8');
     console.log('[省流助手] 已下载字幕: ' + filename);
+  }
+
+  function toSrtTimestamp(sec) {
+    var seconds = Math.max(0, Number(sec) || 0);
+    var totalMs = Math.floor(seconds * 1000);
+    var hours = Math.floor(totalMs / 3600000);
+    var minutes = Math.floor((totalMs % 3600000) / 60000);
+    var secs = Math.floor((totalMs % 60000) / 1000);
+    var ms = totalMs % 1000;
+    return String(hours).padStart(2, '0') + ':'
+      + String(minutes).padStart(2, '0') + ':'
+      + String(secs).padStart(2, '0') + ','
+      + String(ms).padStart(3, '0');
+  }
+
+  function buildSrtContent(subtitles) {
+    var segments = normalizeSubtitleSegments(subtitles);
+    if (!segments.length) return '';
+    return segments.map(function(seg, idx) {
+      return String(idx + 1)
+        + '\n' + toSrtTimestamp(seg.from) + ' --> ' + toSrtTimestamp(seg.to)
+        + '\n' + seg.text;
+    }).join('\n\n');
+  }
+
+  function downloadSubtitleSrt(subtitles, title, upName, bvid) {
+    var srt = buildSrtContent(subtitles);
+    if (!srt) return false;
+    const safeTitle = sanitizeFilename(title) || '未知标题';
+    const safeUpName = sanitizeFilename(upName) || '未知UP主';
+    const safeBvid = bvid || '未知BV号';
+    const filename = safeUpName + '__' + safeTitle + '__' + safeBvid + '.srt';
+    triggerDownload(srt, filename, 'text/plain;charset=utf-8');
+    console.log('[省流助手] 已下载 SRT: ' + filename);
+    return true;
+  }
+
+  function hasStructuredSubtitleData(subtitles) {
+    return normalizeSubtitleSegments(subtitles).length > 0;
+  }
+
+  function appendSubtitleDownloadButtons(container, videoInfo) {
+    if (!container || !videoInfo) return;
+    var downloadBtn = document.createElement('button');
+    downloadBtn.className = 'tabbit-download-btn';
+    downloadBtn.textContent = '💾 下载字幕';
+    downloadBtn.addEventListener('click', function() {
+      downloadTranscript(rawTranscript, videoInfo.title, videoInfo.upName, videoInfo.bvid);
+    });
+    container.appendChild(downloadBtn);
+
+    if (hasStructuredSubtitleData(rawSubtitleBody)) {
+      var srtBtn = document.createElement('button');
+      srtBtn.className = 'tabbit-download-btn';
+      srtBtn.textContent = '🕒 下载 SRT';
+      srtBtn.title = '导出当前拿到的原始时间轴字幕';
+      srtBtn.addEventListener('click', function() {
+        var ok = downloadSubtitleSrt(rawSubtitleBody, videoInfo.title, videoInfo.upName, videoInfo.bvid);
+        if (!ok) {
+          alert('当前没有可导出的时间轴字幕');
+        }
+      });
+      container.appendChild(srtBtn);
+    }
   }
 
   function downloadGeneratedImage(imageDataUrl, videoInfo, suffix) {
@@ -2484,13 +2844,17 @@
     if (!subtitleBody || subtitleBody.length === 0) {
       return [];
     }
+    var subtitleBlocks = buildSubtitleBlocks(subtitleBody);
+    if (!subtitleBlocks.length) {
+      return [];
+    }
     var sortedDanmaku = danmaku.slice().sort(function(a, b) { return a.time - b.time; });
     var segments = [];
-    for (var i = 0; i < subtitleBody.length; i++) {
-      var seg = subtitleBody[i];
+    for (var i = 0; i < subtitleBlocks.length; i++) {
+      var seg = subtitleBlocks[i];
       var from = seg.from || 0;
-      var to = seg.to || (from + 3);
-      var text = seg.content || seg.text || '';
+      var to = seg.to || from;
+      var text = seg.text || '';
       if (!text.trim()) continue;
 
       var matchedDanmaku = [];
@@ -2501,23 +2865,21 @@
         matchedDanmaku.push(d.text);
       }
 
-      var timeLabel = timeFormatAlign(from);
-      var entry = { time: from, label: timeLabel, subtitle: text, danmaku: matchedDanmaku };
+      var timeLabel = formatTimelineRange(from, to);
+      var entry = { time: from, from: from, to: to, label: timeLabel, subtitle: text, danmaku: matchedDanmaku };
       segments.push(entry);
     }
     return segments;
   }
 
   function timeFormatAlign(sec) {
-    var m = Math.floor(sec / 60);
-    var s = Math.floor(sec % 60);
-    return m + ':' + (s < 10 ? '0' : '') + s;
+    return formatTimelineTimestamp(sec);
   }
 
   // 全面分析数据量上限（字符），超限时才开始截断
   var FULL_DATA_MAX_CHARS_DEFAULT = 64000;
 
-  function formatFullData(videoInfo, subtitleBody, danmaku, comments) {
+  function formatFullData(videoInfo, subtitleBody, danmaku, comments, fallbackTranscript) {
     var lines = [];
     lines.push('【视频信息】');
     lines.push('标题: ' + (videoInfo.title || ''));
@@ -2530,7 +2892,7 @@
     if (subtitleBody && subtitleBody.length > 0) {
       var aligned = alignTimeline(subtitleBody, danmaku);
       lines.push('【字幕 + 弹幕时间轴对齐】');
-      lines.push('（字幕' + subtitleBody.length + '句，弹幕' + (danmaku ? danmaku.length : 0) + '条）');
+      lines.push('（字幕' + subtitleBody.length + '句，整理为' + aligned.length + '个时间块，弹幕' + (danmaku ? danmaku.length : 0) + '条）');
       lines.push('');
       for (var i = 0; i < aligned.length; i++) {
         var seg = aligned[i];
@@ -2541,6 +2903,11 @@
           }
         }
       }
+    } else if (fallbackTranscript && fallbackTranscript.trim()) {
+      lines.push('【字幕文本】');
+      lines.push('（该字幕不含结构化时间轴，以下为纯文本）');
+      lines.push('');
+      lines.push(fallbackTranscript.trim());
     } else if (danmaku && danmaku.length > 0) {
       lines.push('【字幕】');
       lines.push('（该视频无字幕）');
@@ -4131,7 +4498,7 @@
         rawCommentsChatContext = '';
         rawFullDataChatContext = '';
         if (rawTranscript) {
-          await runSummary(panel, rawTranscript, currentVideoInfo);
+          await runSummary(panel, rawTranscript, currentVideoInfo, rawSubtitleBody);
         } else {
           showNoSubtitleState(panel, currentVideoInfo);
         }
@@ -5034,15 +5401,9 @@
       editBtn.className = 'tabbit-copy-btn';
       editBtn.textContent = '✏️ 编辑摘要';
       editBtn.addEventListener('click', function() { startSummaryEdit(contentDiv, result); });
-      const downloadBtn = document.createElement('button');
-      downloadBtn.className = 'tabbit-download-btn';
-      downloadBtn.textContent = '💾 下载字幕';
-      downloadBtn.addEventListener('click', function() {
-        downloadTranscript(rawTranscript, videoInfo.title, videoInfo.upName, videoInfo.bvid);
-      });
-      const modelTag = document.createElement('span');
-      modelTag.style.cssText = 'font-size:11px;color:#999;margin-left:auto;';
-      modelTag.textContent = '🤖 ' + currentModel;
+        const modelTag = document.createElement('span');
+        modelTag.style.cssText = 'font-size:11px;color:#999;margin-left:auto;';
+        modelTag.textContent = '🤖 ' + currentModel;
       const flomoBtn = document.createElement('button');
       flomoBtn.className = 'tabbit-copy-btn';
       flomoBtn.textContent = '发送 FLOMO';
@@ -5080,13 +5441,13 @@
       actionsDiv.appendChild(editBtn);
       actionsDiv.appendChild(genImgBtn);
       actionsDiv.appendChild(copyImagePromptBtn);
-      actionsDiv.appendChild(commentPostBtn);
-      actionsDiv.appendChild(htmlPptBtn);
-      actionsDiv.appendChild(flomoBtn);
-      actionsDiv.appendChild(downloadBtn);
-      actionsDiv.appendChild(editStatus);
-      actionsDiv.appendChild(modelTag);
-    }
+        actionsDiv.appendChild(commentPostBtn);
+        actionsDiv.appendChild(htmlPptBtn);
+        actionsDiv.appendChild(flomoBtn);
+        appendSubtitleDownloadButtons(actionsDiv, videoInfo);
+        actionsDiv.appendChild(editStatus);
+        actionsDiv.appendChild(modelTag);
+      }
   }
 
   // ==================== 无字幕状态展示 ====================
@@ -5184,36 +5545,58 @@
     }
   }
   // ==================== 手动上传字幕 ====================
-  // 解析 SRT 字幕文件，提取纯文本
-  function parseSrtContent(srtText) {
-    if (!srtText) return '';
-    const lines = srtText.split(/\r?\n/);
-    const textLines = [];
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i].trim();
-      if (!line) continue;
-      // 跳过纯数字行（序号）
-      if (/^\d+$/.test(line)) continue;
-      // 跳过时间轴行 00:00:00,000 --> 00:00:00,000
-      if (/^\d{1,2}:\d{2}:\d{2}[,.]\d{1,3}\s*-->\s*\d{1,2}:\d{2}:\d{2}[,.]\d{1,3}/.test(line)) continue;
-      // 移除 HTML 标签（如 <i>、<b>、<font>）
-      const cleaned = line.replace(/<[^>]+>/g, '').trim();
-      if (cleaned) textLines.push(cleaned);
+  function parseSubtitleTimeToSeconds(timeText) {
+    if (!timeText) return 0;
+    var cleaned = timeText.trim().replace(',', '.');
+    var parts = cleaned.split(':');
+    if (parts.length < 3) return 0;
+    var h = Number(parts[0]) || 0;
+    var m = Number(parts[1]) || 0;
+    var s = Number(parts[2]) || 0;
+    return h * 3600 + m * 60 + s;
+  }
+
+  function parseSrtToSegments(srtText) {
+    if (!srtText) return [];
+    var blocks = srtText.replace(/\r/g, '').trim().split(/\n{2,}/);
+    var segments = [];
+    for (var i = 0; i < blocks.length; i++) {
+      var lines = blocks[i].split('\n').map(function(line) { return line.trim(); }).filter(Boolean);
+      if (!lines.length) continue;
+      if (/^\d+$/.test(lines[0])) lines.shift();
+      if (!lines.length) continue;
+      var timeLine = lines.shift();
+      var match = timeLine.match(/(\d{1,2}:\d{2}:\d{2}[,.]\d{1,3})\s*-->\s*(\d{1,2}:\d{2}:\d{2}[,.]\d{1,3})/);
+      if (!match) continue;
+      var text = lines.join(' ').replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
+      if (!text) continue;
+      segments.push({
+        from: parseSubtitleTimeToSeconds(match[1]),
+        to: parseSubtitleTimeToSeconds(match[2]),
+        text: text
+      });
     }
-    return textLines.join('\n');
+    return normalizeSubtitleSegments(segments);
   }
 
   // 智能解析上传的内容：自动判断是 SRT 还是普通文本
   function parseUploadedContent(rawText, filename) {
-    if (!rawText) return '';
-    const isSrt = (filename && /\.srt$/i.test(filename)) ||
-                  /\d{1,2}:\d{2}:\d{2}[,.]\d{1,3}\s*-->\s*\d{1,2}:\d{2}:\d{2}[,.]\d{1,3}/.test(rawText);
+    if (!rawText) return { transcript: '', segments: [] };
+    var isSrt = (filename && /\.srt$/i.test(filename)) ||
+                /\d{1,2}:\d{2}:\d{2}[,.]\d{1,3}\s*-->\s*\d{1,2}:\d{2}:\d{2}[,.]\d{1,3}/.test(rawText);
     if (isSrt) {
       console.log('[省流助手-手动上传] 识别为 SRT 格式，开始解析');
-      return parseSrtContent(rawText);
+      var segments = parseSrtToSegments(rawText);
+      return {
+        transcript: formatTranscript(segments),
+        segments: segments
+      };
     }
     console.log('[省流助手-手动上传] 识别为纯文本格式');
-    return rawText.trim();
+    return {
+      transcript: rawText.trim(),
+      segments: []
+    };
   }
 
   // 打开手动上传字幕对话框
@@ -5298,7 +5681,8 @@
         alert('请先上传文件或粘贴字幕内容');
         return;
       }
-      const transcript = parseUploadedContent(rawText, uploadedFilename);
+      const parsed = parseUploadedContent(rawText, uploadedFilename);
+      const transcript = parsed.transcript;
       if (!transcript || !transcript.trim()) {
         alert('解析后内容为空，请检查字幕格式');
         return;
@@ -5308,13 +5692,14 @@
 
       // ✅ 走与自动获取字幕完全一致的后续流程
       rawTranscript = transcript;
+      rawSubtitleBody = parsed.segments || [];
       const freshVideoInfo = getVideoInfo();
       if (freshVideoInfo.bvid) {
         videoInfo = freshVideoInfo;
         currentVideoInfo = videoInfo;
       }
       panel.querySelectorAll('.tabbit-model-chip').forEach(c => c.classList.remove('disabled'));
-      await runSummary(panel, transcript, videoInfo);
+      await runSummary(panel, transcript, videoInfo, rawSubtitleBody);
     });
   }
   async function manualFetchSubtitle(panel, videoInfo) {
@@ -5365,7 +5750,7 @@
       rawTranscript = transcript;
       console.log('[省流助手] 手动获取成功！');
       panel.querySelectorAll('.tabbit-model-chip').forEach(c => c.classList.remove('disabled'));
-      await runSummary(panel, transcript, videoInfo);
+      await runSummary(panel, transcript, videoInfo, content);
 
     } catch (err) {
       console.error('[省流助手] 手动获取字幕失败:', err);
@@ -5938,7 +6323,7 @@
         rawCommentsChatContext = '';
         rawFullDataChatContext = '';
         if (rawTranscript) {
-          await runSummary(panel, rawTranscript, videoInfo || currentVideoInfo);
+          await runSummary(panel, rawTranscript, videoInfo || currentVideoInfo, rawSubtitleBody);
         } else if (videoInfo || currentVideoInfo) {
           showNoSubtitleState(panel, videoInfo || currentVideoInfo);
         }
@@ -6142,7 +6527,7 @@
   /**
    * 🆕 流式版：初始总结（支持打断）
    */
-  async function runSummary(panel, transcript, videoInfo) {
+  async function runSummary(panel, transcript, videoInfo, subtitleBody) {
     const contentDiv = panel.querySelector('.tabbit-panel-content');
     const input = panel.querySelector('.tabbit-chat-input');
     const sendBtn = panel.querySelector('.tabbit-chat-send');
@@ -6157,11 +6542,13 @@
     const activePreset = (CONFIG.promptPresets || []).find(p => p.id === activePresetId);
     const activePrompt = (activePreset && activePreset.prompt) || CONFIG.promptText || PROMPT_TEXT;
     const videoDesc = limitText(videoInfo.desc || '', 1500);
+    const aiTranscript = buildAiTranscript(subtitleBody, transcript);
+    const hasTimelineTranscript = !!(subtitleBody && subtitleBody.length > 0 && aiTranscript);
     const _subMaxChars = (typeof CONFIG !== 'undefined' && CONFIG.fullDataMaxChars) || 64000;
     let _subTruncated = false;
-    let _subTranscript = transcript;
-    if (transcript.length > _subMaxChars) {
-      _subTranscript = transcript.substring(0, _subMaxChars);
+    let _subTranscript = aiTranscript;
+    if (aiTranscript.length > _subMaxChars) {
+      _subTranscript = aiTranscript.substring(0, _subMaxChars);
       _subTruncated = true;
     }
     const fullPrompt = activePrompt
@@ -6169,12 +6556,16 @@
       + '\n视频标题: ' + (videoInfo.title || '')
       + '\nUP主: ' + (videoInfo.upName || '')
       + (videoDesc ? '\n视频简介: ' + videoDesc : '')
-      + '\n\n字幕内容:\n' + _subTranscript;
+      + '\n\n'
+      + (hasTimelineTranscript
+        ? '字幕内容（每行开头的 [开始-结束] 是视频时间范围；回答涉及具体片段、原话或定位时，请尽量保留对应时间范围）:\n'
+        : '字幕内容:\n')
+      + _subTranscript;
 
     const presetBarHtml = renderPresetBarHtml();
     const useImageGen = isImageGenEnabled();
     const useHtmlPptDirect = CONFIG.enableHtmlPptDirect === true;
-    const cacheKey = buildSummaryCacheKey(videoInfo, currentModel, activePresetId, activePrompt, transcript);
+    const cacheKey = buildSummaryCacheKey(videoInfo, currentModel, activePresetId, activePrompt, aiTranscript);
 
     renderSummaryShell(panel, contentDiv, presetBarHtml, videoInfo, pageUrl);
     if (_subTruncated) {
@@ -6182,7 +6573,7 @@
       if (resultContainer) {
         const warnDiv = document.createElement('div');
         warnDiv.style.cssText = 'background:#fff3cd;color:#856404;padding:6px 10px;border-radius:6px;font-size:12px;margin-bottom:8px;';
-        warnDiv.textContent = '⚠️ 字幕数据量（' + transcript.length.toLocaleString() + '字符）超过上限（' + _subMaxChars.toLocaleString() + '字符），AI 仅分析了前 ' + _subMaxChars.toLocaleString() + ' 字符。点击「💾 下载字幕」可获取完整字幕。';
+        warnDiv.textContent = '⚠️ 发送给 AI 的字幕数据量（' + aiTranscript.length.toLocaleString() + '字符）超过上限（' + _subMaxChars.toLocaleString() + '字符），AI 仅分析了前 ' + _subMaxChars.toLocaleString() + ' 字符。点击「💾 下载字幕」可获取完整字幕。';
         resultContainer.parentNode.insertBefore(warnDiv, resultContainer);
       }
     }
@@ -6217,16 +6608,10 @@
       const actionsDiv = contentDiv.querySelector('.tabbit-result-actions');
       if (actionsDiv) {
         actionsDiv.innerHTML = '';
-        const downloadBtn = document.createElement('button');
-        downloadBtn.className = 'tabbit-download-btn';
-        downloadBtn.textContent = '💾 下载字幕';
-        downloadBtn.addEventListener('click', function() {
-          downloadTranscript(rawTranscript, videoInfo.title, videoInfo.upName, videoInfo.bvid);
-        });
         const modelTag = document.createElement('span');
         modelTag.style.cssText = 'font-size:11px;color:#999;margin-left:auto;';
         modelTag.textContent = '📊 ' + currentModel;
-        actionsDiv.appendChild(downloadBtn);
+        appendSubtitleDownloadButtons(actionsDiv, videoInfo);
         actionsDiv.appendChild(modelTag);
       }
       try {
@@ -6731,7 +7116,7 @@
   let rawFullDataChatContext = '';
   let lastFullPromptText = '';
 
-  const FULL_ANALYSIS_PROMPT = '你是一个专业的视频内容全面分析师。请对以下视频的字幕内容、弹幕和评论进行综合分析，输出一份完整的分析报告，包括：\n1. 【视频核心内容】用简洁的话概括视频到底在讲什么\n2. 【弹幕热评联动】哪些字幕片段引发了最热烈的弹幕/评论讨论，分析观众的反应和情绪\n3. 【观众共鸣点】弹幕和评论中反复出现的话题、梗或观点\n4. 【争议与分歧】弹幕/评论中存在对立看法的地方\n5. 【时间轴亮点】按时间线标注视频中哪些时刻引发了最多的弹幕互动\n6. 【综合评价】综合字幕+弹幕+评论，给出这个视频的整体质量和口碑\n7. 我理解能力差、没耐心，别讲铺垫、别讲背景、别讲废话，只告诉我核心结论和关键点。';
+  const FULL_ANALYSIS_PROMPT = '你是一个专业的视频内容全面分析师。请对以下视频的字幕内容、弹幕和评论进行综合分析，输出一份完整的分析报告，包括：\n1. 【视频核心内容】用简洁的话概括视频到底在讲什么\n2. 【弹幕热评联动】哪些字幕片段引发了最热烈的弹幕/评论讨论，分析观众的反应和情绪\n3. 【观众共鸣点】弹幕和评论中反复出现的话题、梗或观点\n4. 【争议与分歧】弹幕/评论中存在对立看法的地方\n5. 【时间轴亮点】按时间线标注视频中哪些时刻引发了最多的弹幕互动\n6. 【综合评价】综合字幕+弹幕+评论，给出这个视频的整体质量和口碑\n7. 我理解能力差、没耐心，别讲铺垫、别讲背景、别讲废话，只告诉我核心结论和关键点。\n\n重要约束：\n- 只能引用输入数据里已经出现的时间范围，禁止自行猜测、补写或编造时间点。\n- 如果某个结论无法从输入中定位到明确时间范围，直接写“未定位到明确时间点”，不要硬写时间。\n- 优先使用输入中的 [开始-结束] 时间范围；不要把一个时间范围私自改写成别的时间点。';
 
   async function runFullAnalysis(panel, videoInfo) {
     if (isFullAnalyzing) return;
@@ -6819,7 +7204,7 @@
       }
 
       // 4. 构建全面数据
-      const fullDataText = formatFullData(videoInfo, rawSubtitleBody, danmaku, comments);
+      const fullDataText = formatFullData(videoInfo, rawSubtitleBody, danmaku, comments, rawTranscript);
       const maxChars = (typeof CONFIG !== 'undefined' && CONFIG.fullDataMaxChars) || 64000;
       let truncatedDataText = fullDataText;
       let wasTruncated = false;
@@ -6979,14 +7364,18 @@
     try {
       // 构建包含所有可用原始数据的用户消息
       let userContext = text;
+      const subtitleLocatorContext = buildSubtitleLocatorContext(text, rawSubtitleBody);
       let allContext = '';
       if (rawFullDataChatContext) allContext += rawFullDataChatContext;
       else {
         if (rawDanmakuChatContext) allContext += rawDanmakuChatContext;
         if (rawCommentsChatContext) allContext += rawCommentsChatContext;
       }
+      if (subtitleLocatorContext) {
+        userContext += '\n\n[字幕定位参考-仅供回答当前问题，不要重复完整贴出原文]\n' + subtitleLocatorContext;
+      }
       if (allContext) {
-        userContext = text + '\n\n[参考数据-仅供参考，不要重复展示]' + allContext;
+        userContext += '\n\n[参考数据-仅供参考，不要重复展示]' + allContext;
       }
       conversationHistory.push({ role: 'user', content: userContext });
 
@@ -8311,13 +8700,7 @@
         if (contentDivForDL) {
           var resultActionsForDL = contentDivForDL.querySelector('.tabbit-result-actions');
           if (resultActionsForDL) {
-            var dlBtnEarly = document.createElement('button');
-            dlBtnEarly.className = 'tabbit-download-btn';
-            dlBtnEarly.textContent = '💾 下载字幕';
-            dlBtnEarly.addEventListener('click', function() {
-              downloadTranscript(rawTranscript, videoInfo.title, videoInfo.upName, videoInfo.bvid);
-            });
-            resultActionsForDL.appendChild(dlBtnEarly);
+            appendSubtitleDownloadButtons(resultActionsForDL, videoInfo);
           }
         }
         // 🆕 自动下载字幕
@@ -8331,7 +8714,7 @@
         }
       }
 
-      await runSummary(panel, fetchResult, videoInfo);
+      await runSummary(panel, fetchResult, videoInfo, rawSubtitleBody);
     } catch (err) {
       if (overallTimer) {
         clearTimeout(overallTimer);
