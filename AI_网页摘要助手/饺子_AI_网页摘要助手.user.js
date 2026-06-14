@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         饺子 AI 网页摘要助手
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      2.9.1
+// @version      2.9.2
 // @description  指定网站自动弹出 AI 网页摘要，支持连续对话、多预设、多模板、SPA路由、摘要生图、flomo、坚果云双文件云同步。Shadow DOM 隔离样式。
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
@@ -96,6 +96,7 @@
     enableImageAutoDownload: true,
     imageGenPromptText: IMAGE_GEN_PROMPT_TEXT,
     flomoTags: '#饺子AI摘要',
+    silentAutoRun: false,
     systemPromptMd: '',
     systemPromptMdEnabled: false,
     systemPromptMdAsSystem: true,
@@ -470,6 +471,7 @@
     result.acCooldown = Number(result.acCooldown || 2000);
     result.acMinLen = Number(result.acMinLen || 2);
     result.acTempMinutes = Number(result.acTempMinutes || 10);
+    result.silentAutoRun = saved.silentAutoRun === true;
 
     return result;
   }
@@ -505,6 +507,16 @@
   }
 
   let config = loadConfig();
+
+  /* ─── 🤫 静默分析：待展示结果 ─── */
+  let pendingSummary = null; // { conversation, pageContextLoaded }
+
+  function showFloatBadge() {
+    if (floatBtn) floatBtn.classList.add('tabbit-has-badge');
+  }
+  function hideFloatBadge() {
+    if (floatBtn) floatBtn.classList.remove('tabbit-has-badge');
+  }
 
   /******************************************************************
    * 4. Profiles 管理
@@ -2371,6 +2383,24 @@
       }
       #${FLOAT_BTN_ID}:hover { opacity: 1 !important; transform: scale(1.08); }
       #${FLOAT_BTN_ID}.dragging { transition: none !important; transform: scale(1.08); }
+
+      /* 静默分析完成徽章 */
+      #tabbit-float-badge {
+        position: absolute; top: -4px; right: -4px;
+        width: 14px; height: 14px; border-radius: 7px;
+        background: #22c55e;
+        border: 2px solid rgba(139,92,246,1);
+        display: none;
+        pointer-events: none;
+        animation: tabbitBadgePulse 2s ease-in-out infinite;
+      }
+      #${FLOAT_BTN_ID}.tabbit-has-badge #tabbit-float-badge {
+        display: block;
+      }
+      @keyframes tabbitBadgePulse {
+        0%, 100% { transform: scale(1); opacity: 1; }
+        50% { transform: scale(1.25); opacity: 0.7; }
+      }
     `;
   }
 
@@ -2408,6 +2438,10 @@
     floatBtn.title = '打开 AI 摘要（点击自动总结）';
     floatBtn.textContent = '🥟';
     floatBtn.style.opacity = config.floatButton.opacity;
+    // 静默分析完成徽章
+    const badge = document.createElement('div');
+    badge.id = 'tabbit-float-badge';
+    floatBtn.appendChild(badge);
     shadowContainer.appendChild(floatBtn);
     applyFloatButtonPosition();
 
@@ -2794,6 +2828,16 @@
     if (!panelEl) createPanel();
     panelEl.classList.remove('tabbit-hidden');
     renderModelSelect();
+    // 🤫 优先展示静默分析的结果
+    if (pendingSummary) {
+      conversation = pendingSummary.conversation;
+      pageContextLoaded = pendingSummary.pageContextLoaded;
+      pendingSummary = null;
+      hideFloatBadge();
+      renderConversation();
+      setStatus('已完成后台分析', 'ok', 2000);
+      return;
+    }
     if (autoRun) {
       const hasVisible = conversation.filter(m => m.role !== 'system').length > 0;
       if (!hasVisible) {
@@ -3174,6 +3218,58 @@
     }
   }
 
+  /* ─── 🤫 静默分析：后台执行，不弹出面板 ─── */
+  async function runSummarySilent() {
+    if (!checkApiConfig()) return;
+
+    const profile = getCurrentProfile();
+    const template = getTemplateForUrl(window.location.href);
+
+    const pageText = getPageText();
+    if (!pageText || pageText.length < 30) {
+      console.log('[饺子AI-静默] 页面正文过短，跳过');
+      return;
+    }
+
+    const silentConv = [];
+    const mdContent = getSystemPromptMd();
+    if (mdContent && config.systemPromptMdAsSystem !== false) {
+      silentConv.push({ role: 'system', content: '==== 预加载上下文 ====' + '\n' + mdContent });
+    }
+    silentConv.push({ role: 'system', content: buildPageSystemPrompt() });
+
+    let userPrompt = `请按以下要求总结当前页面：\n\n${template.text}`;
+    if (mdContent && config.systemPromptMdAsSystem === false) {
+      userPrompt = '==== 预加载上下文 ====\n' + mdContent + '\n\n' + userPrompt;
+    }
+    silentConv.push({ role: 'user', content: userPrompt, meta: { hidden: true } });
+
+    console.log('[饺子AI-静默] 开始后台分析…');
+
+    try {
+      const messagesForApi = silentConv
+        .filter(m => !m.meta?.streaming)
+        .map(m => ({ role: m.role, content: m.meta?.apiContent || m.content }));
+
+      const finalText = await callChatApi(messagesForApi);
+
+      silentConv.push({
+        role: 'assistant',
+        content: finalText,
+        meta: { model: getCurrentModelDisplayName(), streaming: false }
+      });
+
+      pendingSummary = {
+        conversation: silentConv,
+        pageContextLoaded: true
+      };
+      showFloatBadge();
+      console.log('[饺子AI-静默] ✅ 分析完成，点击悬浮球查看');
+    } catch (err) {
+      console.warn('[饺子AI-静默] 分析失败：', err.message || err);
+    }
+  }
+
   async function runSummaryAppend(template) {
     if (!panelEl) createPanel();
     if (panelEl.classList.contains('tabbit-hidden')) panelEl.classList.remove('tabbit-hidden');
@@ -3459,7 +3555,11 @@
               </label>
             </div>
             <label class="tabbit-field">
-              <span><input id="tabbit-set-auto-run" type="checkbox"> 命中网址规则时自动弹出并总结</span>
+              <span><input id="tabbit-set-auto-run" type="checkbox"> 命中网址规则时自动总结</span>
+            </label>
+            <label class="tabbit-field">
+              <span><input id="tabbit-set-silent-auto-run" type="checkbox"> 🤫 静默模式（后台分析，不弹出面板，完成后悬浮球提示）</span>
+              <small>开启后命中规则时在后台自动分析，完成后悬浮球右上角显示绿色提示，点击即可查看结果</small>
             </label>
             <div class="tabbit-section-title">📋 自动复制</div>
             <small class="tabbit-help">选中文本后自动复制到剪贴板，可选择是否附带页面标题和链接作为出处。也可右键点击浮动按钮快速切换。</small>
@@ -3741,6 +3841,7 @@
     settingsEl.querySelector('#tabbit-set-ac-cooldown').value = config.acCooldown || 2000;
     settingsEl.querySelector('#tabbit-set-ac-temp-minutes').value = config.acTempMinutes || 10;
     settingsEl.querySelector('#tabbit-set-auto-run').checked = !!config.autoRun;
+    settingsEl.querySelector('#tabbit-set-silent-auto-run').checked = !!config.silentAutoRun;
     settingsEl.querySelector('#tabbit-set-flomo-api').value = config.flomoApiUrl || '';
     settingsEl.querySelector('#tabbit-set-flomo-tags').value = config.flomoTags || '#饺子AI摘要';
     settingsEl.querySelector('#tabbit-set-auto-copy').checked = config.autoCopy?.enabled !== false;
@@ -3922,6 +4023,7 @@
     syncTemplatesFromSettings();
     syncUrlRulesFromSettings();
     config.autoRun = settingsEl.querySelector('#tabbit-set-auto-run').checked;
+    config.silentAutoRun = settingsEl.querySelector('#tabbit-set-silent-auto-run').checked;
     config.extractMaxChars = Number(settingsEl.querySelector('#tabbit-set-extract-max').value || 16000);
     config.apiTimeout = Number(settingsEl.querySelector('#tabbit-set-api-timeout').value || 120000);
     config.acMinLen = Number(settingsEl.querySelector('#tabbit-set-ac-min-len').value || 2);
@@ -4137,7 +4239,11 @@
     renderPromptSelect();
 
     if (config.autoRun && matchUrl(location.href, config.urlRules)) {
-      setTimeout(() => openPanel(true), 600);
+      if (config.silentAutoRun) {
+        setTimeout(() => runSummarySilent(), 600);
+      } else {
+        setTimeout(() => openPanel(true), 600);
+      }
     }
   }
 
@@ -4181,7 +4287,11 @@
 
     // 6. 规则自动总结：首次加载即匹配
     if (config.autoRun && matchUrl(location.href, config.urlRules)) {
-      setTimeout(() => openPanel(true), 800);
+      if (config.silentAutoRun) {
+        setTimeout(() => runSummarySilent(), 800);
+      } else {
+        setTimeout(() => openPanel(true), 800);
+      }
     }
 
     // 7. SPA 路由切换监听
