@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Folo 网站增强工具
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      13.8.2
+// @version      14.0.0
 // @description  Folo 增强：Jina Reader + Readability + 启发式三级抓取 + AI 总结 + 自动总结 + 手动列表全量预加载 + 后续对话 + 多配置管理 + 坚果云 WebDAV 同步 + 复制对话 + 保存到 flomo
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
@@ -474,6 +474,22 @@
     function setFlomoApiUrl(v) { GM_setValue("ai_flomo_api_url", String(v || "").trim()); }
     function getFlomoTags() { return GM_getValue("ai_flomo_tags", "#Folo增强 #AI总结"); }
     function setFlomoTags(v) { GM_setValue("ai_flomo_tags", String(v || "").trim() || "#Folo增强 #AI总结"); }
+
+    const DEFAULT_OVERVIEW_PROMPT = `你是一个信息分析助手。下面是一份包含 {{total}} 篇文章的 RSS 订阅列表。
+{{analysisHint}}
+规则：
+- 用中文回答，语言简洁干练
+- 引用文章时保留标题中的 markdown 链接格式 [标题](URL)，方便读者点击
+- 不要输出"以下是分析"之类的开场白
+- 最重要的规则：{{total}} 篇文章必须全部出现在输出中，一篇都不能漏。在输出最后用加粗写上"共覆盖 X/Y 篇"来自检
+输出结构：
+**一句话总结**：这个列表在讲什么，值不值得花时间
+**主题分组**：按主题将全部 {{total}} 篇文章归类。每个主题用一句话概括，下面列出该主题下的所有文章标题（保留链接）。每个主题下的文章用编号列表，确保所有文章都出现在某个主题下
+**值得优先看**：从上面的文章中挑 3-5 篇最值得关注的，引用标题，每篇一句话说清为什么值得看
+**信号与趋势**：从这些文章里能看出什么趋势、风险或机会
+**可以跳过**：哪些文章明显是重复或低价值的，引用标题，简要说明原因`;
+    function getOverviewPrompt() { return GM_getValue("ai_overview_prompt", DEFAULT_OVERVIEW_PROMPT); }
+    function setOverviewPrompt(v) { GM_setValue("ai_overview_prompt", v || DEFAULT_OVERVIEW_PROMPT); }
 
     function getProfiles() {
         let profiles = GM_getValue("ai_profiles", []);
@@ -1113,6 +1129,17 @@
         const scopeChanged = scopePath !== preloadLastScopePath;
         if (!scopePath) return;
         if (!options.force && !scopeChanged && now - preloadLastPassiveScanAt < 1200) return;
+
+        // When switching lists, clear stale articles and overview result
+        if (scopeChanged) {
+            PRELOAD_ARTICLES.clear();
+            const panel = document.getElementById("my-ai-preload-panel");
+            if (panel) {
+                const resultDiv = panel.querySelector('.preload-overview-content');
+                if (resultDiv) { resultDiv.innerHTML = ''; resultDiv.style.display = 'none'; }
+            }
+        }
+
         preloadLastScopePath = scopePath;
         preloadLastPassiveScanAt = now;
         scanListDomForPreloadArticles({ silent: true });
@@ -1354,33 +1381,32 @@
             panel.id = "my-ai-preload-panel";
             panel.innerHTML = `
                 <div class="preload-head">
-                    <span>⚡ AI 预加载</span>
+                    <span>📊 列表分析</span>
                     <span class="preload-mini"></span>
-                    <button class="preload-scan-mini" title="预加载当前列表全部文章">预加载</button>
-                    <button class="preload-toggle" title="收起/展开">收起</button>
+                    <button class="preload-scan-mini" data-act="overview" title="基于列表文章生成 AI 总览" style="background:linear-gradient(135deg,#7c3aed,#2563eb);color:white;border:none;padding:3px 10px;border-radius:99px;cursor:pointer;font-size:12px;font-weight:600;flex:0 0 auto;">✨ 分析</button>
+                    <button class="preload-toggle" title="收起/展开">展开</button>
                 </div>
                 <div class="preload-body">
-                    <div class="preload-grid">
+                    <div class="preload-grid" style="display:none">
                         <span>本列表 <b data-k="listTotal">0</b></span>
-                        <span>已缓存 <b data-k="listCached">0</b></span>
-                        <span>计划 <b data-k="listPlanned">0</b></span>
-                        <span>运行 <b data-k="running">0</b></span>
-                        <span>失败 <b data-k="failed">0</b></span>
-                        <span>缓存 <b data-k="cache">0</b></span>
+                        <span style="display:none">已缓存 <b data-k="listCached">0</b></span>
+                        <span style="display:none">计划 <b data-k="listPlanned">0</b></span>
+                        <span style="display:none">运行 <b data-k="running">0</b></span>
+                        <span style="display:none">失败 <b data-k="failed">0</b></span>
+                        <span style="display:none">缓存 <b data-k="cache">0</b></span>
                     </div>
-                    <div class="preload-scope"></div>
+                    <div class="preload-scope" style="display:none"></div>
                     <div class="preload-actions">
-                        <button data-act="preload-list" class="preload-act-primary">预加载本列表全部</button>
-                        <button data-act="pause" class="preload-act-primary"></button>
-                        <button data-act="ignore"></button>
-                        <button data-act="clear-queue">清空队列</button>
-                        <button data-act="clear-cache">清空缓存</button>
-                        <button data-act="retry-failed">重试失败</button>
-                        <button data-act="overview">总览</button>
+                        <button data-act="preload-list" style="display:none" class="preload-act-primary">预加载本列表全部</button>
+                        <button data-act="pause" style="display:none" class="preload-act-primary"></button>
+                        <button data-act="ignore" style="display:none"></button>
+                        <button data-act="clear-queue" style="display:none">清空队列</button>
+                        <button data-act="clear-cache" style="display:none">清空缓存</button>
+                        <button data-act="retry-failed" style="display:none">重试失败</button>
+                        <button data-act="overview" class="preload-act-primary" style="background:linear-gradient(135deg,#7c3aed,#2563eb);color:white;">✨ 生成列表总览</button>
                         <button data-act="settings">设置</button>
                     </div>
-                    <div class="preload-section-title">运行日志</div>
-                    <div class="preload-log"></div>
+                    <div class="preload-overview-content" style="display:none;"></div>
                 </div>
                 <div class="preload-resize-handle" title="从左下角锚定拉伸"></div>`;
             document.body.appendChild(panel);
@@ -1421,9 +1447,19 @@
                 }
                 updatePreloadPanel();
             }
-            panel.querySelector('.preload-scan-mini').onclick = preloadCurrentListAll;
+            // mini button now handled by overview binding below
             panel.querySelector('[data-act="preload-list"]').onclick = preloadCurrentListAll;
-            panel.querySelector('[data-act="overview"]').onclick = runCurrentListOverview;
+            panel.querySelectorAll('[data-act="overview"]').forEach(b => {
+                b.onclick = () => {
+                    // Expand panel if minimized
+                    if (panel.classList.contains('is-minimized')) {
+                        panel.classList.remove('is-minimized');
+                        panel.querySelector('.preload-toggle').innerText = '收起';
+                        applyPreloadPanelLayout(panel, preloadPanelExpandedLayout);
+                    }
+                    runCurrentListOverview();
+                };
+            });
             panel.querySelector('[data-act="pause"]').onclick = () => {
                 const willEnable = !getPreloadEnabled();
                 setPreloadEnabled(willEnable);
@@ -1602,9 +1638,7 @@
             setText("cache", getCacheCount());
             const mini = panel.querySelector('.preload-mini');
             if (mini) {
-                mini.innerText = ignored
-                    ? `已忽略 · ${listStats.total}篇`
-                    : `${listStats.cached}/${listStats.total} 缓存 · 计划 ${listStats.planned} · 运行 ${listStats.running} · 失败 ${listStats.failed}`;
+                mini.innerText = `${listStats.total} 篇文章`;
             }
             const scopeEl = panel.querySelector('.preload-scope');
             if (scopeEl) scopeEl.innerText = route.scopePath ? `当前列表：${route.scopePath}${ignored ? "（已忽略）" : ""}` : "当前列表：未识别";
@@ -1615,9 +1649,9 @@
             }
             const miniPreloadBtn = panel.querySelector('.preload-scan-mini');
             if (miniPreloadBtn) {
-                miniPreloadBtn.disabled = ignored || !route.scopePath;
-                miniPreloadBtn.innerText = ignored ? "已忽略" : "预加载";
-                miniPreloadBtn.title = ignored ? "本列表已忽略，展开后可取消忽略" : "预加载当前列表全部文章";
+                miniPreloadBtn.disabled = !route.scopePath;
+                miniPreloadBtn.innerText = "✨ 总览";
+                miniPreloadBtn.title = "基于列表文章生成 AI 总览";
             }
             const pauseBtn = panel.querySelector('[data-act="pause"]');
             if (pauseBtn) pauseBtn.innerText = getPreloadEnabled() ? "暂停" : "继续";
@@ -1780,7 +1814,7 @@
         const scope = route.scopePath || "当前列表";
         const sourceText = meta && meta.sourceText ? meta.sourceText : "";
         win.style.display = 'flex';
-        win.querySelector('.list-overview-meta').innerText = meta ? `${scope} · 已缓存 ${meta.cached}/${meta.total} · 使用 ${meta.used || meta.cached} 篇` : scope;
+        win.querySelector('.list-overview-meta').innerText = meta ? `${scope} · 共 ${meta.total} 篇 · 分析 ${meta.used || meta.total} 篇` : scope;
         win.querySelector('.list-overview-content').innerHTML = _md(markdown);
         win.querySelector('.my-ai-chat-history').innerHTML = '';
         win.__articleContext = {
@@ -1808,53 +1842,89 @@
             showSettingsModal();
             return;
         }
-        scanListDomForPreloadArticles();
-        const { entries, cached } = collectCachedListSummaries();
-        if (!entries.length) {
-            setPreloadStatus("当前列表没有扫描到文章", "warn");
+        // Collect articles from current DOM, enriched with PRELOAD_ARTICLES data
+        const route = getTimelineRouteInfo(location.href);
+        const anchors = getCurrentListArticleAnchors(route);
+        const articles = [];
+        const seen = new Set();
+        // Build lookup from PRELOAD_ARTICLES by entryId for enrichment
+        const preloadByEntry = new Map();
+        PRELOAD_ARTICLES.forEach(item => {
+            if (item.entryId) preloadByEntry.set(String(item.entryId), item);
+        });
+        anchors.forEach(a => {
+            const info = getTimelineRouteInfo(a.href);
+            const entryId = info.entryId;
+            if (!entryId || seen.has(entryId)) return;
+            seen.add(entryId);
+            const title = getTitleFromRow(a);
+            if (!title) return;
+            const domText = getVisibleRowText(a);
+            const cached = preloadByEntry.get(String(entryId));
+            const url = (cached && cached.url) || "";
+            const text = (cached && cached.text) || domText;
+            articles.push({ title, url, appUrl: a.href, entryId, text });
+        });
+
+        if (!articles.length) {
+            setPreloadStatus("当前列表没有扫描到文章，请稍等页面加载", "warn");
             return;
         }
-        if (!cached.length) {
-            setPreloadStatus(`当前列表 ${entries.length} 篇,暂无可用缓存摘要`, "warn");
-            return;
-        }
-        const maxItems = 30;
-        const useItems = cached.slice(0, maxItems);
+
+        const useItems = articles;
         const joined = useItems.map((item, idx) => {
             const link = item.url || item.appUrl || "";
-            return `#${idx + 1}\n标题: ${item.title || "无标题"}\n文章ID: ${item.entryId || ""}\n链接: ${link}\n摘要:\n${String(item.summary || "").slice(0, 2500)}`;
+            const desc = item.text ? `\n简介: ${String(item.text).slice(0, 500)}` : "";
+            const titleLink = link ? `[${item.title || "无标题"}](${link})` : (item.title || "无标题");
+            return `标题: ${titleLink}${desc}`;
         }).join("\n\n---\n\n");
-        const prompt =
-            `请基于下面这些“已缓存的单篇原文摘要”,生成当前 RSS 列表总览。` +
-            `\n要求用中文,直接给结论,不要解释流程。` +
-            `\n输出结构：` +
-            `\n1. 核心结论` +
-            `\n2. 值得优先看的文章 Top 5（说明原因）` +
-            `\n3. 主题分组` +
-            `\n4. 关键信号/风险/机会` +
-            `\n5. 一句话速览列表` +
-            `\n\n当前列表共 ${entries.length} 篇,已缓存 ${cached.length} 篇,本次使用 ${useItems.length} 篇。\n\n${joined}`;
+
+        const hasDesc = useItems.some(item => item.text && item.text.length > 10);
+        const analysisHint = hasDesc
+            ? "部分文章附带了简介，请结合标题和简介进行分析。"
+            : "目前只有文章标题，请基于标题进行主题归纳和趋势分析。";
+
+        const total = useItems.length;
+        const promptTemplate = getOverviewPrompt();
+        const prompt = promptTemplate
+            .replace(/\{\{total\}\}/g, total)
+            .replace(/\{\{analysisHint\}\}/g, analysisHint)
+            + `\n\n当前列表共 ${articles.length} 篇，本次分析 ${total} 篇。\n\n${joined}`;
 
         const panel = document.getElementById("my-ai-preload-panel");
-        const btn = panel && panel.querySelector('[data-act="overview"]');
-        if (btn) { btn.disabled = true; btn.innerText = "生成中..."; }
-        setPreloadStatus(`正在生成列表总览：使用 ${useItems.length}/${entries.length} 篇缓存`, "info");
+        const overviewBtns = panel ? panel.querySelectorAll('[data-act="overview"]') : [];
+        const setOvBtn = (disabled, text) => overviewBtns.forEach(b => { b.disabled = disabled; b.innerText = text; });
+        setOvBtn(true, "生成中...");
+        setPreloadStatus(`正在生成列表总览：${useItems.length} 篇`, "info");
+        const resultDiv = panel.querySelector('.preload-overview-content');
+        if (resultDiv) { resultDiv.style.display = 'block'; resultDiv.innerHTML = '<div style="opacity:0.6">⏳ 正在生成...</div>'; }
+
+        let streamStarted = false;
         callAIChat(
             [
-                { role: "system", content: "你是 RSS 信息分析助手,擅长把多篇文章摘要合并成高密度列表总览。" },
+                { role: "system", content: "你是 RSS 信息分析助手，擅长从文章标题和简介中提取趋势、分组主题、发现重点。" },
                 { role: "user", content: prompt }
             ],
             (content) => {
-                if (btn) { btn.disabled = false; btn.innerText = "总览"; }
-                showListOverviewResult(content, { cached: cached.length, total: entries.length, used: useItems.length, sourceText: joined });
+                setOvBtn(false, "✨ 生成列表总览");
+                if (resultDiv) resultDiv.innerHTML = _md(content);
                 setPreloadStatus("列表总览生成完成", "ok");
             },
             (err) => {
-                if (btn) { btn.disabled = false; btn.innerText = "总览"; }
+                setOvBtn(false, "✨ 生成列表总览");
+                if (resultDiv) resultDiv.innerHTML = '<div style="color:red">❌ ' + (err.message || err) + '</div>';
                 setPreloadStatus(`列表总览失败：${err.message || err}`, "err");
+            },
+            (delta, full) => {
+                if (!streamStarted) {
+                    streamStarted = true;
+                    if (resultDiv) resultDiv.innerHTML = '';
+                }
+                if (resultDiv) resultDiv.innerHTML = _md(full) + '<span style="opacity:0.5">▍</span>';
             }
         );
     }
+
 
     // ==================== 3.5. 坚果云 WebDAV 同步 ====================
     const WEBDAV_BASE = 'https://dav.jianguoyun.com/dav/';
@@ -2096,7 +2166,7 @@
             z-index: 99998;
             width: 380px;
             min-width: 300px;
-            min-height: 220px;
+            min-height: 120px;
             max-width: calc(100vw - 36px);
             max-height: calc(100vh - 36px);
             border: 1px solid rgba(139, 92, 246, 0.35);
@@ -2104,10 +2174,12 @@
             background: rgba(255, 255, 255, 0.94);
             box-shadow: 0 10px 30px rgba(15, 23, 42, 0.16);
             color: #1f2937;
-            overflow: auto;
+            overflow: hidden;
             resize: none;
             backdrop-filter: blur(10px);
             font-size: 12px;
+            display: flex;
+            flex-direction: column;
         }
         #my-ai-preload-panel .preload-resize-handle {
             position: absolute;
@@ -2167,20 +2239,10 @@
             color: #64748b;
         }
         #my-ai-preload-panel .preload-scan-mini {
-            border: 1px solid rgba(124, 58, 237, 0.35);
-            background: linear-gradient(135deg, rgba(124, 58, 237, 0.18), rgba(37, 99, 235, 0.14));
             cursor: pointer;
             font-size: 12px;
-            font-weight: 700;
-            color: #4c1d95;
-            min-width: 62px;
-            height: 26px;
-            border-radius: 999px;
-            padding: 0 12px;
-            line-height: 24px;
-            text-align: center;
+            font-weight: 600;
             flex: 0 0 auto;
-            display: none;
         }
         #my-ai-preload-panel .preload-scan-mini:disabled {
             opacity: 0.55;
@@ -2194,9 +2256,7 @@
             background: linear-gradient(135deg, rgba(124, 58, 237, 0.28), rgba(37, 99, 235, 0.22));
             border-color: rgba(124, 58, 237, 0.5);
         }
-        #my-ai-preload-panel.is-minimized .preload-scan-mini {
-            display: none;
-        }
+        /* mini button stays visible in minimized state */
         #my-ai-preload-panel .preload-toggle {
             border: 1px solid rgba(139, 92, 246, 0.25);
             background: rgba(139, 92, 246, 0.10);
@@ -2217,7 +2277,7 @@
             border-color: rgba(139, 92, 246, 0.4);
         }
         #my-ai-preload-panel.is-minimized {
-            width: min(260px, calc(100vw - 36px)) !important;
+            width: min(320px, calc(100vw - 36px)) !important;
             min-height: 40px;
             height: 40px !important;
             overflow: hidden;
@@ -2468,25 +2528,63 @@
             cursor: pointer;
             font-size: 11px;
         }
+        #my-ai-preload-panel .preload-body {
+            display: flex;
+            flex-direction: column;
+            flex: 1;
+            overflow: hidden;
+        }
         #my-ai-preload-panel .preload-overview-content {
-            max-height: 360px;
+            flex: 1;
             overflow-y: auto;
-            line-height: 1.55;
-            font-size: 12px;
-            color: #334155;
-            padding-right: 4px;
+            line-height: 1.7;
+            font-size: 13px;
+            color: #1f2937;
+            padding: 10px 12px;
+            margin-top: 8px;
+            border-top: 1px dashed rgba(139, 92, 246, 0.25);
         }
         .dark #my-ai-preload-panel .preload-overview-content { color: #d1d5db; }
         #my-ai-preload-panel .preload-overview-content h1,
         #my-ai-preload-panel .preload-overview-content h2,
         #my-ai-preload-panel .preload-overview-content h3 {
-            font-size: 13px;
-            margin: 8px 0 4px;
+            font-weight: 700;
+            margin: 0.8em 0 0.4em;
+            color: #4c1d95;
         }
-        #my-ai-preload-panel .preload-overview-content p,
+        #my-ai-preload-panel .preload-overview-content h1 { font-size: 1.15rem; }
+        #my-ai-preload-panel .preload-overview-content h2 { font-size: 1.05rem; }
+        #my-ai-preload-panel .preload-overview-content h3 { font-size: 0.95rem; }
+        .dark #my-ai-preload-panel .preload-overview-content h1,
+        .dark #my-ai-preload-panel .preload-overview-content h2,
+        .dark #my-ai-preload-panel .preload-overview-content h3 { color: #c4b5fd; }
+        #my-ai-preload-panel .preload-overview-content p {
+            margin: 0.5em 0;
+            line-height: 1.75;
+        }
+        #my-ai-preload-panel .preload-overview-content strong { color: #7c3aed; }
+        .dark #my-ai-preload-panel .preload-overview-content strong { color: #a78bfa; }
         #my-ai-preload-panel .preload-overview-content ul,
         #my-ai-preload-panel .preload-overview-content ol {
-            margin: 5px 0;
+            padding-left: 1.6em;
+            margin: 0.5em 0;
+        }
+        #my-ai-preload-panel .preload-overview-content li { margin: 0.2em 0; }
+        #my-ai-preload-panel .preload-overview-content code {
+            background: rgba(139,92,246,0.12);
+            padding: 1px 6px;
+            border-radius: 4px;
+            font-size: 0.88em;
+            color: #be185d;
+        }
+        #my-ai-preload-panel .preload-overview-content hr {
+            border: none;
+            border-top: 1px dashed rgba(139,92,246,0.2);
+            margin: 0.8em 0;
+        }
+        #my-ai-preload-panel .preload-overview-content a {
+            color: #7c3aed;
+            text-decoration: underline;
         }
 
         #my-list-overview-window {
@@ -2829,14 +2927,11 @@
                     </div>
 
                     <div class="my-input-group">
-                        <label class="my-input-label">⚡ 预加载缓存</label>
+                        <label class="my-input-label">📊 列表分析</label>
                         <div class="auto-summary-row">
-                            <label><input type="checkbox" id="cfg-preload-enabled"> 允许执行手动预加载队列</label>
-                            <div class="desc">脚本只识别列表,不会自动预加载；需要在预加载面板点“预加载本列表全部”</div>
-                            <label style="margin-top:6px;">同时总结 <input id="cfg-preload-concurrency" class="my-input" type="number" min="1" max="3" style="width:90px;padding:4px 8px;"> 篇</label>
-                            <div class="desc">控制并发速度。预加载不设篇数上限,点一次会处理当前列表识别到的全部文章</div>
-                            <label style="margin-top:6px;"><input type="checkbox" id="cfg-preload-iframe"> 启用隐藏详情页预取</label>
-                            <div class="desc">默认关闭。开启后可提高预加载命中率，但更耗资源，也可能触发 Folo 已读</div>
+                            <div style="font-size:11px;color:#888;margin-bottom:4px;">分析提示词（可用变量：{{total}} 文章数，{{analysisHint}} 分析提示）</div>
+                            <textarea id="cfg-overview-prompt" class="my-input" rows="8" style="font-size:12px;line-height:1.5;resize:vertical;"></textarea>
+                            <div class="desc">修改提示词可调整分析风格和输出结构。留空恢复默认。</div>
                         </div>
                     </div>
 
@@ -2909,9 +3004,7 @@
         loadFormData(getActiveConfig());
         loadStrategiesUI();
         document.getElementById('cfg-auto-summarize').checked = getAutoSummarizeEnabled();
-        document.getElementById('cfg-preload-enabled').checked = getPreloadEnabled();
-        document.getElementById('cfg-preload-concurrency').value = getPreloadConcurrency();
-        document.getElementById('cfg-preload-iframe').checked = getPreloadIframeEnabled();
+        document.getElementById('cfg-overview-prompt').value = getOverviewPrompt();
         document.getElementById('cfg-flomo-url').value = getFlomoApiUrl();
         document.getElementById('cfg-flomo-tags').value = getFlomoTags();
         document.getElementById('webdav-user').value = getWebDAVUser();
@@ -3085,9 +3178,7 @@
                 loadFormData(getActiveConfig());
                 loadStrategiesUI();
                 document.getElementById('cfg-auto-summarize').checked = getAutoSummarizeEnabled();
-                document.getElementById('cfg-preload-enabled').checked = getPreloadEnabled();
-                document.getElementById('cfg-preload-concurrency').value = getPreloadConcurrency();
-                document.getElementById('cfg-preload-iframe').checked = getPreloadIframeEnabled();
+                document.getElementById('cfg-overview-prompt').value = getOverviewPrompt();
                 document.getElementById('cfg-flomo-url').value = getFlomoApiUrl();
                 setWebDAVStatus(`✅ 下载成功 · 配置数:${merged.profiles.length} · ${new Date().toLocaleTimeString()}`, "success");
             } catch(e) {
@@ -3165,9 +3256,7 @@
             saveFormToProfile(modal.__lastProfileId);
             saveStrategiesFromUI();
             setAutoSummarizeEnabled(document.getElementById('cfg-auto-summarize').checked);
-            setPreloadEnabled(document.getElementById('cfg-preload-enabled').checked);
-            setPreloadConcurrency(document.getElementById('cfg-preload-concurrency').value);
-            setPreloadIframeEnabled(document.getElementById('cfg-preload-iframe').checked);
+            setOverviewPrompt(document.getElementById('cfg-overview-prompt').value.trim());
             setFlomoApiUrl(document.getElementById('cfg-flomo-url').value);
             setFlomoTags(document.getElementById('cfg-flomo-tags').value);
             persistWebDAVCredsFromForm();
