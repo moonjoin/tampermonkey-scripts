@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Folo 网站增强工具
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      14.0.0
+// @version      14.0.1
 // @description  Folo 增强：Jina Reader + Readability + 启发式三级抓取 + AI 总结 + 自动总结 + 手动列表全量预加载 + 后续对话 + 多配置管理 + 坚果云 WebDAV 同步 + 复制对话 + 保存到 flomo
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
@@ -32,13 +32,79 @@
                 .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
                 .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
         }
+        function renderMarkdownLinks(s, isImage) {
+            const prefix = isImage ? '![' : '[';
+            let out = '';
+            let i = 0;
+            while (i < s.length) {
+                const start = s.indexOf(prefix, i);
+                if (start < 0) {
+                    out += s.slice(i);
+                    break;
+                }
+                if (!isImage && start > 0 && s[start - 1] === '!') {
+                    out += s.slice(i, start + 1);
+                    i = start + 1;
+                    continue;
+                }
+                out += s.slice(i, start);
+                let j = start + prefix.length;
+                let depth = 1;
+                while (j < s.length) {
+                    if (s[j] === '\\') { j += 2; continue; }
+                    if (s[j] === '[') depth++;
+                    else if (s[j] === ']') {
+                        depth--;
+                        if (depth === 0) break;
+                    }
+                    j++;
+                }
+                if (j >= s.length || s[j + 1] !== '(') {
+                    out += prefix;
+                    i = start + prefix.length;
+                    continue;
+                }
+                let k = j + 2;
+                while (k < s.length) {
+                    if (s[k] === '\\') { k += 2; continue; }
+                    if (s[k] === ')') break;
+                    k++;
+                }
+                if (k >= s.length) {
+                    out += prefix;
+                    i = start + prefix.length;
+                    continue;
+                }
+                const label = s.slice(start + prefix.length, j).replace(/\\([\[\]])/g, '$1');
+                const targetRaw = s.slice(j + 2, k).trim();
+                const href = targetRaw.replace(/\s+(?:"[^"]*"|&quot;.*?&quot;)$/, '').split(/\s+/)[0];
+                if (!href) {
+                    out += s.slice(start, k + 1);
+                } else if (isImage) {
+                    out += `<img src="${href}" alt="${label}" style="max-width:100%;border-radius:6px">`;
+                } else {
+                    out += `<a href="${href}" target="_blank" rel="noopener">${label}</a>`;
+                }
+                i = k + 1;
+            }
+            return out;
+        }
+        function autoLinkPlainUrls(s) {
+            return s.split(/(<a\b[^>]*>.*?<\/a>|<img\b[^>]*>|<code\b[^>]*>.*?<\/code>)/gi).map(part => {
+                if (!part || /^<(a|img|code)\b/i.test(part)) return part;
+                return part.split(/(<[^>]+>)/g).map(piece => {
+                    if (!piece || piece[0] === '<') return piece;
+                    return piece.replace(/https?:\/\/[^\s<)]+/g, url =>
+                        `<a href="${url}" target="_blank" rel="noopener">${url}</a>`);
+                }).join('');
+            }).join('');
+        }
         function renderInline(text) {
             let s = escapeHtml(text);
             s = s.replace(/`([^`]+?)`/g, '<code>$1</code>');
-            s = s.replace(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g,
-                '<img src="$2" alt="$1" style="max-width:100%;border-radius:6px">');
-            s = s.replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g,
-                '<a href="$2" target="_blank" rel="noopener">$1</a>');
+            s = renderMarkdownLinks(s, true);
+            s = renderMarkdownLinks(s, false);
+            s = autoLinkPlainUrls(s);
             s = s.replace(/\*\*([^\*]+?)\*\*/g, '<strong>$1</strong>');
             s = s.replace(/__([^_]+?)__/g, '<strong>$1</strong>');
             s = s.replace(/(^|[^\*])\*([^\*\n]+?)\*(?!\*)/g, '$1<em>$2</em>');
@@ -136,6 +202,13 @@
                 const h = line.match(/^(#{1,6})\s+(.*)$/);
                 if (h) { closeAllLists(); const lv = h[1].length; html += '<h' + lv + '>' + renderInline(h[2].trim()) + '</h' + lv + '>'; i++; continue; }
                 if (/^\s*([-*_])\s*\1\s*\1[-*_\s]*$/.test(line)) { closeAllLists(); html += '<hr/>'; i++; continue; }
+                const articleRef = line.match(/^\s*(#\d+)\s+(.*)$/);
+                if (articleRef) {
+                    closeAllLists();
+                    html += '<p class="md-article-ref"><span class="md-article-no">' + escapeHtml(articleRef[1]) + '</span>' + renderInline(articleRef[2].trim()) + '</p>';
+                    i++;
+                    continue;
+                }
                 if (/^\s*>\s?/.test(line)) {
                     closeAllLists();
                     let buf = [];
@@ -474,17 +547,24 @@
     function setFlomoApiUrl(v) { GM_setValue("ai_flomo_api_url", String(v || "").trim()); }
     function getFlomoTags() { return GM_getValue("ai_flomo_tags", "#Folo增强 #AI总结"); }
     function setFlomoTags(v) { GM_setValue("ai_flomo_tags", String(v || "").trim() || "#Folo增强 #AI总结"); }
+    function toMarkdownLinkLabel(text) {
+        return String(text || "无标题")
+            .replace(/\s+/g, " ")
+            .replace(/\[/g, "【")
+            .replace(/\]/g, "】")
+            .trim() || "无标题";
+    }
 
     const DEFAULT_OVERVIEW_PROMPT = `你是一个信息分析助手。下面是一份包含 {{total}} 篇文章的 RSS 订阅列表。
 {{analysisHint}}
 规则：
 - 用中文回答，语言简洁干练
-- 引用文章时保留标题中的 markdown 链接格式 [标题](URL)，方便读者点击
+- 输入材料已给每篇文章分配原始编号 #1、#2、#3...；引用文章时必须保留这个编号和标题中的 markdown 链接格式，例如 #3 [标题](URL)，方便定位和统计
 - 不要输出"以下是分析"之类的开场白
 - 最重要的规则：{{total}} 篇文章必须全部出现在输出中，一篇都不能漏。在输出最后用加粗写上"共覆盖 X/Y 篇"来自检
 输出结构：
 **一句话总结**：这个列表在讲什么，值不值得花时间
-**主题分组**：按主题将全部 {{total}} 篇文章归类。每个主题用一句话概括，下面列出该主题下的所有文章标题（保留链接）。每个主题下的文章用编号列表，确保所有文章都出现在某个主题下
+**主题分组**：按主题将全部 {{total}} 篇文章归类。每个主题用一句话概括，下面列出该主题下的所有文章标题（保留原始编号和链接）。每个主题下的文章用编号列表，确保所有文章都出现在某个主题下
 **值得优先看**：从上面的文章中挑 3-5 篇最值得关注的，引用标题，每篇一句话说清为什么值得看
 **信号与趋势**：从这些文章里能看出什么趋势、风险或机会
 **可以跳过**：哪些文章明显是重复或低价值的，引用标题，简要说明原因`;
@@ -1408,7 +1488,7 @@
                     </div>
                     <div class="preload-overview-content" style="display:none;"></div>
                 </div>
-                <div class="preload-resize-handle" title="从左下角锚定拉伸"></div>`;
+                <div class="preload-resize-handle" title="拖动调整大小"></div>`;
             document.body.appendChild(panel);
             panel.classList.add('is-minimized');
             panel.querySelector('.preload-toggle').innerText = '展开';
@@ -1559,15 +1639,15 @@
                 if (e.button !== 0 || panel.classList.contains("is-minimized")) return;
                 resizing = true;
                 const rect = panel.getBoundingClientRect();
-                const vh = window.innerHeight || document.documentElement.clientHeight;
                 startX = e.clientX;
                 startY = e.clientY;
                 startWidth = rect.width;
                 startHeight = rect.height;
-                startBottom = vh - rect.bottom;
+                startLeft = rect.left;
+                startBottom = (window.innerHeight || document.documentElement.clientHeight) - rect.bottom;
                 panel.style.left = rect.left + "px";
-                panel.style.bottom = startBottom + "px";
-                panel.style.top = "auto";
+                panel.style.top = rect.top + "px";
+                panel.style.bottom = "auto";
                 document.body.style.userSelect = "none";
                 e.preventDefault();
                 e.stopPropagation();
@@ -1585,16 +1665,23 @@
                 panel.style.top = "auto";
             }
             if (resizing) {
-                const maxWidth = vw - (parseFloat(panel.style.left) || panel.getBoundingClientRect().left) - 8;
-                const maxHeight = vh - startBottom - 8;
+                const maxWidth = vw - startLeft - 8;
+                const maxHeight = vh - (parseFloat(panel.style.top) || panel.getBoundingClientRect().top) - 8;
                 const width = Math.max(300, Math.min(startWidth + (e.clientX - startX), maxWidth));
-                const height = Math.max(220, Math.min(startHeight - (e.clientY - startY), maxHeight));
+                const height = Math.max(220, Math.min(startHeight + (e.clientY - startY), maxHeight));
                 panel.style.width = width + "px";
                 panel.style.height = height + "px";
             }
         });
         window.addEventListener("mouseup", () => {
             if (!dragging && !resizing) return;
+            if (resizing) {
+                const rect = panel.getBoundingClientRect();
+                const vh = window.innerHeight || document.documentElement.clientHeight || 800;
+                panel.style.left = rect.left + "px";
+                panel.style.bottom = Math.max(8, vh - rect.bottom) + "px";
+                panel.style.top = "auto";
+            }
             dragging = false;
             resizing = false;
             document.body.style.userSelect = "";
@@ -1875,8 +1962,9 @@
         const joined = useItems.map((item, idx) => {
             const link = item.url || item.appUrl || "";
             const desc = item.text ? `\n简介: ${String(item.text).slice(0, 500)}` : "";
-            const titleLink = link ? `[${item.title || "无标题"}](${link})` : (item.title || "无标题");
-            return `标题: ${titleLink}${desc}`;
+            const titleLabel = toMarkdownLinkLabel(item.title);
+            const titleLink = link ? `[${titleLabel}](${link})` : titleLabel;
+            return `编号: #${idx + 1}\n标题: ${titleLink}${desc}`;
         }).join("\n\n---\n\n");
 
         const hasDesc = useItems.some(item => item.text && item.text.length > 10);
@@ -1902,7 +1990,7 @@
         let streamStarted = false;
         callAIChat(
             [
-                { role: "system", content: "你是 RSS 信息分析助手，擅长从文章标题和简介中提取趋势、分组主题、发现重点。" },
+                { role: "system", content: "你是 RSS 信息分析助手，擅长从文章标题和简介中提取趋势、分组主题、发现重点。引用文章时保留输入材料里的 #N 原始编号，方便用户定位和统计。" },
                 { role: "user", content: prompt }
             ],
             (content) => {
@@ -2183,22 +2271,22 @@
         }
         #my-ai-preload-panel .preload-resize-handle {
             position: absolute;
-            top: 0;
+            bottom: 0;
             right: 0;
-            width: 18px;
-            height: 18px;
-            cursor: nesw-resize;
+            width: 22px;
+            height: 22px;
+            cursor: nwse-resize;
             z-index: 2;
         }
         #my-ai-preload-panel .preload-resize-handle::after {
             content: "";
             position: absolute;
-            top: 5px;
             right: 5px;
-            width: 7px;
-            height: 7px;
-            border-top: 2px solid rgba(124, 58, 237, 0.55);
+            bottom: 5px;
+            width: 9px;
+            height: 9px;
             border-right: 2px solid rgba(124, 58, 237, 0.55);
+            border-bottom: 2px solid rgba(124, 58, 237, 0.55);
             border-radius: 1px;
         }
         .dark #my-ai-preload-panel {
@@ -2340,8 +2428,8 @@
         }
         #my-ai-preload-panel .preload-body {
             padding: 12px;
-            max-height: min(720px, calc(100vh - 120px));
-            overflow-y: auto;
+            box-sizing: border-box;
+            min-height: 0;
         }
         #my-ai-preload-panel .preload-grid {
             display: grid;
@@ -2532,16 +2620,18 @@
             display: flex;
             flex-direction: column;
             flex: 1;
+            min-height: 0;
             overflow: hidden;
         }
         #my-ai-preload-panel .preload-overview-content {
             flex: 1;
+            min-height: 0;
             overflow-y: auto;
-            line-height: 1.7;
-            font-size: 13px;
+            line-height: 1.85;
+            font-size: 14px;
             color: #1f2937;
-            padding: 10px 12px;
-            margin-top: 8px;
+            padding: 16px 18px 24px;
+            margin-top: 10px;
             border-top: 1px dashed rgba(139, 92, 246, 0.25);
         }
         .dark #my-ai-preload-panel .preload-overview-content { color: #d1d5db; }
@@ -2549,27 +2639,46 @@
         #my-ai-preload-panel .preload-overview-content h2,
         #my-ai-preload-panel .preload-overview-content h3 {
             font-weight: 700;
-            margin: 0.8em 0 0.4em;
+            margin: 1.15em 0 0.55em;
             color: #4c1d95;
         }
-        #my-ai-preload-panel .preload-overview-content h1 { font-size: 1.15rem; }
-        #my-ai-preload-panel .preload-overview-content h2 { font-size: 1.05rem; }
-        #my-ai-preload-panel .preload-overview-content h3 { font-size: 0.95rem; }
+        #my-ai-preload-panel .preload-overview-content h1 { font-size: 1.2rem; }
+        #my-ai-preload-panel .preload-overview-content h2 { font-size: 1.1rem; }
+        #my-ai-preload-panel .preload-overview-content h3 { font-size: 1rem; }
         .dark #my-ai-preload-panel .preload-overview-content h1,
         .dark #my-ai-preload-panel .preload-overview-content h2,
         .dark #my-ai-preload-panel .preload-overview-content h3 { color: #c4b5fd; }
         #my-ai-preload-panel .preload-overview-content p {
-            margin: 0.5em 0;
-            line-height: 1.75;
+            margin: 0.72em 0;
+            line-height: 1.85;
         }
         #my-ai-preload-panel .preload-overview-content strong { color: #7c3aed; }
         .dark #my-ai-preload-panel .preload-overview-content strong { color: #a78bfa; }
         #my-ai-preload-panel .preload-overview-content ul,
         #my-ai-preload-panel .preload-overview-content ol {
-            padding-left: 1.6em;
-            margin: 0.5em 0;
+            padding-left: 1.8em;
+            margin: 0.7em 0 1em;
         }
-        #my-ai-preload-panel .preload-overview-content li { margin: 0.2em 0; }
+        #my-ai-preload-panel .preload-overview-content li { margin: 0.42em 0; }
+        #my-ai-preload-panel .preload-overview-content .md-article-ref {
+            margin: 0.64em 0;
+            padding: 7px 10px 7px 12px;
+            border-left: 3px solid rgba(124, 58, 237, 0.36);
+            border-radius: 8px;
+            background: rgba(139, 92, 246, 0.055);
+            line-height: 1.72;
+        }
+        #my-ai-preload-panel .preload-overview-content .md-article-no {
+            display: inline-flex;
+            min-width: 38px;
+            margin-right: 4px;
+            color: #7c3aed;
+            font-weight: 800;
+        }
+        .dark #my-ai-preload-panel .preload-overview-content .md-article-ref {
+            background: rgba(139, 92, 246, 0.12);
+            border-left-color: rgba(167, 139, 250, 0.46);
+        }
         #my-ai-preload-panel .preload-overview-content code {
             background: rgba(139,92,246,0.12);
             padding: 1px 6px;
@@ -2585,6 +2694,8 @@
         #my-ai-preload-panel .preload-overview-content a {
             color: #7c3aed;
             text-decoration: underline;
+            text-underline-offset: 3px;
+            overflow-wrap: anywhere;
         }
 
         #my-list-overview-window {
