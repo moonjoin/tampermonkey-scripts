@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         饺子 AI 网页摘要助手
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      2.9.2
+// @version      2.9.3
 // @description  指定网站自动弹出 AI 网页摘要，支持连续对话、多预设、多模板、SPA路由、摘要生图、flomo、坚果云双文件云同步。Shadow DOM 隔离样式。
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
@@ -97,6 +97,7 @@
     imageGenPromptText: IMAGE_GEN_PROMPT_TEXT,
     flomoTags: '#饺子AI摘要',
     silentAutoRun: false,
+    enableThinking: true,
     systemPromptMd: '',
     systemPromptMdEnabled: false,
     systemPromptMdAsSystem: true,
@@ -472,6 +473,7 @@
     result.acMinLen = Number(result.acMinLen || 2);
     result.acTempMinutes = Number(result.acTempMinutes || 10);
     result.silentAutoRun = saved.silentAutoRun === true;
+    result.enableThinking = saved.enableThinking !== false;
 
     return result;
   }
@@ -687,6 +689,7 @@
       temperature: getCurrentTemperature(),
       max_tokens: getCurrentMaxTokens()
     };
+    if (!config.enableThinking) { body.thinking = { type: "disabled" }; body.enable_thinking = false; }
 
     return new Promise((resolve, reject) => {
       currentReject = reject;
@@ -3561,6 +3564,10 @@
               <span><input id="tabbit-set-silent-auto-run" type="checkbox"> 🤫 静默模式（后台分析，不弹出面板，完成后悬浮球提示）</span>
               <small>开启后命中规则时在后台自动分析，完成后悬浮球右上角显示绿色提示，点击即可查看结果</small>
             </label>
+            <label class="tabbit-field">
+              <span><input id="tabbit-set-enable-thinking" type="checkbox"> 🧠 思考模式（Thinking）</span>
+              <small>关闭后请求不带 thinking 参数，可加快响应速度。适用于不支持或不需要思考模式的模型。</small>
+            </label>
             <div class="tabbit-section-title">📋 自动复制</div>
             <small class="tabbit-help">选中文本后自动复制到剪贴板，可选择是否附带页面标题和链接作为出处。也可右键点击浮动按钮快速切换。</small>
             <label class="tabbit-field">
@@ -3842,6 +3849,7 @@
     settingsEl.querySelector('#tabbit-set-ac-temp-minutes').value = config.acTempMinutes || 10;
     settingsEl.querySelector('#tabbit-set-auto-run').checked = !!config.autoRun;
     settingsEl.querySelector('#tabbit-set-silent-auto-run').checked = !!config.silentAutoRun;
+    settingsEl.querySelector("#tabbit-set-enable-thinking").checked = !!config.enableThinking;
     settingsEl.querySelector('#tabbit-set-flomo-api').value = config.flomoApiUrl || '';
     settingsEl.querySelector('#tabbit-set-flomo-tags').value = config.flomoTags || '#饺子AI摘要';
     settingsEl.querySelector('#tabbit-set-auto-copy').checked = config.autoCopy?.enabled !== false;
@@ -4024,6 +4032,7 @@
     syncUrlRulesFromSettings();
     config.autoRun = settingsEl.querySelector('#tabbit-set-auto-run').checked;
     config.silentAutoRun = settingsEl.querySelector('#tabbit-set-silent-auto-run').checked;
+    config.enableThinking = settingsEl.querySelector("#tabbit-set-enable-thinking").checked;
     config.extractMaxChars = Number(settingsEl.querySelector('#tabbit-set-extract-max').value || 16000);
     config.apiTimeout = Number(settingsEl.querySelector('#tabbit-set-api-timeout').value || 120000);
     config.acMinLen = Number(settingsEl.querySelector('#tabbit-set-ac-min-len').value || 2);

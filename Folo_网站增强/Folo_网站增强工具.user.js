@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Folo 网站增强工具
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      14.0.1
+// @version      14.0.3
 // @description  Folo 增强：Jina Reader + Readability + 启发式三级抓取 + AI 总结 + 自动总结 + 手动列表全量预加载 + 后续对话 + 多配置管理 + 坚果云 WebDAV 同步 + 复制对话 + 保存到 flomo
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
@@ -16,8 +16,8 @@
 // @connect      *
 // @run-at       document-start
 // @license      MIT
-// @downloadURL https://update.greasyfork.org/scripts/576150/Folo%20%E7%BD%91%E7%AB%99%E5%A2%9E%E5%BC%BA%E5%B7%A5%E5%85%B7%20%28v134%20flomo%E9%9B%86%E6%88%90%E7%89%88%29.user.js
-// @updateURL https://update.greasyfork.org/scripts/576150/Folo%20%E7%BD%91%E7%AB%99%E5%A2%9E%E5%BC%BA%E5%B7%A5%E5%85%B7%20%28v134%20flomo%E9%9B%86%E6%88%90%E7%89%88%29.meta.js
+// @downloadURL https://update.greasyfork.org/scripts/576150/Folo%20%E7%BD%91%E7%AB%99%E5%A2%9E%E5%BC%BA%E5%B7%A5%E5%85%B7.user.js
+// @updateURL https://update.greasyfork.org/scripts/576150/Folo%20%E7%BD%91%E7%AB%99%E5%A2%9E%E5%BC%BA%E5%B7%A5%E5%85%B7.meta.js
 // ==/UserScript==
 
 (function() {
@@ -514,6 +514,8 @@
     function setPreloadConcurrency(v) { GM_setValue("ai_preload_concurrency", Math.max(1, Math.min(3, Number(v) || 2))); }
     function getPreloadIframeEnabled() { return GM_getValue("ai_preload_iframe_enabled", false) === true; }
     function setPreloadIframeEnabled(v) { GM_setValue("ai_preload_iframe_enabled", !!v); }
+    function getThinkingEnabled() { return GM_getValue("ai_thinking_enabled", true) !== false; }
+    function setThinkingEnabled(v) { GM_setValue("ai_thinking_enabled", !!v); }
     function getIgnoredPreloadScopes() {
         const scopes = GM_getValue("ai_preload_ignored_scopes", {});
         return scopes && typeof scopes === "object" ? scopes : {};
@@ -1929,16 +1931,30 @@
             showSettingsModal();
             return;
         }
-        // Collect articles from current DOM, enriched with PRELOAD_ARTICLES data
+        // Collect articles: primarily from PRELOAD_ARTICLES (accumulates across scroll),
+        // filtered to current scope, then supplement with any DOM-only articles
         const route = getTimelineRouteInfo(location.href);
-        const anchors = getCurrentListArticleAnchors(route);
+        const currentScope = route.scopePath;
+        const currentScopeKey = getTimelineScopeCompareKey(currentScope);
         const articles = [];
         const seen = new Set();
-        // Build lookup from PRELOAD_ARTICLES by entryId for enrichment
-        const preloadByEntry = new Map();
+
+        // 1. Primary source: PRELOAD_ARTICLES filtered to current scope
         PRELOAD_ARTICLES.forEach(item => {
-            if (item.entryId) preloadByEntry.set(String(item.entryId), item);
+            if (!item.entryId || !item.title) return;
+            if (item.appUrl) {
+                const itemScope = getTimelineRouteInfo(item.appUrl).scopePath;
+                const itemScopeKey = getTimelineScopeCompareKey(itemScope);
+                if (itemScope !== currentScope && !(currentScopeKey && itemScopeKey && currentScopeKey === itemScopeKey)) return;
+            }
+            const eid = String(item.entryId);
+            if (seen.has(eid)) return;
+            seen.add(eid);
+            articles.push({ title: item.title, url: item.url || "", appUrl: item.appUrl || "", entryId: eid, text: item.text || "" });
         });
+
+        // 2. Supplement: DOM articles not yet in PRELOAD_ARTICLES
+        const anchors = getCurrentListArticleAnchors(route);
         anchors.forEach(a => {
             const info = getTimelineRouteInfo(a.href);
             const entryId = info.entryId;
@@ -1947,10 +1963,7 @@
             const title = getTitleFromRow(a);
             if (!title) return;
             const domText = getVisibleRowText(a);
-            const cached = preloadByEntry.get(String(entryId));
-            const url = (cached && cached.url) || "";
-            const text = (cached && cached.text) || domText;
-            articles.push({ title, url, appUrl: a.href, entryId, text });
+            articles.push({ title, url: "", appUrl: a.href, entryId, text: domText });
         });
 
         if (!articles.length) {
@@ -3038,6 +3051,14 @@
                     </div>
 
                     <div class="my-input-group">
+                        <label class="my-input-label">🧠 思考模式</label>
+                        <div class="auto-summary-row">
+                            <label><input type="checkbox" id="cfg-thinking"> 开启思考模式（Thinking）</label>
+                            <div class="desc">关闭后请求不带 thinking 参数，可加快响应速度。适用于不支持或不需要思考模式的模型。</div>
+                        </div>
+                    </div>
+
+                    <div class="my-input-group">
                         <label class="my-input-label">📊 列表分析</label>
                         <div class="auto-summary-row">
                             <div style="font-size:11px;color:#888;margin-bottom:4px;">分析提示词（可用变量：{{total}} 文章数，{{analysisHint}} 分析提示）</div>
@@ -3115,6 +3136,7 @@
         loadFormData(getActiveConfig());
         loadStrategiesUI();
         document.getElementById('cfg-auto-summarize').checked = getAutoSummarizeEnabled();
+        document.getElementById("cfg-thinking").checked = getThinkingEnabled();
         document.getElementById('cfg-overview-prompt').value = getOverviewPrompt();
         document.getElementById('cfg-flomo-url').value = getFlomoApiUrl();
         document.getElementById('cfg-flomo-tags').value = getFlomoTags();
@@ -3260,6 +3282,7 @@
             saveFormToProfile(modal.__lastProfileId);
             saveStrategiesFromUI();
             setAutoSummarizeEnabled(document.getElementById('cfg-auto-summarize').checked);
+            setThinkingEnabled(document.getElementById("cfg-thinking").checked);
             setFlomoApiUrl(document.getElementById('cfg-flomo-url').value);
             setFlomoTags(document.getElementById('cfg-flomo-tags').value);
             persistWebDAVCredsFromForm();
@@ -3303,6 +3326,7 @@
             saveFormToProfile(modal.__lastProfileId);
             saveStrategiesFromUI();
             setAutoSummarizeEnabled(document.getElementById('cfg-auto-summarize').checked);
+            setThinkingEnabled(document.getElementById("cfg-thinking").checked);
             setFlomoApiUrl(document.getElementById('cfg-flomo-url').value);
             setFlomoTags(document.getElementById('cfg-flomo-tags').value);
             persistWebDAVCredsFromForm();
@@ -3367,6 +3391,7 @@
             saveFormToProfile(modal.__lastProfileId);
             saveStrategiesFromUI();
             setAutoSummarizeEnabled(document.getElementById('cfg-auto-summarize').checked);
+            setThinkingEnabled(document.getElementById("cfg-thinking").checked);
             setOverviewPrompt(document.getElementById('cfg-overview-prompt').value.trim());
             setFlomoApiUrl(document.getElementById('cfg-flomo-url').value);
             setFlomoTags(document.getElementById('cfg-flomo-tags').value);
@@ -3379,6 +3404,14 @@
     }
 
     // ==================== 6. AI 调用 ====================
+    function buildRequestBody(model, messages, stream) {
+        const body = { model, messages };
+        if (stream) body.stream = true;
+        if (!getThinkingEnabled()) { body.thinking = { type: "disabled" }; body.enable_thinking = false; }
+        return body;
+    }
+
+
     function callAIChat(messages, onSuccess, onError, onChunk) {
         const config = getActiveConfig();
         if (!config.apiKey) {
@@ -3393,7 +3426,7 @@
             GM_xmlhttpRequest({
                 method: "POST", url: finalUrl,
                 headers: { "Content-Type": "application/json", "Authorization": "Bearer " + config.apiKey },
-                data: JSON.stringify({ model: config.model, messages: messages }),
+                data: JSON.stringify(buildRequestBody(config.model, messages, false)),
                 onload: (res) => {
                     if (res.responseText.trim().startsWith("<")) {
                         onError && onError("URL 错误 (返回了 HTML)");
@@ -3453,7 +3486,7 @@
                         'Authorization': 'Bearer ' + config.apiKey,
                         'Accept': 'text/event-stream'
                     },
-                    body: JSON.stringify({ model: config.model, messages: messages, stream: true }),
+                    body: JSON.stringify(buildRequestBody(config.model, messages, true)),
                     signal: controller.signal
                 });
 
@@ -3554,7 +3587,7 @@
                     "Authorization": "Bearer " + config.apiKey,
                     "Accept": "text/event-stream"
                 },
-                data: JSON.stringify({ model: config.model, messages: messages, stream: true }),
+                data: JSON.stringify(buildRequestBody(config.model, messages, true)),
                 responseType: 'stream',
                 onprogress: (e) => {
                     if (aborted) return;

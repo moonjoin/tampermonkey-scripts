@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站省流助手 - 字幕AI摘要 Pro
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      4.3.1
+// @version      4.3.3
 // @description  自动提取B站视频字幕，通过自定义AI API生成极简摘要，支持模型切换、持续对话和评论区总结；支持自动解析开关、自动获取模型列表、flomo自动加标签，新增总结生图功能；v3.9.0 新增html PPT模式；v4.0.0 新增新手引导和API兜底功能（无API时仍可下载字幕、一键复制提示词+字幕到其他AI）
 // @author       次元饺子
 // @match        https://www.bilibili.com/video/*
@@ -898,6 +898,7 @@
     summaryMaxTokens: 4000,
     skipDuration: 60,
     autoParse: true,
+    enableThinking: true,
     promptPresets: DEFAULT_PRESETS,
     activePresetId: 'preset_default',
     enableImageGen: false,
@@ -5773,6 +5774,13 @@
   }
 
   // ==================== AI 调用 ====================
+  function buildReqBody(model, messages, opts) {
+    var body = { model: model, messages: messages, temperature: opts.temperature || 0.7, max_tokens: opts.maxTokens || 2000 };
+    if (opts.stream) body.stream = true;
+    if (CONFIG.enableThinking === false) { body.thinking = { type: "disabled" }; body.enable_thinking = false; }
+    return body;
+  }
+
   // 兼容旧逻辑：非流式
   async function callAI(messages) {
     if (!CONFIG.apiUrl || !CONFIG.apiKey || !currentModel) {
@@ -5785,12 +5793,7 @@
         'Content-Type': 'application/json',
         'Authorization': 'Bearer ' + CONFIG.apiKey
       },
-      body: JSON.stringify({
-        model: currentModel,
-        messages: messages,
-        temperature: 0.7,
-        max_tokens: 2000
-      })
+      body: JSON.stringify(buildReqBody(currentModel, messages, { temperature: 0.7, maxTokens: 2000 }))
     });
     if (!res.ok) {
       const errText = await res.text();
@@ -5832,13 +5835,7 @@
           'Content-Type': 'application/json',
           'Authorization': 'Bearer ' + apiKey
         },
-        body: JSON.stringify({
-          model: model,
-          messages: messages,
-          temperature: temperature,
-          max_tokens: maxTokens,
-          stream: true
-        }),
+        body: JSON.stringify(buildReqBody(model, messages, { temperature: temperature, maxTokens: maxTokens, stream: true })),
         signal: signal // 🆕 关键！把 AbortSignal 传给 fetch
       });
     } catch (netErr) {
@@ -7449,6 +7446,16 @@
               </label>
             </div>
           </div>
+          <div class="tabbit-settings-group" style="margin-top:8px;">
+            <div>
+              <div class="tabbit-settings-label">🧠 思考模式</div>
+              <div class="tabbit-settings-hint" style="margin-top:2px;">关闭后请求不带 thinking 参数，可加快响应速度</div>
+            </div>
+            <label class="tabbit-switch">
+              <input type="checkbox" id="ts-enableThinking" ${CONFIG.enableThinking !== false ? "checked" : ""} />
+              <span class="tabbit-slider"></span>
+            </label>
+          </div>
 
           <div class="tabbit-collapse">
             <div class="tabbit-collapse-header" data-collapse="api-settings">
@@ -8179,6 +8186,7 @@
       const newSkipDuration = parseInt(overlay.querySelector('#ts-skipDuration').value, 10);
       CONFIG.skipDuration = isNaN(newSkipDuration) ? 60 : newSkipDuration;
       CONFIG.autoParse = newAutoParse;
+      CONFIG.enableThinking = overlay.querySelector('#ts-enableThinking') ? overlay.querySelector('#ts-enableThinking').checked : true;
       CONFIG.enableImageGen = overlay.querySelector('#ts-enableImageGen').checked;
       CONFIG.imageGenMode = overlay.querySelector('#ts-imageGenMode').value === 'flow' ? 'flow' : 'api';
       CONFIG.flowProjectUrl = (overlay.querySelector('#ts-flowProjectUrl').value || '').trim() || DEFAULT_FLOW_PROJECT_URL;
