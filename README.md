@@ -3,7 +3,7 @@
 次元饺子个人定制油猴脚本合集，核心是：把网页、B站、Folo、浏览记录里的信息，借助AI大模型能力，自动整理成更好读、可保存、可同步的内容。
 
 - 发布站：https://greasyfork.org/zh-CN/users/1593947-moon-join
-- 国内代理：https://home.greasyfork.org.cn/zh-hans/lookup/#?q=moonjoin
+- 国内代理：[https://home.greasyfork.org.cn/zh-hans/lookup/#?q=moonjoin](https://home.greasyfork.org.cn/zh-hans/lookup#?q=moonjoin&filter_locale=0)
 - B站主页：https://space.bilibili.com/38389107
 - 开源协议：MIT
 
@@ -178,17 +178,11 @@
 总结类任务优先选 Flash / 轻量模型：速度快、成本低，适合摘要、提炼、改写。
 
 当前默认配置偏向：
-- `mimo-v2-flash`
+- `mimo-v2.5`
 - `deepseek-v4-flash`
 - `gemini-3-flash-preview`
 - `claude-haiku` 类模型
 
 原则：先用快模型做摘要；只有需要深度分析、复杂推理时再换强模型。
-
-想要试试生图 API 的可以试试这个：https://api.laozhang.ai/register/?aff_code=OUla ，
-大概是我找到的国内最便宜的中转站了，
-gemini-3.1-flash-image-preview（Nano Banana 2）1K（1024px） 
-一张图 0.04刀（3 毛钱一张），注册送 0.5 刀 ，可以免费生成 10-11 张。
-或者目前还看到有 gpt-image-2，按次收费，0.03 刀一张，更优解。
 
 <img width="772" height="1004" alt="模型参考" src="https://github.com/user-attachments/assets/6189d7fc-d2ec-4386-8cd7-315342dd3ff6" />
