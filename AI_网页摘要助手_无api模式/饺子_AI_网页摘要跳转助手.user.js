@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         饺子 AI 网页摘要跳转助手
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      0.4.2
+// @version      0.4.4
 // @description  精简跳转模式：抓取网页正文，套提示词模板，发送到常驻 ChatGPT 接收端自动提交。
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
@@ -14,6 +14,7 @@
 // @grant        GM_addValueChangeListener
 // @grant        GM_registerMenuCommand
 // @grant        GM_openInTab
+// @grant        GM_notification
 // @run-at       document-idle
 // @license      MIT
 // ==/UserScript==
@@ -27,6 +28,7 @@
   const CHATGPT_OPENING_KEY = 'tabbit_ai_jump_chatgpt_opening_v1';
   const TASK_LOG_KEY = 'tabbit_ai_jump_task_log_v1';
   const AUTO_RUN_STATE_KEY = 'tabbit_ai_jump_auto_run_state_v1';
+  const CHATGPT_ACTIVE_REPLY_TASK_KEY = 'tabbit_chatgpt_active_reply_task_v1';
   const PANEL_ID = 'tabbit-ai-jump-panel';
   const FLOAT_BTN_ID = 'tabbit-ai-jump-float-btn';
   const STYLE_ID = 'tabbit-ai-jump-style';
@@ -35,6 +37,10 @@
   const CHATGPT_HEARTBEAT_MAX_AGE_MS = 35000;
   const CHATGPT_OPENING_COOLDOWN_MS = 45000;
   const READABILITY_MIN_TEXT_LENGTH = 160;
+  const CHATGPT_NOTIFY_REPLY_MAX_LEN = 120;
+  const CHATGPT_NOTIFY_MIN_INTERVAL_MS = 5000;
+  const CHATGPT_NOTIFY_ONLY_BACKGROUND = true;
+  const CHATGPT_NOTIFY_SOUND = true;
 
   const LEGACY_DEFAULT_PROMPT_PREFIX = '请阅读下面网页内容，并用中文给我一份结构化摘要。';
 
@@ -75,6 +81,12 @@
 
   let config = loadConfig();
   let panelEl = null;
+  let chatGptReplyObserver = null;
+  let chatGptReplyCheckTimer = null;
+  let chatGptNotifyAudioCtx = null;
+  let chatGptLastNotifyAt = 0;
+  let chatGptWasGenerating = false;
+  let chatGptGenericCompleting = false;
 
   function clone(obj) {
     return JSON.parse(JSON.stringify(obj));
@@ -1221,6 +1233,228 @@
     }, type === 'error' ? 5000 : 2200);
   }
 
+  function readActiveChatGptReplyTask() {
+    try {
+      const raw = sessionStorage.getItem(CHATGPT_ACTIVE_REPLY_TASK_KEY);
+      return raw ? JSON.parse(raw) : null;
+    } catch (err) {
+      sessionStorage.removeItem(CHATGPT_ACTIVE_REPLY_TASK_KEY);
+      return null;
+    }
+  }
+
+  function writeActiveChatGptReplyTask(task) {
+    if (!task?.id) return;
+    sessionStorage.setItem(CHATGPT_ACTIVE_REPLY_TASK_KEY, JSON.stringify(task));
+  }
+
+  function clearActiveChatGptReplyTask(taskId) {
+    const current = readActiveChatGptReplyTask();
+    if (taskId && current?.id && current.id !== taskId) return;
+    sessionStorage.removeItem(CHATGPT_ACTIVE_REPLY_TASK_KEY);
+  }
+
+  function getChatGptAssistantMessageCount() {
+    return document.querySelectorAll('[data-message-author-role="assistant"]').length;
+  }
+
+  function isChatGptGeneratingReply() {
+    return !!document.querySelector([
+      'button[data-testid="stop-button"]',
+      'button[aria-label*="Stop"]',
+      'button[aria-label*="stop"]',
+      'button[aria-label*="停止"]',
+      'button[aria-label*="中止"]'
+    ].join(','));
+  }
+
+  function getLastChatGptAssistantText() {
+    const nodes = document.querySelectorAll([
+      '[data-message-author-role="assistant"] .markdown',
+      '[data-message-author-role="assistant"]'
+    ].join(','));
+    if (!nodes.length) return '';
+
+    const text = (nodes[nodes.length - 1].innerText || '').replace(/\s+/g, ' ').trim();
+    if (!text) return '';
+    return text.length > CHATGPT_NOTIFY_REPLY_MAX_LEN
+      ? text.slice(0, CHATGPT_NOTIFY_REPLY_MAX_LEN) + '...'
+      : text;
+  }
+
+  function initChatGptNotifyAudio() {
+    if (!CHATGPT_NOTIFY_SOUND) return;
+    try {
+      if (!chatGptNotifyAudioCtx) {
+        chatGptNotifyAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      }
+      if (chatGptNotifyAudioCtx.state === 'suspended') {
+        chatGptNotifyAudioCtx.resume().catch(() => {});
+      }
+    } catch (err) {
+      console.warn('[饺子AI跳转] 通知音频初始化失败：', err);
+    }
+  }
+
+  function playChatGptNotifySound() {
+    if (!CHATGPT_NOTIFY_SOUND) return;
+    try {
+      initChatGptNotifyAudio();
+      if (!chatGptNotifyAudioCtx) return;
+
+      const tone = (freq, delay, duration, volume) => {
+        const start = chatGptNotifyAudioCtx.currentTime + delay;
+        const oscillator = chatGptNotifyAudioCtx.createOscillator();
+        const gain = chatGptNotifyAudioCtx.createGain();
+        oscillator.type = 'sine';
+        oscillator.frequency.setValueAtTime(freq, start);
+        gain.gain.setValueAtTime(0.0001, start);
+        gain.gain.exponentialRampToValueAtTime(volume, start + 0.03);
+        gain.gain.exponentialRampToValueAtTime(0.0001, start + duration);
+        oscillator.connect(gain);
+        gain.connect(chatGptNotifyAudioCtx.destination);
+        oscillator.start(start);
+        oscillator.stop(start + duration + 0.03);
+      };
+
+      tone(523.25, 0, 0.16, 0.07);
+      tone(659.25, 0.12, 0.18, 0.06);
+      tone(783.99, 0.25, 0.24, 0.05);
+    } catch (err) {
+      console.warn('[饺子AI跳转] 提示音播放失败：', err);
+    }
+  }
+
+  function notifyChatGptReplyDone(task, replyText, options) {
+    const opts = options || {};
+    const now = Date.now();
+    if (now - chatGptLastNotifyAt < CHATGPT_NOTIFY_MIN_INTERVAL_MS) return;
+    chatGptLastNotifyAt = now;
+
+    const title = opts.title || (task?.sourceTitle ? `网页摘要完成：${task.sourceTitle}` : 'ChatGPT 回复完成');
+    const text = replyText || 'ChatGPT 已经生成完毕。';
+    if (CHATGPT_NOTIFY_ONLY_BACKGROUND && !document.hidden) {
+      showChatGptAdapterToast(text, 'ok');
+      return;
+    }
+
+    playChatGptNotifySound();
+    if (typeof GM_notification === 'function') {
+      GM_notification({
+        title,
+        text,
+        timeout: 8000,
+        onclick: () => {
+          try { window.focus(); } catch (err) {}
+        }
+      });
+    } else {
+      showChatGptAdapterToast(text, 'ok');
+    }
+  }
+
+  function markChatGptReplyWatchTask(task) {
+    if (!task?.id) return;
+    writeActiveChatGptReplyTask({
+      id: task.id,
+      sourceTitle: task.sourceTitle || '无标题',
+      sourceUrl: task.sourceUrl || '',
+      receiverUrl: location.href,
+      sentAt: Date.now(),
+      assistantCountBefore: getChatGptAssistantMessageCount(),
+      observedGenerating: false,
+      wasGenerating: false,
+      completing: false
+    });
+    scheduleChatGptReplyCompletionCheck();
+  }
+
+  function completeChatGptReplyTask(task) {
+    const current = readActiveChatGptReplyTask();
+    if (!current?.id || current.id !== task.id) return;
+    const replyText = getLastChatGptAssistantText();
+    upsertTaskLog(task.id, {
+      status: 'ChatGPT 回复完成',
+      completedAt: Date.now(),
+      receiverUrl: location.href,
+      replyPreview: replyText
+    });
+    clearActiveChatGptReplyTask(task.id);
+    notifyChatGptReplyDone(task, replyText);
+  }
+
+  function notifyGenericChatGptReplyDone() {
+    const replyText = getLastChatGptAssistantText();
+    notifyChatGptReplyDone(null, replyText, { title: 'ChatGPT 回复完成' });
+  }
+
+  function scheduleChatGptReplyCompletionCheck() {
+    clearTimeout(chatGptReplyCheckTimer);
+    chatGptReplyCheckTimer = setTimeout(() => {
+      const task = readActiveChatGptReplyTask();
+      const generating = isChatGptGeneratingReply();
+      if (generating) {
+        chatGptWasGenerating = true;
+        chatGptGenericCompleting = false;
+      }
+
+      if (!task?.id) {
+        if (chatGptWasGenerating && !generating && !chatGptGenericCompleting) {
+          chatGptGenericCompleting = true;
+          setTimeout(() => {
+            if (!isChatGptGeneratingReply()) {
+              notifyGenericChatGptReplyDone();
+              chatGptWasGenerating = false;
+              chatGptGenericCompleting = false;
+            } else {
+              chatGptGenericCompleting = false;
+            }
+          }, 1500);
+        }
+        return;
+      }
+
+      if (Date.now() - Number(task.sentAt || 0) > 60 * 60 * 1000) {
+        clearActiveChatGptReplyTask(task.id);
+        return;
+      }
+
+      if (generating) {
+        writeActiveChatGptReplyTask({
+          ...task,
+          observedGenerating: true,
+          wasGenerating: true,
+          completing: false,
+          lastGeneratingAt: Date.now()
+        });
+        return;
+      }
+
+      if ((task.observedGenerating || task.wasGenerating) && !task.completing) {
+        writeActiveChatGptReplyTask({ ...task, wasGenerating: false, completing: true });
+        setTimeout(() => {
+          if (!isChatGptGeneratingReply()) completeChatGptReplyTask(task);
+          else writeActiveChatGptReplyTask({ ...task, completing: false, wasGenerating: true });
+        }, 1500);
+      }
+    }, 200);
+  }
+
+  function setupChatGptReplyCompletionNotifier() {
+    window.addEventListener('click', initChatGptNotifyAudio, { once: true });
+    window.addEventListener('keydown', initChatGptNotifyAudio, { once: true });
+    window.addEventListener('pointerdown', initChatGptNotifyAudio, { once: true });
+
+    if (chatGptReplyObserver) return;
+    chatGptReplyObserver = new MutationObserver(scheduleChatGptReplyCompletionCheck);
+    chatGptReplyObserver.observe(document.body, {
+      childList: true,
+      subtree: true,
+      attributes: true
+    });
+    scheduleChatGptReplyCompletionCheck();
+  }
+
   function findChatGptPromptInput() {
     const selectors = [
       '#prompt-textarea',
@@ -1301,8 +1535,9 @@
     }
 
     sendButton.click();
+    markChatGptReplyWatchTask(task);
     showChatGptAdapterToast('已发送网页摘要任务', 'ok');
-    upsertTaskLog(task.id, { status: 'ChatGPT 已发送', sentAt: Date.now(), receiverUrl: location.href });
+    upsertTaskLog(task.id, { status: 'ChatGPT 已发送，等待回复', sentAt: Date.now(), receiverUrl: location.href });
     return true;
   }
 
@@ -1342,6 +1577,7 @@
     } catch (err) {}
     writeChatGptReceiverHeartbeat();
     setInterval(writeChatGptReceiverHeartbeat, CHATGPT_HEARTBEAT_INTERVAL_MS);
+    setupChatGptReplyCompletionNotifier();
 
     const handleTaskValue = (value) => {
       const task = parsePendingChatGptTask(value, true);
