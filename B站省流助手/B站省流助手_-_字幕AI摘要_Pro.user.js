@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站省流助手 - 字幕AI摘要 Pro
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      4.3.3
+// @version      4.3.4
 // @description  自动提取B站视频字幕，通过自定义AI API生成极简摘要，支持模型切换、持续对话和评论区总结；支持自动解析开关、自动获取模型列表、flomo自动加标签，新增总结生图功能；v3.9.0 新增html PPT模式；v4.0.0 新增新手引导和API兜底功能（无API时仍可下载字幕、一键复制提示词+字幕到其他AI）
 // @author       次元饺子
 // @match        https://www.bilibili.com/video/*
@@ -1295,6 +1295,9 @@
   // 🆕 当前正在进行的 AI 任务的 AbortController（用于打断流式输出）
   let currentAbortController = null;
   let currentSubtitleManualFallback = null;
+  let subtitleCaptureInstalled = false;
+  let subtitleCaptureEntries = [];
+  let subtitleCaptureWaiters = [];
 
   function getSummaryMaxTokens() {
     const n = parseInt(CONFIG.summaryMaxTokens, 10);
@@ -1840,6 +1843,176 @@
       console.log('[省流助手] 字幕内容获取失败:', e.message);
       return [];
     }
+  }
+
+  function parseSubtitleJsonText(text) {
+    if (!text || typeof text !== 'string') return null;
+    var cleaned = text.replace(/^\uFEFF/, '');
+    try {
+      return JSON.parse(cleaned);
+    } catch(e) {}
+    var match = cleaned.match(/\{[\s\S]*\}$/);
+    if (match) {
+      try {
+        return JSON.parse(match[0]);
+      } catch(e) {}
+    }
+    return null;
+  }
+
+  function findSubtitleSegmentsDeep(node, seen) {
+    if (!node || typeof node !== 'object') return [];
+    seen = seen || new Set();
+    if (seen.has(node)) return [];
+    seen.add(node);
+
+    var direct = normalizeSubtitleSegments(node);
+    if (direct.length) return direct;
+
+    if (Array.isArray(node)) {
+      for (var i = 0; i < node.length; i++) {
+        var fromItem = findSubtitleSegmentsDeep(node[i], seen);
+        if (fromItem.length) return fromItem;
+      }
+      return [];
+    }
+
+    for (var key of Object.keys(node)) {
+      var found = findSubtitleSegmentsDeep(node[key], seen);
+      if (found.length) return found;
+    }
+    return [];
+  }
+
+  function acceptCapturedSubtitle(url, text, json) {
+    var payload = json || parseSubtitleJsonText(text);
+    var segments = findSubtitleSegmentsDeep(payload);
+    if (!segments.length) return;
+
+    var transcript = formatTranscript(segments);
+    if (!transcript.trim()) return;
+
+    var entry = {
+      url: url || '',
+      segments: segments,
+      transcript: transcript,
+      createdAt: Date.now()
+    };
+    subtitleCaptureEntries.push(entry);
+    if (subtitleCaptureEntries.length > 5) subtitleCaptureEntries.shift();
+    console.log('[省流助手-捕获模式] 已捕获字幕:', url, '段数:', segments.length);
+
+    var waiters = subtitleCaptureWaiters.slice();
+    subtitleCaptureWaiters = [];
+    waiters.forEach(function(waiter) {
+      waiter.resolve(entry);
+    });
+  }
+
+  function installSubtitleCaptureInterceptor() {
+    if (subtitleCaptureInstalled) return;
+    subtitleCaptureInstalled = true;
+    var urlRe = /subtitle/i;
+
+    var originalFetch = window.fetch;
+    if (typeof originalFetch === 'function') {
+      window.fetch = async function() {
+        var response = await originalFetch.apply(this, arguments);
+        try {
+          var req = arguments[0];
+          var url = typeof req === 'string' ? req : (req && req.url) || '';
+          if (urlRe.test(url) && response && typeof response.clone === 'function') {
+            response.clone().text().then(function(text) {
+              acceptCapturedSubtitle(url, text, null);
+            }).catch(function(e) {
+              console.log('[省流助手-捕获模式] fetch 响应读取失败:', e.message);
+            });
+          }
+        } catch(e) {
+          console.log('[省流助手-捕获模式] fetch 捕获失败:', e.message);
+        }
+        return response;
+      };
+    }
+
+    var XHR = window.XMLHttpRequest;
+    if (XHR && XHR.prototype) {
+      var originalOpen = XHR.prototype.open;
+      var originalSend = XHR.prototype.send;
+      XHR.prototype.open = function(method, url) {
+        this._tabbitSubtitleCaptureUrl = url || '';
+        return originalOpen.apply(this, arguments);
+      };
+      XHR.prototype.send = function() {
+        var xhr = this;
+        var url = xhr._tabbitSubtitleCaptureUrl || '';
+        if (urlRe.test(url)) {
+          xhr.addEventListener('readystatechange', function() {
+            if (xhr.readyState !== 4) return;
+            try {
+              var text = typeof xhr.responseText === 'string' ? xhr.responseText : '';
+              acceptCapturedSubtitle(url, text, null);
+            } catch(e) {
+              console.log('[省流助手-捕获模式] XHR 捕获失败:', e.message);
+            }
+          });
+        }
+        return originalSend.apply(this, arguments);
+      };
+    }
+
+    console.log('[省流助手-捕获模式] 字幕请求监听已启用');
+  }
+
+  function waitForCapturedSubtitle(timeoutMs, signal) {
+    installSubtitleCaptureInterceptor();
+    var latest = subtitleCaptureEntries[subtitleCaptureEntries.length - 1];
+    if (latest && Date.now() - latest.createdAt < 60000) {
+      return Promise.resolve(latest);
+    }
+
+    return new Promise(function(resolve, reject) {
+      var done = false;
+      var waiter = { resolve: finish, reject: fail };
+      var timer = setTimeout(function() {
+        fail(new Error('等待超时：请先点击播放器右下角的字幕按钮，并选择可用字幕'));
+      }, timeoutMs || 20000);
+
+      function cleanup() {
+        clearTimeout(timer);
+        subtitleCaptureWaiters = subtitleCaptureWaiters.filter(function(item) {
+          return item !== waiter;
+        });
+        if (signal) signal.removeEventListener('abort', onAbort);
+      }
+      function finish(entry) {
+        if (done) return;
+        done = true;
+        cleanup();
+        resolve(entry);
+      }
+      function fail(err) {
+        if (done) return;
+        done = true;
+        cleanup();
+        reject(err);
+      }
+      function onAbort() {
+        var abortErr = new Error('用户已打断');
+        abortErr.name = 'AbortError';
+        fail(abortErr);
+      }
+
+      subtitleCaptureWaiters.push(waiter);
+      if (signal) {
+        if (signal.aborted) onAbort();
+        else signal.addEventListener('abort', onAbort);
+      }
+    });
+  }
+
+  if (location.hostname === 'www.bilibili.com') {
+    installSubtitleCaptureInterceptor();
   }
 
   function normalizeSubtitleSegments(source) {
@@ -5478,6 +5651,10 @@
         <span class="tabbit-btn-icon">🔄</span>
         <span>手动获取字幕总结</span>
       </button>
+      <button class="tabbit-manual-fetch-btn" id="tabbit-capture-subtitle-btn">
+        <span class="tabbit-btn-icon">🎯</span>
+        <span>捕获模式：点播放器字幕后总结</span>
+      </button>
       <button class="tabbit-manual-fetch-btn tabbit-manual-upload-btn" id="tabbit-manual-upload-btn">
         <span class="tabbit-btn-icon">📤</span>
         <span>手动上传字幕（srt/txt/粘贴）</span>
@@ -5502,6 +5679,11 @@
     const manualFetchBtn = contentDiv.querySelector('#tabbit-manual-fetch-btn');
     if (manualFetchBtn) {
       manualFetchBtn.addEventListener('click', () => manualFetchSubtitle(panel, videoInfo));
+    }
+
+    const captureSubtitleBtn = contentDiv.querySelector('#tabbit-capture-subtitle-btn');
+    if (captureSubtitleBtn) {
+      captureSubtitleBtn.addEventListener('click', () => captureSubtitleFromPlayer(panel, videoInfo));
     }
 
     // 🆕 手动上传字幕按钮
@@ -5535,16 +5717,131 @@
     if (!btn) return;
     const spanEl = btn.querySelector('span:last-child');
     const iconEl = btn.querySelector('span:first-child');
+    if (spanEl && !btn.dataset.defaultText) btn.dataset.defaultText = spanEl.textContent || '';
+    if (iconEl && !btn.dataset.defaultIcon) btn.dataset.defaultIcon = iconEl.textContent || '';
     if (spanEl) spanEl.textContent = text;
     if (iconEl) iconEl.textContent = icon;
     if (resetAfterMs) {
       setTimeout(() => {
-        if (spanEl) spanEl.textContent = '手动获取字幕总结';
-        if (iconEl) iconEl.textContent = '🔄';
+        if (spanEl) spanEl.textContent = btn.dataset.defaultText || '手动获取字幕总结';
+        if (iconEl) iconEl.textContent = btn.dataset.defaultIcon || '🔄';
         btn.disabled = false;
       }, resetAfterMs);
     }
   }
+
+  function clickBiliElement(el) {
+    if (!el) return false;
+    try {
+      ['mouseover', 'mouseenter', 'mousedown', 'mouseup', 'click'].forEach(function(type) {
+        el.dispatchEvent(new MouseEvent(type, {
+          bubbles: true,
+          cancelable: true,
+          view: window
+        }));
+      });
+      if (typeof el.click === 'function') el.click();
+      return true;
+    } catch(e) {
+      try {
+        if (typeof el.click === 'function') {
+          el.click();
+          return true;
+        }
+      } catch(_) {}
+    }
+    return false;
+  }
+
+  function pickSubtitleLanguageItem() {
+    var selectors = [
+      '.bpx-player-ctrl-subtitle-language-item[data-lan="zh-CN"]',
+      '.bpx-player-ctrl-subtitle-language-item[data-lan="ai-zh"]',
+      '.bpx-player-ctrl-subtitle-language-item'
+    ];
+    for (var i = 0; i < selectors.length; i++) {
+      var item = document.querySelector(selectors[i]);
+      if (item) return item;
+    }
+    return null;
+  }
+
+  async function autoTriggerBiliSubtitleRequest() {
+    var languageItem = pickSubtitleLanguageItem();
+    if (languageItem && clickBiliElement(languageItem)) return true;
+
+    var subtitleBtn = document.querySelector('.bpx-player-ctrl-subtitle,.bpx-player-ctrl-btn-subtitle');
+    if (subtitleBtn && clickBiliElement(subtitleBtn)) {
+      await randomDelay(250, 350);
+      languageItem = pickSubtitleLanguageItem();
+      if (languageItem) clickBiliElement(languageItem);
+      return true;
+    }
+
+    var settingBtn = document.querySelector('.bpx-player-ctrl-setting');
+    if (settingBtn && clickBiliElement(settingBtn)) {
+      await randomDelay(250, 350);
+      var textItems = Array.from(document.querySelectorAll([
+        '.bpx-player-ctrl-setting-menu-item',
+        '.bpx-player-ctrl-setting-box button',
+        '.bpx-player-ctrl-setting-box [role="button"]',
+        '.bpx-player-ctrl-subtitle-menu button',
+        '.bpx-player-ctrl-subtitle-menu [role="button"]'
+      ].join(','))).filter(function(node) {
+        return node && node.textContent && /字幕|AI\s*字幕/.test(node.textContent);
+      });
+      for (var i = 0; i < textItems.length; i++) {
+        if (clickBiliElement(textItems[i])) return true;
+      }
+      return true;
+    }
+
+    return false;
+  }
+
+  async function captureSubtitleFromPlayer(panel, videoInfo) {
+    console.log('[省流助手-捕获模式] 开始等待播放器字幕请求...');
+    const contentDiv = panel.querySelector('.tabbit-panel-content');
+    const captureBtn = contentDiv.querySelector('#tabbit-capture-subtitle-btn');
+    const freshVideoInfo = getVideoInfo();
+    if (freshVideoInfo.bvid) {
+      videoInfo = freshVideoInfo;
+      currentVideoInfo = videoInfo;
+    }
+
+    if (captureBtn) {
+      captureBtn.disabled = true;
+      setFetchBtnState(captureBtn, '监听中：正在自动触发字幕', '👂');
+    }
+
+    try {
+      const capturePromise = waitForCapturedSubtitle(25000);
+      const triggered = await autoTriggerBiliSubtitleRequest();
+      if (captureBtn) {
+        setFetchBtnState(
+          captureBtn,
+          triggered ? '已自动触发，等待字幕响应' : '自动触发失败，请手动点字幕按钮',
+          triggered ? '⏳' : '👉'
+        );
+      }
+      const entry = await capturePromise;
+      rawSubtitleBody = entry.segments;
+      rawTranscript = entry.transcript;
+
+      if (!rawTranscript.trim()) {
+        setFetchBtnState(captureBtn, '捕获到字幕但文本为空', '😢', 3000);
+        return;
+      }
+
+      console.log('[省流助手-捕获模式] 捕获成功，开始摘要');
+      panel.querySelectorAll('.tabbit-model-chip').forEach(c => c.classList.remove('disabled'));
+      await runSummary(panel, rawTranscript, videoInfo, rawSubtitleBody);
+    } catch (err) {
+      console.error('[省流助手-捕获模式] 捕获失败:', err);
+      setFetchBtnState(captureBtn, err.message || '捕获失败，请重试', '❌', 3500);
+    }
+  }
+
   // ==================== 手动上传字幕 ====================
   function parseSubtitleTimeToSeconds(timeText) {
     if (!timeText) return 0;
