@@ -819,6 +819,34 @@
   const SUMMARY_CACHE_KEY = 'bili_summary_pro_summary_cache_v1';
   const SUMMARY_CACHE_MAX_ENTRIES = 20;
   const SUMMARY_CACHE_MAX_CHARS = 250000;
+  const RESULT_ACTION_BUTTON_IDS = [
+    'copy_summary', 'edit_summary', 'generate_image', 'copy_image_prompt',
+    'post_comment', 'html_ppt', 'send_flomo', 'download_transcript',
+    'download_srt', 'save_image', 'fill_image_comment'
+  ];
+
+  function getDefaultResultActionButtons() {
+    return RESULT_ACTION_BUTTON_IDS.map(function(id) {
+      return { id: id, enabled: true };
+    });
+  }
+
+  function normalizeResultActionButtons(raw) {
+    if (!Array.isArray(raw)) return getDefaultResultActionButtons();
+    if (raw.length === 0) return [];
+    var known = new Set(RESULT_ACTION_BUTTON_IDS);
+    var seen = new Set();
+    var out = [];
+    raw.forEach(function(item) {
+      if (!item || !known.has(item.id) || seen.has(item.id)) return;
+      seen.add(item.id);
+      out.push({ id: item.id, enabled: item.enabled !== false });
+    });
+    RESULT_ACTION_BUTTON_IDS.forEach(function(id) {
+      if (!seen.has(id)) out.push({ id: id, enabled: true });
+    });
+    return out;
+  }
 
   const DEFAULT_PRESETS = [
     {
@@ -922,7 +950,8 @@
     commentMinDelay: 1800,
     commentMaxDelay: 3800,
     autoSubmitCommentSummary: false,
-    enableAutoDownloadSubtitle: false
+    enableAutoDownloadSubtitle: false,
+    resultActionButtons: getDefaultResultActionButtons()
   };
 
   const SUMMARY_LENGTH_ERROR_MESSAGE = 'AI 输出被截断：finish_reason=length。请在设置中调大「普通摘要最大输出 tokens」，或换支持更大输出上限的模型/API。';
@@ -947,21 +976,25 @@
         const saved = JSON.parse(raw);
         const merged = Object.assign({}, DEFAULT_CONFIG, saved);
         merged.promptPresets = mergeBuiltInPromptPresets(merged.promptPresets);
+        merged.resultActionButtons = normalizeResultActionButtons(saved.resultActionButtons);
         return merged;
       }
     } catch(e) {
       console.warn('[省流助手] 读取配置失败，使用默认配置:', e.message);
     }
     return Object.assign({}, DEFAULT_CONFIG, {
-      promptPresets: mergeBuiltInPromptPresets(DEFAULT_CONFIG.promptPresets)
+      promptPresets: mergeBuiltInPromptPresets(DEFAULT_CONFIG.promptPresets),
+      resultActionButtons: normalizeResultActionButtons(undefined)
     });
   }
 
   function saveConfig(cfg) {
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(cfg));
+      return true;
     } catch(e) {
       console.warn('[省流助手] 保存配置失败:', e.message);
+      return false;
     }
   }
 
@@ -1141,8 +1174,6 @@
    */
   function showApiNotConfiguredFallback(contentDiv, videoInfo, reason) {
     var apiCheck = reason || isApiConfigured().reason;
-    var actionsDiv = contentDiv.querySelector('.tabbit-result-actions');
-    var hasSrt = hasStructuredSubtitleData(rawSubtitleBody);
 
     var fallbackHtml =
       '<div style="background:linear-gradient(135deg,#fff3e0 0%,#fff8e1 100%);border:1px solid #ffe0b2;border-radius:10px;padding:14px;margin-bottom:10px;">' +
@@ -1155,8 +1186,6 @@
         '</div>' +
         '<div style="display:flex;gap:8px;flex-wrap:wrap;">' +
           '<button class="tabbit-copy-btn" id="tabbit-copy-prompt-transcript" style="background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:white;border:none;font-weight:600;">📋 一键复制 提示词+字幕</button>' +
-          '<button class="tabbit-download-btn" id="tabbit-download-transcript-fallback">💾 下载字幕文件</button>' +
-          (hasSrt ? '<button class="tabbit-download-btn" id="tabbit-download-srt-fallback">🕒 下载 SRT</button>' : '') +
         '</div>' +
         '<div style="font-size:11px;color:#999;margin-top:8px;">💡 复制后打开 ChatGPT / DeepSeek / Kimi 等任意 AI，粘贴发送即可获得视频摘要</div>' +
       '</div>' +
@@ -1167,14 +1196,13 @@
       resultContainer.innerHTML = fallbackHtml;
     }
 
-    if (actionsDiv) {
-      actionsDiv.innerHTML = '';
-      appendSubtitleDownloadButtons(actionsDiv, videoInfo);
-      var modelTag = document.createElement('span');
-      modelTag.style.cssText = 'font-size:11px;color:#999;margin-left:auto;';
-      modelTag.textContent = '📌 v4.0 兜底模式';
-      actionsDiv.appendChild(modelTag);
-    }
+    contentDiv._tabbitResultActionContext = {
+      resultType: 'fallback', contentDiv: contentDiv, videoInfo: videoInfo,
+      summaryFallback: '', hasText: false, hasImage: false,
+      hasTimelineSubtitle: hasStructuredSubtitleData(rawSubtitleBody) && !!buildSrtContent(rawSubtitleBody),
+      modelLabel: '📌 v4.0 兜底模式'
+    };
+    refreshResultActionButtons(contentDiv);
 
     // 绑定一键复制按钮
     var copyBtn = contentDiv.querySelector('#tabbit-copy-prompt-transcript');
@@ -1189,23 +1217,6 @@
             copyBtn.style.background = 'linear-gradient(135deg,#667eea 0%,#764ba2 100%)';
           }, 3000);
         });
-      });
-    }
-
-    var downloadBtn = contentDiv.querySelector('#tabbit-download-transcript-fallback');
-    if (downloadBtn) {
-      downloadBtn.addEventListener('click', function() {
-        downloadTranscript(rawTranscript, videoInfo.title, videoInfo.upName, videoInfo.bvid);
-      });
-    }
-
-    var downloadSrtBtn = contentDiv.querySelector('#tabbit-download-srt-fallback');
-    if (downloadSrtBtn) {
-      downloadSrtBtn.addEventListener('click', function() {
-        var ok = downloadSubtitleSrt(rawSubtitleBody, videoInfo.title, videoInfo.upName, videoInfo.bvid);
-        if (!ok) {
-          alert('当前没有可导出的时间轴字幕');
-        }
       });
     }
 
@@ -2339,31 +2350,6 @@
 
   function hasStructuredSubtitleData(subtitles) {
     return normalizeSubtitleSegments(subtitles).length > 0;
-  }
-
-  function appendSubtitleDownloadButtons(container, videoInfo) {
-    if (!container || !videoInfo) return;
-    var downloadBtn = document.createElement('button');
-    downloadBtn.className = 'tabbit-download-btn';
-    downloadBtn.textContent = '💾 下载字幕';
-    downloadBtn.addEventListener('click', function() {
-      downloadTranscript(rawTranscript, videoInfo.title, videoInfo.upName, videoInfo.bvid);
-    });
-    container.appendChild(downloadBtn);
-
-    if (hasStructuredSubtitleData(rawSubtitleBody)) {
-      var srtBtn = document.createElement('button');
-      srtBtn.className = 'tabbit-download-btn';
-      srtBtn.textContent = '🕒 下载 SRT';
-      srtBtn.title = '导出当前拿到的原始时间轴字幕';
-      srtBtn.addEventListener('click', function() {
-        var ok = downloadSubtitleSrt(rawSubtitleBody, videoInfo.title, videoInfo.upName, videoInfo.bvid);
-        if (!ok) {
-          alert('当前没有可导出的时间轴字幕');
-        }
-      });
-      container.appendChild(srtBtn);
-    }
   }
 
   function downloadGeneratedImage(imageDataUrl, videoInfo, suffix) {
@@ -3641,6 +3627,7 @@
         margin-bottom: 12px;
         flex-wrap: wrap;
       }
+      .tabbit-result-actions:empty, .tabbit-img-actions:empty { display: none !important; }
       .tabbit-copy-btn, .tabbit-download-btn {
         display: inline-flex;
         align-items: center;
@@ -4114,6 +4101,20 @@
       .tabbit-settings-group {
         margin-bottom: 18px;
       }
+      .tabbit-result-action-settings-item {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 7px 8px;
+        border: 1px solid #e3e5ee;
+        border-radius: 8px;
+        background: #fff;
+        margin-top: 6px;
+        font-size: 12px;
+      }
+      .tabbit-result-action-settings-item label { flex: 1; cursor: pointer; }
+      .tabbit-result-action-settings-item button { min-width: 28px; padding: 3px 6px; }
+      .tabbit-result-action-settings-item button:disabled { opacity: 0.45; cursor: not-allowed; }
       .tabbit-collapse {
         margin-bottom: 18px;
         border: 1px solid #e8e8ef;
@@ -5162,6 +5163,7 @@
       setCurrentSummaryText(contentDiv, nextText);
       invalidatePendingImageGeneration(contentDiv);
       renderSummaryMarkdown(contentDiv, nextText);
+      refreshResultActionButtons(contentDiv);
       const actionsDiv = contentDiv.querySelector('.tabbit-result-actions');
       const statusEl = actionsDiv ? actionsDiv.querySelector('.tabbit-summary-edit-status') : null;
       if (statusEl) {
@@ -5401,6 +5403,15 @@
     card.appendChild(toolbar);
     pptSlot.appendChild(card);
     contentDiv._tabbitHtmlPpt = html;
+    if (!contentDiv._tabbitResultActionContext || contentDiv._tabbitResultActionContext.resultType === 'html_ppt') {
+      contentDiv._tabbitResultActionContext = {
+        resultType: 'html_ppt', contentDiv: contentDiv, videoInfo: videoInfo,
+        summaryFallback: getCurrentSummaryText(contentDiv, ''), hasText: false, hasImage: false,
+        hasTimelineSubtitle: hasStructuredSubtitleData(rawSubtitleBody) && !!buildSrtContent(rawSubtitleBody),
+        modelLabel: '📊 ' + currentModel
+      };
+    }
+    refreshResultActionButtons(contentDiv);
   }
 
   async function generateHtmlPptFromPrompt(contentDiv, prompt, fallbackSourceText, videoInfo, btn, options) {
@@ -5535,6 +5546,13 @@
 
           resultContainer.appendChild(imgDiv);
         }
+        if (contentDiv._tabbitResultActionContext) {
+          contentDiv._tabbitResultActionContext.resultType = 'image';
+          contentDiv._tabbitResultActionContext.hasImage = true;
+          contentDiv._tabbitResultActionContext.imageDataUrl = imageDataUrl;
+          contentDiv._tabbitResultActionContext.videoInfo = videoInfo;
+          refreshResultActionButtons(contentDiv);
+        }
       }
 
       if (!imageSlot && CONFIG.enableImageAutoDownload !== false) {
@@ -5564,64 +5582,17 @@
     if (resultContainer) {
       resultContainer.innerHTML = parseMarkdown(result);
     }
-    const actionsDiv = contentDiv.querySelector('.tabbit-result-actions');
-    if (actionsDiv) {
-      actionsDiv.innerHTML = '';
-      const copyBtn = document.createElement('button');
-      copyBtn.className = 'tabbit-copy-btn';
-      copyBtn.textContent = '📋 复制摘要';
-      copyBtn.addEventListener('click', function() { copyResult(this); });
-      const editBtn = document.createElement('button');
-      editBtn.className = 'tabbit-copy-btn';
-      editBtn.textContent = '✏️ 编辑摘要';
-      editBtn.addEventListener('click', function() { startSummaryEdit(contentDiv, result); });
-        const modelTag = document.createElement('span');
-        modelTag.style.cssText = 'font-size:11px;color:#999;margin-left:auto;';
-        modelTag.textContent = '🤖 ' + currentModel;
-      const flomoBtn = document.createElement('button');
-      flomoBtn.className = 'tabbit-copy-btn';
-      flomoBtn.textContent = '发送 FLOMO';
-      flomoBtn.addEventListener('click', function() { sendToFlomo(rawMarkdownResult, this); });
-      const genImgBtn = document.createElement('button');
-      genImgBtn.className = 'tabbit-copy-btn';
-      genImgBtn.textContent = isFlowImageGenMode() ? '发送到 Flow' : '🖼️ 生成配图';
-      genImgBtn.addEventListener('click', function() {
-        triggerManualImageGen(contentDiv, getCurrentSummaryText(contentDiv, result), videoInfo, genImgBtn);
-      });
-      const htmlPptBtn = document.createElement('button');
-      htmlPptBtn.className = 'tabbit-copy-btn';
-      htmlPptBtn.textContent = '📊 HTML PPT';
-      htmlPptBtn.addEventListener('click', function() {
-        triggerHtmlPptGen(contentDiv, getCurrentSummaryText(contentDiv, result), videoInfo, htmlPptBtn);
-      });
-      const editStatus = document.createElement('span');
-      editStatus.className = 'tabbit-summary-edit-status';
-      const commentPostBtn = document.createElement('button');
-      commentPostBtn.className = 'tabbit-copy-btn';
-      commentPostBtn.textContent = '📋 摘要发评论';
-      commentPostBtn.title = '一键将摘要插入B站评论框';
-      commentPostBtn.addEventListener('click', function() { fillBiliCommentSummary(commentPostBtn); });
-      const copyImagePromptBtn = document.createElement('button');
-      copyImagePromptBtn.className = 'tabbit-copy-btn';
-      copyImagePromptBtn.textContent = '复制 生图提示词';
-      copyImagePromptBtn.title = '一键复制生图提示词+摘要到剪贴板，粘贴到任意AI生图';
-      copyImagePromptBtn.addEventListener('click', function() {
-        const copyText = buildImagePrompt(getCurrentSummaryText(contentDiv, result));
-        copyToClipboard(copyText);
-        copyImagePromptBtn.textContent = '✅ 已复制';
-        setTimeout(function() { copyImagePromptBtn.textContent = '复制 生图提示词'; }, 2000);
-      });
-      actionsDiv.appendChild(copyBtn);
-      actionsDiv.appendChild(editBtn);
-      actionsDiv.appendChild(genImgBtn);
-      actionsDiv.appendChild(copyImagePromptBtn);
-        actionsDiv.appendChild(commentPostBtn);
-        actionsDiv.appendChild(htmlPptBtn);
-        actionsDiv.appendChild(flomoBtn);
-        appendSubtitleDownloadButtons(actionsDiv, videoInfo);
-        actionsDiv.appendChild(editStatus);
-        actionsDiv.appendChild(modelTag);
-      }
+    contentDiv._tabbitResultActionContext = {
+      resultType: 'summary',
+      contentDiv: contentDiv,
+      videoInfo: videoInfo,
+      summaryFallback: result,
+      hasText: !!String(result || '').trim(),
+      hasImage: false,
+      hasTimelineSubtitle: hasStructuredSubtitleData(rawSubtitleBody) && !!buildSrtContent(rawSubtitleBody),
+      modelLabel: '🤖 ' + currentModel
+    };
+    refreshResultActionButtons(contentDiv);
   }
 
   // ==================== 无字幕状态展示 ====================
@@ -6336,27 +6307,181 @@
     return CONFIG.enableImageGen === true;
   }
 
+  function createResultActionButton(className, text, onClick, title) {
+    var btn = document.createElement('button');
+    btn.className = className;
+    btn.textContent = text;
+    if (title) btn.title = title;
+    btn.addEventListener('click', onClick);
+    return btn;
+  }
+
+  const RESULT_ACTION_BUTTONS = {
+    copy_summary: {
+      id: 'copy_summary', scopes: ['summary', 'image'], requiresText: true, settingsLabel: '📋 复制摘要',
+      create: function(context) {
+        var label = context.resultType === 'image' ? '📋 复制文字' : '📋 复制摘要';
+        return createResultActionButton('tabbit-copy-btn', label, function() {
+          var btn = this;
+          copyToClipboard(markdownToPlainText(getCurrentSummaryText(context.contentDiv, context.summaryFallback || '')));
+          btn.textContent = '✅ 已复制';
+          btn.classList.add('copied');
+          setTimeout(function() { btn.textContent = label; btn.classList.remove('copied'); }, 2000);
+        });
+      }
+    },
+    edit_summary: {
+      id: 'edit_summary', scopes: ['summary', 'image'], requiresText: true, settingsLabel: '✏️ 编辑摘要',
+      create: function(context) {
+        return createResultActionButton('tabbit-copy-btn', '✏️ 编辑摘要', function() {
+          startSummaryEdit(context.contentDiv, context.summaryFallback || '');
+        });
+      }
+    },
+    generate_image: {
+      id: 'generate_image', scopes: ['summary', 'image'], requiresText: true, settingsLabel: '🖼️ 生成配图',
+      create: function(context) {
+        var hasImage = context.resultType === 'image' && context.hasImage;
+        var label = isFlowImageGenMode() ? '发送到 Flow' : (hasImage ? '🔁 重新生成配图' : '🖼️ 生成配图');
+        return createResultActionButton('tabbit-copy-btn', label, function() {
+          triggerManualImageGen(context.contentDiv, getCurrentSummaryText(context.contentDiv, context.summaryFallback || ''), context.videoInfo, this);
+        });
+      }
+    },
+    copy_image_prompt: {
+      id: 'copy_image_prompt', scopes: ['summary', 'image'], requiresText: true, settingsLabel: '复制 生图提示词',
+      create: function(context) {
+        return createResultActionButton('tabbit-copy-btn', '复制 生图提示词', function() {
+          var btn = this;
+          copyToClipboard(buildImagePrompt(getCurrentSummaryText(context.contentDiv, context.summaryFallback || '')));
+          btn.textContent = '✅ 已复制';
+          setTimeout(function() { btn.textContent = '复制 生图提示词'; }, 2000);
+        }, '一键复制生图提示词+摘要到剪贴板，粘贴到任意AI生图');
+      }
+    },
+    post_comment: {
+      id: 'post_comment', scopes: ['summary', 'image'], requiresText: true, settingsLabel: '📋 摘要发评论',
+      create: function() {
+        return createResultActionButton('tabbit-copy-btn', '📋 摘要发评论', function() { fillBiliCommentSummary(this); }, '一键将摘要插入B站评论框');
+      }
+    },
+    html_ppt: {
+      id: 'html_ppt', scopes: ['summary', 'image'], requiresText: true, settingsLabel: '📊 HTML PPT',
+      create: function(context) {
+        return createResultActionButton('tabbit-copy-btn', '📊 HTML PPT', function() {
+          triggerHtmlPptGen(context.contentDiv, getCurrentSummaryText(context.contentDiv, context.summaryFallback || ''), context.videoInfo, this);
+        });
+      }
+    },
+    send_flomo: {
+      id: 'send_flomo', scopes: ['summary', 'image'], requiresText: true, settingsLabel: '发送 FLOMO',
+      create: function(context) {
+        return createResultActionButton('tabbit-copy-btn', '发送 FLOMO', function() {
+          sendToFlomo(getCurrentSummaryText(context.contentDiv, context.summaryFallback || ''), this);
+        });
+      }
+    },
+    download_transcript: {
+      id: 'download_transcript', scopes: ['summary', 'image', 'fallback', 'html_ppt'], settingsLabel: '💾 下载字幕',
+      create: function(context) {
+        return createResultActionButton('tabbit-download-btn', '💾 下载字幕', function() {
+          downloadTranscript(rawTranscript, context.videoInfo.title, context.videoInfo.upName, context.videoInfo.bvid);
+        });
+      }
+    },
+    download_srt: {
+      id: 'download_srt', scopes: ['summary', 'image', 'fallback', 'html_ppt'], settingsLabel: '🕒 下载 SRT',
+      create: function(context) {
+        return createResultActionButton('tabbit-download-btn', '🕒 下载 SRT', function() {
+          if (!downloadSubtitleSrt(rawSubtitleBody, context.videoInfo.title, context.videoInfo.upName, context.videoInfo.bvid)) {
+            alert('当前没有可导出的时间轴字幕');
+          }
+        }, '导出当前拿到的原始时间轴字幕');
+      }
+    },
+    save_image: {
+      id: 'save_image', imageRow: true, settingsLabel: '💾 保存图片',
+      create: function(context) {
+        return createResultActionButton('tabbit-copy-btn tabbit-save-img-btn', '💾 保存图片', function() {
+          downloadGeneratedImage(context.imageDataUrl, context.videoInfo, context.imageFilenameSuffix || '_总结');
+        });
+      }
+    },
+    fill_image_comment: {
+      id: 'fill_image_comment', imageRow: true, settingsLabel: '💬 填字并点上传',
+      create: function() {
+        return createResultActionButton('tabbit-copy-btn tabbit-comment-text-btn', '💬 填字并点上传', function() {
+          fillBiliCommentTextOnly(this);
+        }, '随机填入一条评论预设，并尝试点开B站评论区图片上传按钮');
+      }
+    }
+  };
+
+  function canRenderResultAction(definition, context) {
+    if (definition.imageRow) return context.resultType === 'image' && context.hasImage;
+    if (definition.id === 'download_srt') return context.hasTimelineSubtitle && !!buildSrtContent(rawSubtitleBody);
+    return definition.scopes.indexOf(context.resultType) !== -1 && (!definition.requiresText || context.hasText);
+  }
+
+  function appendResultActionStatus(container, context) {
+    if (!container.childElementCount) return;
+    var editStatus = document.createElement('span');
+    editStatus.className = 'tabbit-summary-edit-status';
+    container.appendChild(editStatus);
+    var modelTag = document.createElement('span');
+    modelTag.style.cssText = 'font-size:11px;color:#999;margin-left:auto;';
+    modelTag.textContent = context.modelLabel || (context.resultType === 'image' ? '🖼️ ' + (CONFIG.imageGenModel || 'gemini-2.0-flash-preview-image-generation') : '🤖 ' + currentModel);
+    container.appendChild(modelTag);
+  }
+
+  function renderResultActionButtons(container, context) {
+    if (!container) return;
+    container.innerHTML = '';
+    normalizeResultActionButtons(CONFIG.resultActionButtons).forEach(function(item) {
+      var definition = RESULT_ACTION_BUTTONS[item.id];
+      if (!item.enabled || !definition || definition.imageRow || !canRenderResultAction(definition, context)) return;
+      container.appendChild(definition.create(context));
+    });
+    appendResultActionStatus(container, context);
+  }
+
+  function renderImageActionButtons(container, context) {
+    if (!container) return;
+    container.innerHTML = '';
+    normalizeResultActionButtons(CONFIG.resultActionButtons).forEach(function(item) {
+      var definition = RESULT_ACTION_BUTTONS[item.id];
+      if (!item.enabled || !definition || !definition.imageRow || !canRenderResultAction(definition, context)) return;
+      container.appendChild(definition.create(context));
+    });
+  }
+
+  function refreshResultActionButtons(contentDiv) {
+    if (!contentDiv || !contentDiv.isConnected) return;
+    var context = contentDiv._tabbitResultActionContext;
+    if (!context) return;
+    context.hasTimelineSubtitle = hasStructuredSubtitleData(rawSubtitleBody) && !!buildSrtContent(rawSubtitleBody);
+    context.hasText = !!String(getCurrentSummaryText(contentDiv, context.summaryFallback || '')).trim();
+    renderResultActionButtons(contentDiv.querySelector('.tabbit-result-actions'), context);
+    contentDiv.querySelectorAll('.tabbit-img-actions').forEach(function(row) {
+      var imageContext = Object.assign({}, context, row._tabbitImageActionContext || {});
+      imageContext.resultType = 'image';
+      imageContext.hasImage = !!(imageContext.imageDataUrl && /^data:image\//i.test(imageContext.imageDataUrl));
+      renderImageActionButtons(row, imageContext);
+    });
+  }
+
   function createImageActionRow(imageDataUrl, videoInfo, filenameSuffix) {
     const row = document.createElement('div');
     row.className = 'tabbit-img-actions';
     row.style.cssText = 'display:flex;gap:8px;justify-content:center;flex-wrap:wrap;margin-top:8px;';
-
-    const saveBtn = document.createElement('button');
-    saveBtn.className = 'tabbit-copy-btn tabbit-save-img-btn';
-    saveBtn.textContent = '💾 保存图片';
-    saveBtn.addEventListener('click', function() {
-      downloadGeneratedImage(imageDataUrl, videoInfo, filenameSuffix || '_总结');
-    });
-    row.appendChild(saveBtn);
-
-    const commentTextBtn = document.createElement('button');
-    commentTextBtn.className = 'tabbit-copy-btn tabbit-comment-text-btn';
-    commentTextBtn.textContent = '💬 填字并点上传';
-    commentTextBtn.title = '随机填入一条评论预设，并尝试点开B站评论区图片上传按钮';
-    commentTextBtn.addEventListener('click', function() {
-      fillBiliCommentTextOnly(commentTextBtn);
-    });
-    row.appendChild(commentTextBtn);
+    row._tabbitImageActionContext = {
+      resultType: 'image',
+      hasImage: !!(imageDataUrl && /^data:image\//i.test(imageDataUrl)),
+      imageDataUrl: imageDataUrl,
+      imageFilenameSuffix: filenameSuffix || '_总结',
+      videoInfo: videoInfo
+    };
+    renderImageActionButtons(row, row._tabbitImageActionContext);
 
     return row;
   }
@@ -6410,85 +6535,19 @@
         }
       }
     }
-
-    const actionsDiv = contentDiv.querySelector('.tabbit-result-actions');
-    if (actionsDiv) {
-      actionsDiv.innerHTML = '';
-      if (textContent && textContent.trim()) {
-        const copyBtn = document.createElement('button');
-        copyBtn.className = 'tabbit-copy-btn';
-        copyBtn.textContent = '📋 复制文字';
-        copyBtn.addEventListener('click', function() {
-          copyToClipboard(markdownToPlainText(getCurrentSummaryText(contentDiv, textContent)));
-          copyBtn.textContent = '✅ 已复制';
-          setTimeout(function() { copyBtn.textContent = '📋 复制文字'; }, 2000);
-        });
-
-        const editBtn = document.createElement('button');
-        editBtn.className = 'tabbit-copy-btn';
-        editBtn.textContent = '✏️ 编辑摘要';
-        editBtn.addEventListener('click', function() { startSummaryEdit(contentDiv, textContent); });
-
-        const htmlPptBtn = document.createElement('button');
-        htmlPptBtn.className = 'tabbit-copy-btn';
-        htmlPptBtn.textContent = '📊 HTML PPT';
-        htmlPptBtn.addEventListener('click', function() {
-          triggerHtmlPptGen(contentDiv, getCurrentSummaryText(contentDiv, textContent), videoInfo, htmlPptBtn);
-        });
-        const genImgBtn = document.createElement('button');
-        genImgBtn.className = 'tabbit-copy-btn';
-        genImgBtn.textContent = isFlowImageGenMode() ? '发送到 Flow' : (imageDataUrl && imageDataUrl !== 'ERROR' ? '🔁 重新生成配图' : '🖼️ 生成配图');
-        genImgBtn.addEventListener('click', function() {
-          triggerManualImageGen(contentDiv, getCurrentSummaryText(contentDiv, textContent), videoInfo, genImgBtn);
-        });
-
-        const copyImagePromptBtn = document.createElement('button');
-        copyImagePromptBtn.className = 'tabbit-copy-btn';
-        copyImagePromptBtn.textContent = '复制 生图提示词';
-        copyImagePromptBtn.title = '一键复制生图提示词+摘要到剪贴板，粘贴到任意AI生图';
-        copyImagePromptBtn.addEventListener('click', function() {
-          const copyText = buildImagePrompt(getCurrentSummaryText(contentDiv, textContent));
-          copyToClipboard(copyText);
-          copyImagePromptBtn.textContent = '✅ 已复制';
-          setTimeout(function() { copyImagePromptBtn.textContent = '复制 生图提示词'; }, 2000);
-        });
-
-        const commentPostBtn = document.createElement('button');
-        commentPostBtn.className = 'tabbit-copy-btn';
-        commentPostBtn.textContent = '📋 摘要发评论';
-        commentPostBtn.title = '一键将摘要插入B站评论框';
-        commentPostBtn.addEventListener('click', function() { fillBiliCommentSummary(commentPostBtn); });
-
-        actionsDiv.appendChild(copyBtn);
-        actionsDiv.appendChild(editBtn);
-        actionsDiv.appendChild(genImgBtn);
-        actionsDiv.appendChild(copyImagePromptBtn);
-        actionsDiv.appendChild(commentPostBtn);
-        actionsDiv.appendChild(htmlPptBtn);
-
-        const flomoBtn = document.createElement('button');
-        flomoBtn.className = 'tabbit-copy-btn';
-        flomoBtn.textContent = '发送 FLOMO';
-        flomoBtn.addEventListener('click', function() {
-          sendToFlomo(getCurrentSummaryText(contentDiv, textContent), this);
-        });
-        actionsDiv.appendChild(flomoBtn);
-      }
-      const downloadBtn = document.createElement('button');
-      downloadBtn.className = 'tabbit-download-btn';
-      downloadBtn.textContent = '💾 下载字幕';
-      downloadBtn.addEventListener('click', function() {
-        downloadTranscript(rawTranscript, videoInfo.title, videoInfo.upName, videoInfo.bvid);
-      });
-      const modelTag = document.createElement('span');
-      modelTag.style.cssText = 'font-size:11px;color:#999;margin-left:auto;';
-      modelTag.textContent = '🖼️ ' + (CONFIG.imageGenModel || 'gemini-2.0-flash-preview-image-generation');
-      actionsDiv.appendChild(downloadBtn);
-      const editStatus = document.createElement('span');
-      editStatus.className = 'tabbit-summary-edit-status';
-      actionsDiv.appendChild(editStatus);
-      actionsDiv.appendChild(modelTag);
-    }
+    contentDiv._tabbitResultActionContext = {
+      resultType: 'image',
+      contentDiv: contentDiv,
+      videoInfo: videoInfo,
+      summaryFallback: textContent || '',
+      hasText: !!String(textContent || '').trim(),
+      hasImage: !!(imageDataUrl && /^data:image\//i.test(imageDataUrl)),
+      imageDataUrl: imageDataUrl,
+      imageFilenameSuffix: '_总结',
+      hasTimelineSubtitle: hasStructuredSubtitleData(rawSubtitleBody) && !!buildSrtContent(rawSubtitleBody),
+      modelLabel: '🖼️ ' + (CONFIG.imageGenModel || 'gemini-2.0-flash-preview-image-generation')
+    };
+    refreshResultActionButtons(contentDiv);
   }
 
   function updateImageResult(contentDiv, imageDataUrl, videoInfo) {
@@ -6499,6 +6558,11 @@
 
     if (!imageDataUrl || imageDataUrl === 'ERROR') {
       wrap.outerHTML = '<div class="tabbit-img-wrap" style="text-align:center;margin-bottom:12px;padding:14px;background:#fff3f3;border:1px solid #ffcccc;border-radius:10px;color:#c00;font-size:13px;">⚠️ 配图生成失败，仅显示文字总结</div>';
+      if (contentDiv._tabbitResultActionContext) {
+        contentDiv._tabbitResultActionContext.hasImage = false;
+        contentDiv._tabbitResultActionContext.imageDataUrl = '';
+        refreshResultActionButtons(contentDiv);
+      }
       return;
     }
 
@@ -6529,6 +6593,13 @@
           try { downloadGeneratedImage(imageDataUrl, videoInfo, '_总结'); } catch(e) { console.warn('[省流助手] 自动下载失败', e); }
         }, 0);
       }
+    }
+    if (contentDiv._tabbitResultActionContext) {
+      contentDiv._tabbitResultActionContext.resultType = 'image';
+      contentDiv._tabbitResultActionContext.hasImage = true;
+      contentDiv._tabbitResultActionContext.imageDataUrl = imageDataUrl;
+      contentDiv._tabbitResultActionContext.videoInfo = videoInfo;
+      refreshResultActionButtons(contentDiv);
     }
   }
 
@@ -6899,15 +6970,13 @@
             '<div style="font-size:11px;color:#999;margin-top:4px;">本次不生成普通摘要</div>' +
           '</div>';
       }
-      const actionsDiv = contentDiv.querySelector('.tabbit-result-actions');
-      if (actionsDiv) {
-        actionsDiv.innerHTML = '';
-        const modelTag = document.createElement('span');
-        modelTag.style.cssText = 'font-size:11px;color:#999;margin-left:auto;';
-        modelTag.textContent = '📊 ' + currentModel;
-        appendSubtitleDownloadButtons(actionsDiv, videoInfo);
-        actionsDiv.appendChild(modelTag);
-      }
+      contentDiv._tabbitResultActionContext = {
+        resultType: 'html_ppt', contentDiv: contentDiv, videoInfo: videoInfo,
+        summaryFallback: '', hasText: false, hasImage: false,
+        hasTimelineSubtitle: hasStructuredSubtitleData(rawSubtitleBody) && !!buildSrtContent(rawSubtitleBody),
+        modelLabel: '📊 ' + currentModel
+      };
+      refreshResultActionButtons(contentDiv);
       try {
         const directPrompt = buildHtmlPptTranscriptPrompt(transcript, videoInfo, activePrompt);
         contentDiv._tabbitHtmlPptDirectPrompt = directPrompt;
@@ -7755,6 +7824,17 @@
           </div>
 
           <div class="tabbit-collapse">
+            <div class="tabbit-collapse-header" data-collapse="result-action-settings">
+              <div class="tabbit-collapse-title">🎛️ 摘要结果操作按钮</div>
+              <span class="tabbit-collapse-arrow">▶</span>
+            </div>
+            <div class="tabbit-collapse-body">
+              <div class="tabbit-settings-hint">勾选控制显示；上移、下移调整同一区域顺序。保存后才更新结果区。</div>
+              <div id="ts-result-action-buttons-list"></div>
+            </div>
+          </div>
+
+          <div class="tabbit-collapse">
             <div class="tabbit-collapse-header" data-collapse="api-settings">
               <div class="tabbit-collapse-title">🤖 大模型 API 设置</div>
               <span class="tabbit-collapse-arrow">▶</span>
@@ -8091,6 +8171,62 @@
     let editingActiveId = CONFIG.activePresetId || (editingPresets[0] && editingPresets[0].id);
     let editingHtmlPptSkillText = String(CONFIG.htmlPptSkillText || '');
     let editingHtmlPptSkillName = CONFIG.htmlPptSkillName || '';
+    let editingResultActionButtons = normalizeResultActionButtons(CONFIG.resultActionButtons);
+
+    function moveEditingResultActionButton(index, direction) {
+      var target = index + direction;
+      if (target < 0 || target >= editingResultActionButtons.length) return;
+      var item = editingResultActionButtons[index];
+      editingResultActionButtons[index] = editingResultActionButtons[target];
+      editingResultActionButtons[target] = item;
+      renderResultActionButtonEditList(target);
+    }
+
+    function renderResultActionButtonEditList(focusIndex) {
+      var listEl = overlay.querySelector('#ts-result-action-buttons-list');
+      if (!listEl) return;
+      listEl.innerHTML = '';
+      editingResultActionButtons.forEach(function(item, index) {
+        var definition = RESULT_ACTION_BUTTONS[item.id];
+        if (!definition) return;
+        var row = document.createElement('div');
+        row.className = 'tabbit-result-action-settings-item';
+        row.dataset.index = String(index);
+
+        var checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.checked = item.enabled !== false;
+        checkbox.addEventListener('change', function() { item.enabled = checkbox.checked; });
+
+        var label = document.createElement('label');
+        label.appendChild(checkbox);
+        label.appendChild(document.createTextNode(' ' + definition.settingsLabel));
+
+        var upBtn = document.createElement('button');
+        upBtn.type = 'button';
+        upBtn.textContent = '↑';
+        upBtn.title = '上移';
+        upBtn.disabled = index === 0;
+        upBtn.addEventListener('click', function() { moveEditingResultActionButton(index, -1); });
+
+        var downBtn = document.createElement('button');
+        downBtn.type = 'button';
+        downBtn.textContent = '↓';
+        downBtn.title = '下移';
+        downBtn.disabled = index === editingResultActionButtons.length - 1;
+        downBtn.addEventListener('click', function() { moveEditingResultActionButton(index, 1); });
+
+        row.appendChild(label);
+        row.appendChild(upBtn);
+        row.appendChild(downBtn);
+        listEl.appendChild(row);
+      });
+      if (typeof focusIndex === 'number') {
+        var focused = listEl.querySelector('[data-index="' + focusIndex + '"]');
+        if (focused) focused.scrollIntoView({ block: 'nearest' });
+      }
+    }
+    renderResultActionButtonEditList();
 
     function updateHtmlPptSkillInfo() {
       const infoEl = overlay.querySelector('#ts-htmlPptSkillInfo');
@@ -8512,8 +8648,16 @@
       CONFIG.enableHtmlPptDirect = overlay.querySelector('#ts-enableHtmlPptDirect').checked;
       CONFIG.htmlPptSkillText = editingHtmlPptSkillText || '';
       CONFIG.htmlPptSkillName = editingHtmlPptSkillName || '';
+      CONFIG.resultActionButtons = normalizeResultActionButtons(editingResultActionButtons);
       currentModel = CONFIG.model;
-      saveConfig(CONFIG);
+      if (!saveConfig(CONFIG)) {
+        alert('配置保存失败，请检查浏览器本地存储是否可用。');
+        return;
+      }
+
+      document.querySelectorAll('#tabbit-ai-summary-panel .tabbit-panel-content').forEach(function(contentDiv) {
+        refreshResultActionButtons(contentDiv);
+      });
 
       if (mainPanel) {
         const modelListEl = mainPanel.querySelector('.tabbit-model-list');
@@ -8560,6 +8704,10 @@
             if (imported.apiUrl) overlay.querySelector('#ts-apiUrl').value = imported.apiUrl;
             if (imported.apiKey) overlay.querySelector('#ts-apiKey').value = imported.apiKey;
             if (imported.model) overlay.querySelector('#ts-model').value = imported.model;
+            if (imported.resultActionButtons !== undefined) {
+              editingResultActionButtons = normalizeResultActionButtons(imported.resultActionButtons);
+              renderResultActionButtonEditList();
+            }
             if (imported.summaryMaxTokens !== undefined) {
               var summaryMaxTokensEl = overlay.querySelector('#ts-summaryMaxTokens');
               if (summaryMaxTokensEl) summaryMaxTokensEl.value = imported.summaryMaxTokens;
@@ -8696,6 +8844,8 @@
       editingHtmlPptSkillText = '';
       editingHtmlPptSkillName = '';
       updateHtmlPptSkillInfo();
+      editingResultActionButtons = getDefaultResultActionButtons();
+      renderResultActionButtonEditList();
       editingPresets = JSON.parse(JSON.stringify(DEFAULT_PRESETS));
       editingActiveId = 'preset_default';
       renderPresetEditList();
@@ -8999,15 +9149,10 @@
       console.log('[省流助手] 字幕获取完成');
       if (isStaleRoute(parsingGeneration)) return;
 
-      // 🆕 字幕获取成功后立即显示下载按钮（不等AI解析完）
+      // 字幕已到达时只刷新已有结果区；尚未生成结果则由后续渲染统一处理。
       if (panel && videoInfo) {
         var contentDivForDL = panel.querySelector('.tabbit-panel-content');
-        if (contentDivForDL) {
-          var resultActionsForDL = contentDivForDL.querySelector('.tabbit-result-actions');
-          if (resultActionsForDL) {
-            appendSubtitleDownloadButtons(resultActionsForDL, videoInfo);
-          }
-        }
+        if (contentDivForDL && contentDivForDL._tabbitResultActionContext) refreshResultActionButtons(contentDivForDL);
         // 🆕 自动下载字幕
         if (CONFIG.enableAutoDownloadSubtitle) {
           try {
