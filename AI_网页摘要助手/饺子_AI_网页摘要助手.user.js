@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         饺子 AI 网页摘要助手
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      2.9.3
+// @version      2.9.4
 // @description  指定网站自动弹出 AI 网页摘要，支持连续对话、多预设、多模板、SPA路由、摘要生图、flomo、坚果云双文件云同步。Shadow DOM 隔离样式。
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
@@ -4198,15 +4198,7 @@
   function registerMenus() {
     if (typeof GM_registerMenuCommand !== 'function') return;
     GM_registerMenuCommand('打开面板', () => openPanel(false));
-    GM_registerMenuCommand('立即总结当前页', () => openPanel(true));
     GM_registerMenuCommand('设置', openSettings);
-    GM_registerMenuCommand(`🔀 切换预设（当前：${getCurrentProfile().name}）`, switchProfileQuick);
-    GM_registerMenuCommand('☁️ 一键拉取云端配置', quickCloudPull);
-    GM_registerMenuCommand('☁️ 一键上传到云端', quickCloudPush);
-    GM_registerMenuCommand('加入当前网址', () => openAddUrlRuleModal());
-    GM_registerMenuCommand('导出配置文件', exportConfigToFile);
-    GM_registerMenuCommand('导入配置文件', importConfigFromFile);
-    GM_registerMenuCommand('重置配置', resetConfig);
   }
   function switchProfileQuick() {
     const list = config.profiles.map((p, i) => `${i + 1}. ${p.name}${p.id === config.currentProfileId ? ' ✓' : ''}`).join('\n');
