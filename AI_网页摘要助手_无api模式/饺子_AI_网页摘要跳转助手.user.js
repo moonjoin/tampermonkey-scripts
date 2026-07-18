@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         饺子 AI 网页摘要跳转助手
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      0.4.4
+// @version      0.4.5
 // @description  精简跳转模式：抓取网页正文，套提示词模板，发送到常驻 ChatGPT 接收端自动提交。
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
@@ -39,6 +39,7 @@
   const READABILITY_MIN_TEXT_LENGTH = 160;
   const CHATGPT_NOTIFY_REPLY_MAX_LEN = 120;
   const CHATGPT_NOTIFY_MIN_INTERVAL_MS = 5000;
+  const CHATGPT_NOTIFY_SAME_REPLY_COOLDOWN_MS = 10 * 60 * 1000;
   const CHATGPT_NOTIFY_ONLY_BACKGROUND = true;
   const CHATGPT_NOTIFY_SOUND = true;
 
@@ -85,6 +86,7 @@
   let chatGptReplyCheckTimer = null;
   let chatGptNotifyAudioCtx = null;
   let chatGptLastNotifyAt = 0;
+  let chatGptLastNotifyFingerprint = '';
   let chatGptWasGenerating = false;
   let chatGptGenericCompleting = false;
 
@@ -1329,9 +1331,22 @@
     const opts = options || {};
     const now = Date.now();
     if (now - chatGptLastNotifyAt < CHATGPT_NOTIFY_MIN_INTERVAL_MS) return;
-    chatGptLastNotifyAt = now;
 
-    const title = opts.title || (task?.sourceTitle ? `网页摘要完成：${task.sourceTitle}` : 'ChatGPT 回复完成');
+    const fingerprint = String(replyText || '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(-500);
+    if (
+      fingerprint &&
+      fingerprint === chatGptLastNotifyFingerprint &&
+      now - chatGptLastNotifyAt < CHATGPT_NOTIFY_SAME_REPLY_COOLDOWN_MS
+    ) return;
+
+    chatGptLastNotifyAt = now;
+    chatGptLastNotifyFingerprint = fingerprint;
+
+    const rawTitle = opts.title || (task?.sourceTitle ? `网页摘要完成：${task.sourceTitle}` : 'ChatGPT 回复完成');
+    const title = `【饺子脚本】${rawTitle}`;
     const text = replyText || 'ChatGPT 已经生成完毕。';
     if (CHATGPT_NOTIFY_ONLY_BACKGROUND && !document.hidden) {
       showChatGptAdapterToast(text, 'ok');
@@ -1380,6 +1395,8 @@
       replyPreview: replyText
     });
     clearActiveChatGptReplyTask(task.id);
+    chatGptWasGenerating = false;
+    chatGptGenericCompleting = false;
     notifyChatGptReplyDone(task, replyText);
   }
 
