@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站省流助手 - 字幕AI摘要 Pro
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      4.3.6
+// @version      4.3.7
 // @description  自动提取B站视频字幕，通过自定义AI API生成极简摘要，支持模型切换、持续对话和评论区总结；支持自动解析开关、自动获取模型列表、flomo自动加标签，新增总结生图功能；v3.9.0 新增html PPT模式；v4.0.0 新增新手引导和API兜底功能（无API时仍可下载字幕、一键复制提示词+字幕到其他AI）
 // @author       次元饺子
 // @match        https://www.bilibili.com/video/*
@@ -1252,6 +1252,10 @@
   const IMAGE_GEN_SUMMARY_MAX_LEN = 5000;
   const BILI_API_TIMEOUT_MS = 12000;
   const BILI_SUBTITLE_TIMEOUT_MS = 15000;
+  // 自动解析优先等待播放器实际发出的字幕响应；未捕获到再走原字幕接口。
+  // 控件出现和网络响应分开等待：播放器已经就绪时不人为停顿；慢页面仍给响应留出余量。
+  const SUBTITLE_CAPTURE_CONTROL_TIMEOUT_MS = 3500;
+  const SUBTITLE_CAPTURE_WAIT_TIMEOUT_MS = 5000;
   const AUX_REQUEST_TIMEOUT_MS = 30000;
   // 🆕 流式渲染节流间隔（ms），控制 UI 重绘频率
   const STREAM_RENDER_THROTTLE = 80;
@@ -1311,6 +1315,7 @@
   let subtitleCaptureInstalled = false;
   let subtitleCaptureEntries = [];
   let subtitleCaptureWaiters = [];
+  let isSubtitleCaptureInProgress = false;
 
   function getSummaryMaxTokens() {
     const n = parseInt(CONFIG.summaryMaxTokens, 10);
@@ -1977,16 +1982,21 @@
     console.log('[省流助手-捕获模式] 字幕请求监听已启用');
   }
 
-  function waitForCapturedSubtitle(timeoutMs, signal) {
+  function waitForCapturedSubtitle(timeoutMs, signal, minCreatedAt) {
     installSubtitleCaptureInterceptor();
     var latest = subtitleCaptureEntries[subtitleCaptureEntries.length - 1];
-    if (latest && Date.now() - latest.createdAt < 60000) {
+    if (latest && latest.createdAt >= (minCreatedAt || 0) && Date.now() - latest.createdAt < 60000) {
       return Promise.resolve(latest);
     }
 
     return new Promise(function(resolve, reject) {
       var done = false;
-      var waiter = { resolve: finish, reject: fail };
+      var waiter = {
+        resolve: function(entry) {
+          if (entry && entry.createdAt >= (minCreatedAt || 0)) finish(entry);
+        },
+        reject: fail
+      };
       var timer = setTimeout(function() {
         fail(new Error('等待超时：请先点击播放器右下角的字幕按钮，并选择可用字幕'));
       }, timeoutMs || 20000);
@@ -4345,45 +4355,50 @@
       }
       #tabbit-float-btn {
         position: fixed !important;
-        top: 50% !important;
-        right: 0 !important;
+        top: 50%;
+        right: 18px;
         z-index: 2147483647 !important;
         display: flex !important;
-        flex-direction: column;
+        flex-direction: row;
         align-items: center;
         justify-content: center;
-        width: 50px;
-        padding: 10px 0;
+        min-width: 104px;
+        max-width: calc(100vw - 24px);
+        min-height: 42px;
+        padding: 0 14px;
         background: linear-gradient(160deg, #667eea 0%, #764ba2 100%) !important;
         color: white !important;
         border: none !important;
-        border-radius: 12px 0 0 12px;
+        border-radius: 999px;
         cursor: grab;
-        font-size: 18px;
-        letter-spacing: 2px;
+        font-size: 13px;
+        letter-spacing: 0;
         font-weight: 600;
         font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        box-shadow: 0 8px 22px rgba(82, 70, 180, 0.32);
+        transform: translateY(-50%);
         animation: tabbitFloatIn 0.35s cubic-bezier(0.34,1.56,0.64,1) forwards, tabbitFloatPulse 2.5s ease-in-out 0.4s infinite;
-        transition: width 0.2s, background 0.2s;
+        transition: transform 0.2s, box-shadow 0.2s, background 0.2s;
         user-select: none;
-        gap: 6px;
+        gap: 7px;
+        white-space: nowrap;
         pointer-events: auto !important;
         visibility: visible !important;
         opacity: 1 !important;
       }
       #tabbit-float-btn.dragging { cursor: grabbing; animation: none; }
       #tabbit-float-btn:hover {
-        width: 60px;
+        transform: translateY(-50%) scale(1.04);
+        box-shadow: 0 10px 26px rgba(82, 70, 180, 0.42);
         background: linear-gradient(160deg, #5a6fd6 0%, #6a3d96 100%);
       }
       #tabbit-float-btn .tabbit-float-icon {
-        font-size: 20px;
-        margin-bottom: 4px;
+        font-size: 16px;
+        line-height: 1;
       }
       #tabbit-float-btn .tabbit-float-label {
-        font-size: 11px;
-        writing-mode: vertical-rl;
-        letter-spacing: 3px;
+        font-size: 13px;
+        line-height: 1;
       }
       #tabbit-float-btn.tabbit-float-processing {
         background: linear-gradient(160deg, #2563eb 0%, #7c3aed 100%) !important;
@@ -4393,6 +4408,16 @@
       }
       #tabbit-float-btn.tabbit-float-error {
         background: linear-gradient(160deg, #dc2626 0%, #ea580c 100%) !important;
+      }
+      @media (max-width: 480px) {
+        #tabbit-float-btn {
+          right: 12px;
+          min-width: 0;
+          min-height: 38px;
+          padding: 0 12px;
+          font-size: 12px;
+        }
+        #tabbit-float-btn .tabbit-float-label { font-size: 12px; }
       }
       #tabbit-summary-notice {
         position: fixed;
@@ -4964,8 +4989,9 @@
   // ==================== 悬浮按钮 ====================
   function applyFloatBtnPosition(btn) {
     if (POSITIONS.floatBtn) {
-      const maxLeft = window.innerWidth - 60;
-      const maxTop = window.innerHeight - 100;
+      const rect = btn.getBoundingClientRect();
+      const maxLeft = Math.max(0, window.innerWidth - rect.width);
+      const maxTop = Math.max(0, window.innerHeight - rect.height);
       const left = Math.max(0, Math.min(POSITIONS.floatBtn.left, maxLeft));
       const top = Math.max(0, Math.min(POSITIONS.floatBtn.top, maxTop));
       btn.style.left = left + 'px';
@@ -5020,9 +5046,9 @@
     showSummaryNotice(panel, '✅ 摘要已完成，点击查看', 'ready');
   }
 
-  function notifyBackgroundSummaryFailed(panel, generation, message) {
+  function notifyBackgroundSummaryFailed(panel, generation, message, state) {
     if (isStaleRoute(generation)) return;
-    setFloatBtnState(panel, 'error');
+    setFloatBtnState(panel, state || 'error');
     showSummaryNotice(panel, '⚠️ ' + (message || '摘要失败，点击查看'), 'error');
   }
 
@@ -5035,14 +5061,21 @@
     btn.id = 'tabbit-float-btn';
     const floatState = state || (panel && panel._tabbitFloatState) || 'idle';
     const labels = {
-      processing: { icon: '⏳', label: '处理中', title: '摘要正在后台处理，点击查看进度（可拖动）' },
-      ready: { icon: '✅', label: '摘要完成', title: '摘要已完成，点击查看（可拖动）' },
-      error: { icon: '⚠️', label: '处理失败', title: '处理失败，点击查看（可拖动）' },
-      idle: { icon: '🎬', label: '省流助手', title: panel ? '打开省流助手（可拖动）' : '点击开始解析（可拖动）' }
+      processing: { icon: '⏳', label: '处理中', title: '处理中，点击查看' },
+      ready: { icon: '✅', label: '已完成', title: '已完成，点击查看' },
+      error: { icon: '⚠️', label: '未完成', title: '未完成，点击查看' },
+      'no-subtitle': { icon: '🔇', label: '无字幕', title: '无字幕，点击查看' },
+      interrupted: { icon: '⏹', label: '已中断', title: '已中断，点击查看' },
+      idle: { icon: '🎬', label: '省流助手', title: panel ? '打开省流助手' : '开始处理' }
     };
     const info = labels[floatState] || labels.idle;
-    if (floatState !== 'idle') btn.classList.add('tabbit-float-' + floatState);
+    if (floatState === 'error' || floatState === 'no-subtitle' || floatState === 'interrupted') {
+      btn.classList.add('tabbit-float-error');
+    } else if (floatState !== 'idle') {
+      btn.classList.add('tabbit-float-' + floatState);
+    }
     btn.title = info.title;
+    btn.setAttribute('aria-label', '省流助手：' + info.label);
     btn.innerHTML = '<span class="tabbit-float-icon">' + info.icon + '</span><span class="tabbit-float-label">' + info.label + '</span>';
     btn.style.cssText = 'position:fixed!important;z-index:2147483647!important;display:flex!important;visibility:visible!important;opacity:1!important;pointer-events:auto!important;';
     document.body.appendChild(btn);
@@ -5819,6 +5852,21 @@
     return false;
   }
 
+  // 字幕总开关是二态控件，不能复用会派发 click 再调用 .click() 的通用方法，避免被反向切回。
+  function clickBiliSubtitleToggleOnce(el) {
+    if (!el || !el.isConnected) return false;
+    try {
+      ['mouseover', 'mouseenter', 'mousedown', 'mouseup'].forEach(function(type) {
+        el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+      });
+      el.click();
+      return true;
+    } catch(e) {
+      console.log('[省流助手-捕获模式] 字幕开关点击失败:', e.message);
+      return false;
+    }
+  }
+
   function pickSubtitleLanguageItem() {
     var selectors = [
       '.bpx-player-ctrl-subtitle-language-item[data-lan="zh-CN"]',
@@ -5832,43 +5880,133 @@
     return null;
   }
 
-  async function autoTriggerBiliSubtitleRequest() {
-    var languageItem = pickSubtitleLanguageItem();
-    if (languageItem && clickBiliElement(languageItem)) return true;
+  function getSubtitleToggleElement() {
+    return document.querySelector('.bpx-player-ctrl-subtitle,.bpx-player-ctrl-btn-subtitle');
+  }
 
-    var subtitleBtn = document.querySelector('.bpx-player-ctrl-subtitle,.bpx-player-ctrl-btn-subtitle');
-    if (subtitleBtn && clickBiliElement(subtitleBtn)) {
-      await randomDelay(250, 350);
-      languageItem = pickSubtitleLanguageItem();
-      if (languageItem) clickBiliElement(languageItem);
-      return true;
+  // B 站不同播放器版本的状态标记不完全一致；只有能明确判断时才执行恢复点击。
+  function getSubtitleToggleState(toggle) {
+    toggle = toggle || getSubtitleToggleElement();
+    if (!toggle || !toggle.isConnected) return { state: 'unknown', toggle: toggle };
+    var ariaPressed = String(toggle.getAttribute('aria-pressed') || '').toLowerCase();
+    if (ariaPressed === 'true') return { state: 'on', toggle: toggle, source: 'aria-pressed' };
+    if (ariaPressed === 'false') return { state: 'off', toggle: toggle, source: 'aria-pressed' };
+    var ariaChecked = String(toggle.getAttribute('aria-checked') || '').toLowerCase();
+    if (ariaChecked === 'true') return { state: 'on', toggle: toggle, source: 'aria-checked' };
+    if (ariaChecked === 'false') return { state: 'off', toggle: toggle, source: 'aria-checked' };
+    var classText = String(toggle.className || '') + ' ' + String(toggle.getAttribute('data-state') || '');
+    if (/(^|\s|[-_])(active|on|enabled|show|selected)(\s|$|[-_])/i.test(classText)) {
+      return { state: 'on', toggle: toggle, source: 'class' };
     }
+    if (/(^|\s|[-_])(off|disabled|hide|hidden)(\s|$|[-_])/i.test(classText)) {
+      return { state: 'off', toggle: toggle, source: 'class' };
+    }
+    var label = [toggle.getAttribute('title'), toggle.getAttribute('aria-label'), toggle.textContent].filter(Boolean).join(' ');
+    if (/关闭.*字幕|隐藏.*字幕/.test(label)) return { state: 'on', toggle: toggle, source: 'label' };
+    if (/打开.*字幕|显示.*字幕/.test(label)) return { state: 'off', toggle: toggle, source: 'label' };
+    var subtitleLayer = document.querySelector('.bpx-player-subtitle-wrap,.bpx-player-subtitle,.bpx-player-subtitle-panel');
+    if (subtitleLayer && subtitleLayer.isConnected && subtitleLayer.textContent && subtitleLayer.getClientRects().length) {
+      return { state: 'on', toggle: toggle, source: 'visible-layer' };
+    }
+    return { state: 'unknown', toggle: toggle };
+  }
 
-    var settingBtn = document.querySelector('.bpx-player-ctrl-setting');
-    if (settingBtn && clickBiliElement(settingBtn)) {
-      await randomDelay(250, 350);
-      var textItems = Array.from(document.querySelectorAll([
-        '.bpx-player-ctrl-setting-menu-item',
-        '.bpx-player-ctrl-setting-box button',
-        '.bpx-player-ctrl-setting-box [role="button"]',
-        '.bpx-player-ctrl-subtitle-menu button',
-        '.bpx-player-ctrl-subtitle-menu [role="button"]'
-      ].join(','))).filter(function(node) {
-        return node && node.textContent && /字幕|AI\s*字幕/.test(node.textContent);
-      });
-      for (var i = 0; i < textItems.length; i++) {
-        if (clickBiliElement(textItems[i])) return true;
+  function waitForSubtitleCaptureControl(timeoutMs, signal) {
+    timeoutMs = timeoutMs || SUBTITLE_CAPTURE_CONTROL_TIMEOUT_MS;
+    return new Promise(function(resolve, reject) {
+      var startedAt = Date.now();
+      var timer = null;
+      function cleanup() {
+        if (timer) clearTimeout(timer);
+        if (signal) signal.removeEventListener('abort', onAbort);
       }
-      return true;
+      function onAbort() {
+        cleanup();
+        var err = new Error('用户已打断');
+        err.name = 'AbortError';
+        reject(err);
+      }
+      function check() {
+        var toggle = getSubtitleToggleElement();
+        if (toggle) {
+          cleanup();
+          resolve(toggle);
+          return;
+        }
+        if (Date.now() - startedAt >= timeoutMs) {
+          cleanup();
+          resolve(null);
+          return;
+        }
+        timer = setTimeout(check, 50);
+      }
+      if (signal && signal.aborted) return onAbort();
+      if (signal) signal.addEventListener('abort', onAbort);
+      check(); // 已经加载时首轮立刻触发，不等轮询周期。
+    });
+  }
+
+  function isCaptureSessionCurrent(session) {
+    return !!(session && session.generation === routeGeneration && session.routeKey === getRouteKey() &&
+      session.toggle && session.toggle.isConnected && document.contains(session.toggle));
+  }
+
+  function restoreSubtitleAfterCapture(session, reason) {
+    if (!session || !session.toggledByScript) return false;
+    if (!isCaptureSessionCurrent(session)) {
+      console.log('[省流助手-捕获模式] 路由或字幕控件已变化，跳过字幕恢复:', reason || 'unknown');
+      return false;
+    }
+    var current = getSubtitleToggleState(session.toggle);
+    if (current.state !== 'on') {
+      console.log('[省流助手-捕获模式] 字幕状态不确定或已关闭，跳过恢复点击:', current.state);
+      return false;
+    }
+    var restored = clickBiliSubtitleToggleOnce(session.toggle);
+    if (restored) {
+      // click 的状态更新可能异步，标记已处理，避免 finally 紧跟着再次点击而反向打开字幕。
+      session.toggledByScript = false;
+      console.log('[省流助手-捕获模式] 已恢复捕获前的字幕关闭状态:', reason || 'completed');
+    }
+    return restored;
+  }
+
+  async function triggerSubtitleForCapture(signal, generation) {
+    var toggle = await waitForSubtitleCaptureControl(SUBTITLE_CAPTURE_CONTROL_TIMEOUT_MS, signal);
+    if (!toggle) return { triggered: false, session: null };
+    var before = getSubtitleToggleState(toggle);
+    var session = {
+      generation: generation,
+      routeKey: getRouteKey(),
+      toggle: toggle,
+      originalState: before.state,
+      toggledByScript: false
+    };
+    if (!isCaptureSessionCurrent(session)) return { triggered: false, session: session };
+
+    if (before.state === 'off') {
+      // 监听已由调用方先挂好；控件出现后立即打开字幕，不插入固定等待。
+      session.toggledByScript = clickBiliSubtitleToggleOnce(toggle);
+      return { triggered: session.toggledByScript, session: session };
     }
 
-    return false;
+    // 用户原本开着字幕时不碰总开关，只尝试现成的语言项来促发一次字幕请求。
+    var languageItem = pickSubtitleLanguageItem();
+    if (languageItem && languageItem.isConnected) {
+      return { triggered: clickBiliElement(languageItem), session: session };
+    }
+    return { triggered: false, session: session };
   }
 
   async function captureSubtitleFromPlayer(panel, videoInfo) {
+    if (isSubtitleCaptureInProgress) {
+      console.log('[省流助手-捕获模式] 已有捕获任务在进行，忽略重复触发');
+      return;
+    }
     console.log('[省流助手-捕获模式] 开始等待播放器字幕请求...');
     const contentDiv = panel.querySelector('.tabbit-panel-content');
     const captureBtn = contentDiv.querySelector('#tabbit-capture-subtitle-btn');
+    const captureAbortController = new AbortController();
     const freshVideoInfo = getVideoInfo();
     if (freshVideoInfo.bvid) {
       videoInfo = freshVideoInfo;
@@ -5879,10 +6017,18 @@
       captureBtn.disabled = true;
       setFetchBtnState(captureBtn, '监听中：正在自动触发字幕', '👂');
     }
+    isSubtitleCaptureInProgress = true;
+    currentAbortController = captureAbortController;
+    const captureGeneration = routeGeneration;
+    let captureSession = null;
 
     try {
-      const capturePromise = waitForCapturedSubtitle(25000);
-      const triggered = await autoTriggerBiliSubtitleRequest();
+      // 必须先注册 waiter，再操作播放器，避免极快的字幕响应从监听窗口溜走。
+      const captureStartedAt = Date.now();
+      const capturePromise = waitForCapturedSubtitle(SUBTITLE_CAPTURE_WAIT_TIMEOUT_MS, captureAbortController.signal, captureStartedAt);
+      const triggerResult = await triggerSubtitleForCapture(captureAbortController.signal, captureGeneration);
+      captureSession = triggerResult.session;
+      const triggered = triggerResult.triggered;
       if (captureBtn) {
         setFetchBtnState(
           captureBtn,
@@ -5891,6 +6037,8 @@
         );
       }
       const entry = await capturePromise;
+      if (isStaleRoute(captureGeneration)) return;
+      restoreSubtitleAfterCapture(captureSession, 'manual-captured');
       rawSubtitleBody = entry.segments;
       rawTranscript = entry.transcript;
 
@@ -5905,6 +6053,11 @@
     } catch (err) {
       console.error('[省流助手-捕获模式] 捕获失败:', err);
       setFetchBtnState(captureBtn, err.message || '捕获失败，请重试', '❌', 3500);
+    } finally {
+      // 无论成功、超时、Abort 还是 SPA 切页都尝试恢复；内部会做路由和当前控件校验。
+      restoreSubtitleAfterCapture(captureSession, 'manual-finally');
+      isSubtitleCaptureInProgress = false;
+      if (currentAbortController === captureAbortController) currentAbortController = null;
     }
   }
 
@@ -6067,6 +6220,11 @@
     });
   }
   async function manualFetchSubtitle(panel, videoInfo) {
+    if (isSubtitleCaptureInProgress) {
+      const captureBtn = panel.querySelector('#tabbit-capture-subtitle-btn');
+      setFetchBtnState(captureBtn, '捕获模式进行中，请先等待或打断', '⏳', 3000);
+      return;
+    }
     console.log('[省流助手] 手动获取字幕...');
     const contentDiv = panel.querySelector('.tabbit-panel-content');
     const fetchBtn = contentDiv.querySelector('#tabbit-manual-fetch-btn');
@@ -6919,6 +7077,7 @@
   }
 
   function setSummaryReady(panel, contentDiv, videoInfo) {
+    setFloatBtnState(panel, 'ready');
     const input = panel.querySelector('.tabbit-chat-input');
     const sendBtn = panel.querySelector('.tabbit-chat-send');
     if (input) {
@@ -6993,10 +7152,12 @@
     const sendBtn = panel.querySelector('.tabbit-chat-send');
     const isBackgroundRun = !!(backgroundOptions && backgroundOptions.background);
     const backgroundGeneration = backgroundOptions && backgroundOptions.generation;
-    function finishBackgroundRun(ok, message) {
+    function finishSummaryRun(ok, message, failedState) {
+      if (typeof backgroundGeneration === 'number' && isStaleRoute(backgroundGeneration)) return;
+      setFloatBtnState(panel, ok ? 'ready' : (failedState || 'error'));
       if (!isBackgroundRun || typeof backgroundGeneration !== 'number') return;
       if (ok) notifyBackgroundSummaryReady(panel, backgroundGeneration);
-      else notifyBackgroundSummaryFailed(panel, backgroundGeneration, message);
+      else notifyBackgroundSummaryFailed(panel, backgroundGeneration, message, failedState);
     }
 
     panel.querySelectorAll('.tabbit-model-chip').forEach(c => c.classList.add('disabled'));
@@ -7056,7 +7217,7 @@
     if (!apiCheck.configured) {
       console.log('[省流助手] API 未配置，显示兜底模式');
       showApiNotConfiguredFallback(contentDiv, videoInfo, apiCheck.reason);
-      finishBackgroundRun(false, 'API 未配置，点击查看');
+      finishSummaryRun(false, 'API 未配置，点击查看');
       return;
     }
 
@@ -7089,13 +7250,14 @@
           resultContainer.innerHTML = '<div style="background:#f8f9fa;border-radius:8px;padding:14px;color:#555;text-align:center;">✅ HTML PPT 已生成。本模式跳过普通摘要；如需摘要，请关闭「字幕直出 HTML PPT」。</div>';
         }
         bindCommentButton(contentDiv, panel, videoInfo, true);
-        finishBackgroundRun(true);
+        finishSummaryRun(true);
       } catch (err) {
         if (isAbortError(err)) {
           if (resultContainer) resultContainer.innerHTML = '<div style="background:#fff7e6;border:1px solid #ffd591;border-radius:8px;padding:14px;color:#b76d00;text-align:center;">⏹ 已被用户打断，未生成 HTML PPT</div>';
+          finishSummaryRun(false, '已中断，点击查看', 'interrupted');
         } else {
           showError(contentDiv, err.message);
-          finishBackgroundRun(false, '摘要失败，点击查看');
+          finishSummaryRun(false, '摘要失败，点击查看');
         }
       } finally {
         if (currentAbortController === localController) currentAbortController = null;
@@ -7123,7 +7285,7 @@
         finalizeSummaryUI(contentDiv, cachedSummary, pageUrl, videoInfo);
         setSummaryReady(panel, contentDiv, videoInfo);
       }
-      finishBackgroundRun(true);
+      finishSummaryRun(true);
       return;
     }
 
@@ -7195,7 +7357,7 @@
 
         showImageResult(contentDiv, textContent, '', pageUrl, videoInfo);
         setSummaryReady(panel, contentDiv, videoInfo);
-        finishBackgroundRun(true);
+        finishSummaryRun(true);
 
         startAsyncImageGeneration(contentDiv, textContent, videoInfo);
 
@@ -7226,7 +7388,7 @@
 
         finalizeSummaryUI(contentDiv, reply, pageUrl, videoInfo);
         setSummaryReady(panel, contentDiv, videoInfo);
-        finishBackgroundRun(true);
+        finishSummaryRun(true);
       }
 
     } catch (err) {
@@ -7237,9 +7399,10 @@
         if (resultContainer) {
           resultContainer.innerHTML = '<div style="background:#fff7e6;border:1px solid #ffd591;border-radius:8px;padding:14px;color:#b76d00;text-align:center;">⏹ 已被用户打断，未生成内容</div>';
         }
+        finishSummaryRun(false, '已中断，点击查看', 'interrupted');
       } else {
         showError(contentDiv, err.message);
-        finishBackgroundRun(false, '摘要失败，点击查看');
+        finishSummaryRun(false, '摘要失败，点击查看');
       }
 
       input.disabled = false;
@@ -9038,6 +9201,10 @@
     abortCurrentTask();
     clearSummaryNotice();
     currentSubtitleManualFallback = null;
+    // 捕获缓存没有可靠的视频 ID，切换 SPA 路由时必须清空，避免把上一条视频的字幕直接用于新视频。
+    subtitleCaptureEntries = [];
+    subtitleCaptureWaiters = [];
+    isSubtitleCaptureInProgress = false;
     rawMarkdownResult = '';
     rawTranscript = '';
     rawSubtitleBody = [];
@@ -9095,8 +9262,8 @@
   }
 
   // ==================== 自动启动主流程 ====================
-  // 🆕 字幕获取整体超时（5 秒），防止 B 站 SPA 初始化竞态导致永久卡住
-  const SUBTITLE_FETCH_OVERALL_TIMEOUT_MS = 5000;
+  // 捕获优先后仍给原接口链路留出完整回退时间，避免总超时提前掐掉回退。
+  const SUBTITLE_FETCH_OVERALL_TIMEOUT_MS = 40000;
 
   async function startParsing(options) {
     if (hasParsed) return;
@@ -9111,6 +9278,7 @@
     let subtitleManualFallbackShown = false;
     let subtitleForceStopped = false;
     let overallTimer = null;
+    let captureFallbackUsed = false;
     function cleanupSubtitleAbortUi() {
       if (subtitleAbortBtnWrap && subtitleAbortBtnWrap.parentNode) {
         subtitleAbortBtnWrap.remove();
@@ -9137,6 +9305,7 @@
           title: '已停止自动获取',
           desc: '自动字幕获取已打断。现在可以手动获取字幕，或直接上传 srt/txt/粘贴字幕内容。'
         });
+        setFloatBtnState(panel, 'interrupted');
       }
     }
     function forceStopAutoSubtitleFetch() {
@@ -9178,14 +9347,15 @@
         hideFloatBtn();
       } else {
         panel.style.display = 'none';
-        setFloatBtnState(panel, 'processing');
       }
+      setFloatBtnState(panel, 'processing');
 
       const skipSec = CONFIG.skipDuration || 60;
       if (videoInfo.duration > 0 && videoInfo.duration < skipSec) {
         console.log('[省流助手] 视频时长不足' + skipSec + '秒，跳过自动字幕获取');
         showNoSubtitleState(panel, videoInfo, true);
-        if (isAutoTriggered) notifyBackgroundSummaryFailed(panel, parsingGeneration, '视频时长过短，点击查看');
+        setFloatBtnState(panel, 'no-subtitle');
+        if (isAutoTriggered) notifyBackgroundSummaryFailed(panel, parsingGeneration, '视频时长过短，点击查看', 'no-subtitle');
         return;
       }
 
@@ -9205,9 +9375,52 @@
       });
 
       var fetchFlow = (async function() {
-        console.log('[省流助手] 检测字幕可用性...');
         const loadingSpan = panel.querySelector('.tabbit-panel-content .tabbit-loading span');
-        if (loadingSpan) loadingSpan.textContent = '正在检测字幕可用性...';
+
+        // 自动解析默认走捕获模式：实际播放器响应通常比字幕接口更可靠。
+        // 等待和自动触发共用当前 AbortController，因此「停止自动获取」会同时取消等待。
+        throwIfSubtitleForceStopped();
+        isSubtitleCaptureInProgress = true;
+        let captureSession = null;
+        try {
+          if (loadingSpan) loadingSpan.textContent = '正在捕获播放器字幕...';
+          console.log('[省流助手-捕获模式] 自动解析：优先等待播放器字幕响应');
+          // 先挂监听 waiter，再点字幕；字幕控件已在时不会额外 sleep。
+          const captureStartedAt = Date.now();
+          const capturePromise = waitForCapturedSubtitle(SUBTITLE_CAPTURE_WAIT_TIMEOUT_MS, subtitleAbortController.signal, captureStartedAt);
+          // autoTrigger 被中止时，capturePromise 也会同步 reject；提前挂处理器避免未处理拒绝。
+          capturePromise.catch(function() {});
+          const triggerResult = await triggerSubtitleForCapture(subtitleAbortController.signal, parsingGeneration);
+          captureSession = triggerResult.session;
+          const triggered = triggerResult.triggered;
+          throwIfSubtitleForceStopped();
+          if (!triggered) throw new Error('未找到可安全触发的字幕控件');
+          if (loadingSpan) {
+            loadingSpan.textContent = triggered ? '已触发播放器字幕，正在捕获...' : '等待播放器字幕响应...';
+          }
+          const captured = await capturePromise;
+          throwIfSubtitleForceStopped();
+          if (isStaleRoute(parsingGeneration)) return 'stale';
+          if (captured && captured.transcript && captured.transcript.trim()) {
+            restoreSubtitleAfterCapture(captureSession, 'auto-captured');
+            rawSubtitleBody = captured.segments || [];
+            console.log('[省流助手-捕获模式] 自动解析捕获成功，直接开始摘要');
+            return captured.transcript;
+          }
+          throw new Error('捕获到的字幕为空');
+        } catch (captureErr) {
+          if (isAbortError(captureErr)) throw captureErr;
+          throwIfSubtitleForceStopped();
+          captureFallbackUsed = true;
+          console.warn('[省流助手-捕获模式] 自动捕获未成功，回退字幕接口:', captureErr.message || captureErr);
+          if (loadingSpan) loadingSpan.textContent = '捕获未成功，正在回退接口获取字幕...';
+        } finally {
+          // 失败、超时、停止及切路由都走这里；恢复函数会拒绝碰新路由或已替换的控件。
+          restoreSubtitleAfterCapture(captureSession, 'auto-finally');
+          isSubtitleCaptureInProgress = false;
+        }
+
+        console.log('[省流助手] 捕获未命中，检测字幕可用性并回退接口...');
 
         throwIfSubtitleForceStopped();
         const hasSubtitleButton = await waitForSubtitleButton(2000, 200, subtitleAbortController.signal);
@@ -9275,8 +9488,12 @@
 
       if (fetchResult === 'stale') return;
       if (fetchResult === 'no_subtitle') {
-        showNoSubtitleState(panel, videoInfo);
-        if (isAutoTriggered) notifyBackgroundSummaryFailed(panel, parsingGeneration, '未找到字幕，点击查看');
+        showNoSubtitleState(panel, videoInfo, false, captureFallbackUsed ? {
+          title: '捕获和接口获取均未成功',
+          desc: '已先尝试捕获播放器字幕，再回退字幕接口，仍未找到可用字幕。可手动获取、使用捕获模式，或上传字幕。'
+        } : undefined);
+        setFloatBtnState(panel, 'no-subtitle');
+        if (isAutoTriggered) notifyBackgroundSummaryFailed(panel, parsingGeneration, '未找到字幕，点击查看', 'no-subtitle');
         return;
       }
 
@@ -9314,6 +9531,7 @@
       if (isAbortError(err)) {
         console.log('[省流助手] 自动字幕获取已被用户打断');
         showInterruptedSubtitleManualState();
+        if (panel && !isStaleRoute(parsingGeneration)) setFloatBtnState(panel, 'interrupted');
         return;
       }
       console.error('[省流助手] 自动解析失败:', err);
@@ -9324,6 +9542,7 @@
         if (stateEl) {
           stateEl.insertAdjacentHTML('beforeend', '<div style="font-size:12px;color:#c00;margin-top:8px;">自动获取失败：' + escapeHtml(err.message || String(err)) + '</div>');
         }
+        setFloatBtnState(panel, 'error');
         if (isAutoTriggered) notifyBackgroundSummaryFailed(panel, parsingGeneration, '自动解析失败，点击查看');
       }
     }
