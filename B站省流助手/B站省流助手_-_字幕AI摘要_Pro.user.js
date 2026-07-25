@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站省流助手 - 字幕AI摘要 Pro
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      4.3.5
+// @version      4.3.6
 // @description  自动提取B站视频字幕，通过自定义AI API生成极简摘要，支持模型切换、持续对话和评论区总结；支持自动解析开关、自动获取模型列表、flomo自动加标签，新增总结生图功能；v3.9.0 新增html PPT模式；v4.0.0 新增新手引导和API兜底功能（无API时仍可下载字幕、一键复制提示词+字幕到其他AI）
 // @author       次元饺子
 // @match        https://www.bilibili.com/video/*
@@ -926,6 +926,7 @@
     summaryMaxTokens: 4000,
     skipDuration: 60,
     autoParse: true,
+    autoOpenPanelWhileProcessing: false,
     enableThinking: true,
     promptPresets: DEFAULT_PRESETS,
     activePresetId: 'preset_default',
@@ -1303,6 +1304,7 @@
   let lastRouteKey = '';
   let routeRestartTimer = null;
   let routeGeneration = 0;
+  let summaryNoticeTimer = null;
   // 🆕 当前正在进行的 AI 任务的 AbortController（用于打断流式输出）
   let currentAbortController = null;
   let currentSubtitleManualFallback = null;
@@ -4383,6 +4385,42 @@
         writing-mode: vertical-rl;
         letter-spacing: 3px;
       }
+      #tabbit-float-btn.tabbit-float-processing {
+        background: linear-gradient(160deg, #2563eb 0%, #7c3aed 100%) !important;
+      }
+      #tabbit-float-btn.tabbit-float-ready {
+        background: linear-gradient(160deg, #16a34a 0%, #0891b2 100%) !important;
+      }
+      #tabbit-float-btn.tabbit-float-error {
+        background: linear-gradient(160deg, #dc2626 0%, #ea580c 100%) !important;
+      }
+      #tabbit-summary-notice {
+        position: fixed;
+        right: 18px;
+        bottom: 24px;
+        z-index: 2147483647;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        max-width: min(360px, calc(100vw - 36px));
+        padding: 13px 16px;
+        border: 0;
+        border-radius: 12px;
+        background: linear-gradient(135deg, #16a34a 0%, #0891b2 100%);
+        color: #fff;
+        box-shadow: 0 10px 28px rgba(8,145,178,0.34);
+        cursor: pointer;
+        font: 600 14px/1.35 -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        animation: tabbitNoticeIn 0.24s ease-out;
+      }
+      #tabbit-summary-notice.tabbit-summary-notice-error {
+        background: linear-gradient(135deg, #dc2626 0%, #ea580c 100%);
+        box-shadow: 0 10px 28px rgba(220,38,38,0.3);
+      }
+      @keyframes tabbitNoticeIn {
+        from { opacity: 0; transform: translateY(12px); }
+        to { opacity: 1; transform: translateY(0); }
+      }
       .tabbit-preset-bar {
         background: linear-gradient(135deg, #fff5f8 0%, #f0f4ff 100%);
         border: 1px solid #ffd6e3;
@@ -4769,7 +4807,7 @@
       panel.style.animation = 'slideOutRight 0.3s ease forwards';
       setTimeout(() => {
         panel.style.display = 'none';
-        try { showFloatBtn(panel); } catch(e) { console.warn('[省流助手] 显示悬浮窗失败:', e); }
+        try { showFloatBtn(panel, panel._tabbitFloatState || 'idle'); } catch(e) { console.warn('[省流助手] 显示悬浮窗失败:', e); }
       }, 350);
     });
 
@@ -4937,15 +4975,75 @@
     }
   }
 
-  function showFloatBtn(panel) {
+  function clearSummaryNotice() {
+    if (summaryNoticeTimer) clearTimeout(summaryNoticeTimer);
+    summaryNoticeTimer = null;
+    const notice = document.querySelector('#tabbit-summary-notice');
+    if (notice) notice.remove();
+  }
+
+  function openPanel(panel) {
+    if (!panel) return;
+    clearSummaryNotice();
+    hideFloatBtn();
+    panel.style.animation = 'none';
+    panel.style.display = 'flex';
+    void panel.offsetWidth;
+    panel.style.animation = 'slideInRight 0.3s ease';
+  }
+
+  function showSummaryNotice(panel, text, type) {
+    clearSummaryNotice();
+    if (!panel || panel.style.display !== 'none') return;
+    const notice = document.createElement('button');
+    notice.id = 'tabbit-summary-notice';
+    if (type === 'error') notice.classList.add('tabbit-summary-notice-error');
+    notice.type = 'button';
+    notice.textContent = text;
+    notice.addEventListener('click', function() {
+      clearSummaryNotice();
+      openPanel(panel);
+    });
+    document.body.appendChild(notice);
+    summaryNoticeTimer = setTimeout(clearSummaryNotice, 12000);
+  }
+
+  function setFloatBtnState(panel, state) {
+    if (!panel) return;
+    panel._tabbitFloatState = state || 'idle';
+    if (panel.style.display === 'none') showFloatBtn(panel, panel._tabbitFloatState);
+  }
+
+  function notifyBackgroundSummaryReady(panel, generation) {
+    if (isStaleRoute(generation)) return;
+    setFloatBtnState(panel, 'ready');
+    showSummaryNotice(panel, '✅ 摘要已完成，点击查看', 'ready');
+  }
+
+  function notifyBackgroundSummaryFailed(panel, generation, message) {
+    if (isStaleRoute(generation)) return;
+    setFloatBtnState(panel, 'error');
+    showSummaryNotice(panel, '⚠️ ' + (message || '摘要失败，点击查看'), 'error');
+  }
+
+  function showFloatBtn(panel, state) {
     createStyles();
     const old = document.querySelector('#tabbit-float-btn');
     if (old) old.remove();
 
     const btn = document.createElement('button');
     btn.id = 'tabbit-float-btn';
-    btn.title = panel ? '打开省流助手（可拖动）' : '点击开始解析（可拖动）';
-    btn.innerHTML = '<span class="tabbit-float-icon">🎬</span><span class="tabbit-float-label">省流助手</span>';
+    const floatState = state || (panel && panel._tabbitFloatState) || 'idle';
+    const labels = {
+      processing: { icon: '⏳', label: '处理中', title: '摘要正在后台处理，点击查看进度（可拖动）' },
+      ready: { icon: '✅', label: '摘要完成', title: '摘要已完成，点击查看（可拖动）' },
+      error: { icon: '⚠️', label: '处理失败', title: '处理失败，点击查看（可拖动）' },
+      idle: { icon: '🎬', label: '省流助手', title: panel ? '打开省流助手（可拖动）' : '点击开始解析（可拖动）' }
+    };
+    const info = labels[floatState] || labels.idle;
+    if (floatState !== 'idle') btn.classList.add('tabbit-float-' + floatState);
+    btn.title = info.title;
+    btn.innerHTML = '<span class="tabbit-float-icon">' + info.icon + '</span><span class="tabbit-float-label">' + info.label + '</span>';
     btn.style.cssText = 'position:fixed!important;z-index:2147483647!important;display:flex!important;visibility:visible!important;opacity:1!important;pointer-events:auto!important;';
     document.body.appendChild(btn);
 
@@ -4961,13 +5059,10 @@
 
     btn.addEventListener('click', async () => {
       if (dragMoved) return;
-      hideFloatBtn();
       if (panel) {
-        panel.style.animation = 'none';
-        panel.style.display = 'flex';
-        void panel.offsetWidth;
-        panel.style.animation = 'slideInRight 0.3s ease';
+        openPanel(panel);
       } else {
+        hideFloatBtn();
         await startParsing();
       }
     });
@@ -6892,10 +6987,17 @@
   /**
    * 🆕 流式版：初始总结（支持打断）
    */
-  async function runSummary(panel, transcript, videoInfo, subtitleBody) {
+  async function runSummary(panel, transcript, videoInfo, subtitleBody, backgroundOptions) {
     const contentDiv = panel.querySelector('.tabbit-panel-content');
     const input = panel.querySelector('.tabbit-chat-input');
     const sendBtn = panel.querySelector('.tabbit-chat-send');
+    const isBackgroundRun = !!(backgroundOptions && backgroundOptions.background);
+    const backgroundGeneration = backgroundOptions && backgroundOptions.generation;
+    function finishBackgroundRun(ok, message) {
+      if (!isBackgroundRun || typeof backgroundGeneration !== 'number') return;
+      if (ok) notifyBackgroundSummaryReady(panel, backgroundGeneration);
+      else notifyBackgroundSummaryFailed(panel, backgroundGeneration, message);
+    }
 
     panel.querySelectorAll('.tabbit-model-chip').forEach(c => c.classList.add('disabled'));
     panel.querySelectorAll('.tabbit-preset-chip').forEach(c => c.classList.add('disabled'));
@@ -6954,6 +7056,7 @@
     if (!apiCheck.configured) {
       console.log('[省流助手] API 未配置，显示兜底模式');
       showApiNotConfiguredFallback(contentDiv, videoInfo, apiCheck.reason);
+      finishBackgroundRun(false, 'API 未配置，点击查看');
       return;
     }
 
@@ -6986,11 +7089,13 @@
           resultContainer.innerHTML = '<div style="background:#f8f9fa;border-radius:8px;padding:14px;color:#555;text-align:center;">✅ HTML PPT 已生成。本模式跳过普通摘要；如需摘要，请关闭「字幕直出 HTML PPT」。</div>';
         }
         bindCommentButton(contentDiv, panel, videoInfo, true);
+        finishBackgroundRun(true);
       } catch (err) {
         if (isAbortError(err)) {
           if (resultContainer) resultContainer.innerHTML = '<div style="background:#fff7e6;border:1px solid #ffd591;border-radius:8px;padding:14px;color:#b76d00;text-align:center;">⏹ 已被用户打断，未生成 HTML PPT</div>';
         } else {
           showError(contentDiv, err.message);
+          finishBackgroundRun(false, '摘要失败，点击查看');
         }
       } finally {
         if (currentAbortController === localController) currentAbortController = null;
@@ -7018,6 +7123,7 @@
         finalizeSummaryUI(contentDiv, cachedSummary, pageUrl, videoInfo);
         setSummaryReady(panel, contentDiv, videoInfo);
       }
+      finishBackgroundRun(true);
       return;
     }
 
@@ -7089,6 +7195,7 @@
 
         showImageResult(contentDiv, textContent, '', pageUrl, videoInfo);
         setSummaryReady(panel, contentDiv, videoInfo);
+        finishBackgroundRun(true);
 
         startAsyncImageGeneration(contentDiv, textContent, videoInfo);
 
@@ -7119,6 +7226,7 @@
 
         finalizeSummaryUI(contentDiv, reply, pageUrl, videoInfo);
         setSummaryReady(panel, contentDiv, videoInfo);
+        finishBackgroundRun(true);
       }
 
     } catch (err) {
@@ -7131,6 +7239,7 @@
         }
       } else {
         showError(contentDiv, err.message);
+        finishBackgroundRun(false, '摘要失败，点击查看');
       }
 
       input.disabled = false;
@@ -7804,10 +7913,22 @@
             <div class="tabbit-switch-row">
               <div>
                 <div class="tabbit-settings-label">🚀 自动解析</div>
-                <div class="tabbit-settings-hint" style="margin-top:2px;">开启：进入视频页自动开始解析并打开面板；关闭：仅在右侧显示悬浮窗，由你决定是否解析</div>
+                <div class="tabbit-settings-hint" style="margin-top:2px;">开启：进入视频页自动在后台获取字幕和生成摘要；关闭：仅在右侧显示悬浮窗，由你决定是否解析</div>
               </div>
               <label class="tabbit-switch">
                 <input type="checkbox" id="ts-autoParse" ${CONFIG.autoParse ? 'checked' : ''} />
+                <span class="tabbit-slider"></span>
+              </label>
+            </div>
+          </div>
+          <div class="tabbit-settings-group" style="margin-top:8px;">
+            <div class="tabbit-switch-row">
+              <div>
+                <div class="tabbit-settings-label">🪟 处理时自动打开面板</div>
+                <div class="tabbit-settings-hint" style="margin-top:2px;">默认关闭。关闭后通过悬浮按钮查看进度，摘要完成会提示“点击查看”。</div>
+              </div>
+              <label class="tabbit-switch">
+                <input type="checkbox" id="ts-autoOpenPanelWhileProcessing" ${CONFIG.autoOpenPanelWhileProcessing === true ? 'checked' : ''} />
                 <span class="tabbit-slider"></span>
               </label>
             </div>
@@ -8545,6 +8666,7 @@
         .filter(Boolean);
       CONFIG.autoSubmitCommentSummary = overlay.querySelector('#ts-autoSubmitCommentSummary').checked;
       const newAutoParse = overlay.querySelector('#ts-autoParse').checked;
+      const newAutoOpenPanelWhileProcessing = overlay.querySelector('#ts-autoOpenPanelWhileProcessing').checked;
 
       const cleanedPresets = editingPresets
         .map(function(p) {
@@ -8619,6 +8741,7 @@
       const newSkipDuration = parseInt(overlay.querySelector('#ts-skipDuration').value, 10);
       CONFIG.skipDuration = isNaN(newSkipDuration) ? 60 : newSkipDuration;
       CONFIG.autoParse = newAutoParse;
+      CONFIG.autoOpenPanelWhileProcessing = newAutoOpenPanelWhileProcessing;
       CONFIG.enableThinking = overlay.querySelector('#ts-enableThinking') ? overlay.querySelector('#ts-enableThinking').checked : true;
       CONFIG.enableImageGen = overlay.querySelector('#ts-enableImageGen').checked;
       CONFIG.imageGenMode = overlay.querySelector('#ts-imageGenMode').value === 'flow' ? 'flow' : 'api';
@@ -8747,6 +8870,7 @@
             if (imported.commentMaxDelay !== undefined) overlay.querySelector('#ts-commentMaxDelay').value = imported.commentMaxDelay;
             if (imported.skipDuration !== undefined) overlay.querySelector('#ts-skipDuration').value = imported.skipDuration;
             if (imported.autoParse !== undefined) overlay.querySelector('#ts-autoParse').checked = !!imported.autoParse;
+            if (imported.autoOpenPanelWhileProcessing !== undefined) overlay.querySelector('#ts-autoOpenPanelWhileProcessing').checked = imported.autoOpenPanelWhileProcessing === true;
             if (imported.enableImageGen !== undefined) overlay.querySelector('#ts-enableImageGen').checked = !!imported.enableImageGen;
             if (imported.imageGenMode !== undefined) { var igModeEl = overlay.querySelector('#ts-imageGenMode'); if (igModeEl) igModeEl.value = imported.imageGenMode === 'flow' ? 'flow' : 'api'; }
             if (imported.flowProjectUrl !== undefined) { var flowProjectUrlEl = overlay.querySelector('#ts-flowProjectUrl'); if (flowProjectUrlEl) flowProjectUrlEl.value = imported.flowProjectUrl || DEFAULT_FLOW_PROJECT_URL; }
@@ -8827,6 +8951,7 @@
       overlay.querySelector('#ts-commentMaxDelay').value = DEFAULT_CONFIG.commentMaxDelay;
       overlay.querySelector('#ts-skipDuration').value = DEFAULT_CONFIG.skipDuration;
       overlay.querySelector('#ts-autoParse').checked = DEFAULT_CONFIG.autoParse;
+      overlay.querySelector('#ts-autoOpenPanelWhileProcessing').checked = DEFAULT_CONFIG.autoOpenPanelWhileProcessing;
       overlay.querySelector('#ts-enableImageGen').checked = false;
       var imageGenModeReset = overlay.querySelector('#ts-imageGenMode'); if (imageGenModeReset) imageGenModeReset.value = DEFAULT_CONFIG.imageGenMode;
       var flowProjectUrlReset = overlay.querySelector('#ts-flowProjectUrl'); if (flowProjectUrlReset) flowProjectUrlReset.value = DEFAULT_CONFIG.flowProjectUrl;
@@ -8911,6 +9036,7 @@
 
   function resetRuntimeForRouteChange() {
     abortCurrentTask();
+    clearSummaryNotice();
     currentSubtitleManualFallback = null;
     rawMarkdownResult = '';
     rawTranscript = '';
@@ -8944,7 +9070,7 @@
     routeRestartTimer = setTimeout(function() {
       resetRuntimeForRouteChange();
       if (CONFIG.autoParse) {
-        startParsing();
+        startParsing({ autoTriggered: true });
       } else {
         showFloatOnlyMode();
       }
@@ -8972,9 +9098,11 @@
   // 🆕 字幕获取整体超时（5 秒），防止 B 站 SPA 初始化竞态导致永久卡住
   const SUBTITLE_FETCH_OVERALL_TIMEOUT_MS = 5000;
 
-  async function startParsing() {
+  async function startParsing(options) {
     if (hasParsed) return;
     hasParsed = true;
+    const isAutoTriggered = !!(options && options.autoTriggered);
+    const keepPanelVisible = !isAutoTriggered || CONFIG.autoOpenPanelWhileProcessing === true;
     const parsingGeneration = routeGeneration;
     let panel = null;
     let videoInfo = null;
@@ -9046,11 +9174,18 @@
 
       createStyles();
       panel = createPanel(videoInfo);
+      if (keepPanelVisible) {
+        hideFloatBtn();
+      } else {
+        panel.style.display = 'none';
+        setFloatBtnState(panel, 'processing');
+      }
 
       const skipSec = CONFIG.skipDuration || 60;
       if (videoInfo.duration > 0 && videoInfo.duration < skipSec) {
         console.log('[省流助手] 视频时长不足' + skipSec + '秒，跳过自动字幕获取');
         showNoSubtitleState(panel, videoInfo, true);
+        if (isAutoTriggered) notifyBackgroundSummaryFailed(panel, parsingGeneration, '视频时长过短，点击查看');
         return;
       }
 
@@ -9141,6 +9276,7 @@
       if (fetchResult === 'stale') return;
       if (fetchResult === 'no_subtitle') {
         showNoSubtitleState(panel, videoInfo);
+        if (isAutoTriggered) notifyBackgroundSummaryFailed(panel, parsingGeneration, '未找到字幕，点击查看');
         return;
       }
 
@@ -9164,7 +9300,10 @@
         }
       }
 
-      await runSummary(panel, fetchResult, videoInfo, rawSubtitleBody);
+      await runSummary(panel, fetchResult, videoInfo, rawSubtitleBody, {
+        background: isAutoTriggered,
+        generation: parsingGeneration
+      });
     } catch (err) {
       if (overallTimer) {
         clearTimeout(overallTimer);
@@ -9185,6 +9324,7 @@
         if (stateEl) {
           stateEl.insertAdjacentHTML('beforeend', '<div style="font-size:12px;color:#c00;margin-top:8px;">自动获取失败：' + escapeHtml(err.message || String(err)) + '</div>');
         }
+        if (isAutoTriggered) notifyBackgroundSummaryFailed(panel, parsingGeneration, '自动解析失败，点击查看');
       }
     }
   }
@@ -9201,7 +9341,7 @@
     // 避免 B 站页面初始化时的 replaceState（URL 规范化）被误判为路由切换
     setTimeout(async () => {
       if (CONFIG.autoParse) {
-        await startParsing();
+        await startParsing({ autoTriggered: true });
       } else {
         showFloatOnlyMode();
       }
