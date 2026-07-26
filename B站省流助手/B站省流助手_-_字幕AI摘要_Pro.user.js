@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站省流助手 - 字幕AI摘要 Pro
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      4.3.7
+// @version      4.3.8
 // @description  自动提取B站视频字幕，通过自定义AI API生成极简摘要，支持模型切换、持续对话和评论区总结；支持自动解析开关、自动获取模型列表、flomo自动加标签，新增总结生图功能；v3.9.0 新增html PPT模式；v4.0.0 新增新手引导和API兜底功能（无API时仍可下载字幕、一键复制提示词+字幕到其他AI）
 // @author       次元饺子
 // @match        https://www.bilibili.com/video/*
@@ -4295,6 +4295,13 @@
         justify-content: space-between;
         gap: 12px;
       }
+      .tabbit-top-switch-row .tabbit-switch-copy {
+        flex: 1;
+        min-width: 0;
+      }
+      .tabbit-top-switch-row .tabbit-switch {
+        flex-shrink: 0;
+      }
       .tabbit-switch-row .tabbit-settings-label {
         margin-bottom: 0;
       }
@@ -6026,16 +6033,18 @@
       // 必须先注册 waiter，再操作播放器，避免极快的字幕响应从监听窗口溜走。
       const captureStartedAt = Date.now();
       const capturePromise = waitForCapturedSubtitle(SUBTITLE_CAPTURE_WAIT_TIMEOUT_MS, captureAbortController.signal, captureStartedAt);
+      capturePromise.catch(function() {});
       const triggerResult = await triggerSubtitleForCapture(captureAbortController.signal, captureGeneration);
       captureSession = triggerResult.session;
       const triggered = triggerResult.triggered;
       if (captureBtn) {
         setFetchBtnState(
           captureBtn,
-          triggered ? '已自动触发，等待字幕响应' : '自动触发失败，请手动点字幕按钮',
+          triggered ? '已自动触发，等待字幕响应' : '自动触发失败，正在回退字幕接口',
           triggered ? '⏳' : '👉'
         );
       }
+      if (!triggered) throw new Error('未找到可安全触发的字幕控件');
       const entry = await capturePromise;
       if (isStaleRoute(captureGeneration)) return;
       restoreSubtitleAfterCapture(captureSession, 'manual-captured');
@@ -6051,8 +6060,30 @@
       panel.querySelectorAll('.tabbit-model-chip').forEach(c => c.classList.remove('disabled'));
       await runSummary(panel, rawTranscript, videoInfo, rawSubtitleBody);
     } catch (err) {
-      console.error('[省流助手-捕获模式] 捕获失败:', err);
-      setFetchBtnState(captureBtn, err.message || '捕获失败，请重试', '❌', 3500);
+      if (isAbortError(err)) {
+        setFetchBtnState(captureBtn, '已取消字幕捕获', '⏹️', 2500);
+        return;
+      }
+      console.warn('[省流助手-捕获模式] 捕获失败，回退字幕接口:', err.message || err);
+      try {
+        if (captureBtn) setFetchBtnState(captureBtn, '捕获未命中，正在回退字幕接口', '⏳');
+        var fallbackSubtitles = await fetchSubtitles(videoInfo.cid, videoInfo.bvid, captureAbortController.signal);
+        var fallbackTarget = fallbackSubtitles.find(function(subtitle) {
+          return subtitle.lan === 'zh-CN' || subtitle.lan === 'ai-zh';
+        }) || fallbackSubtitles[0];
+        var fallbackSegments = fallbackTarget ? await fetchSubtitleContent(fallbackTarget.subtitle_url, captureAbortController.signal) : [];
+        var fallbackTranscript = formatTranscript(fallbackSegments);
+        if (!fallbackTranscript.trim()) throw err;
+        rawSubtitleBody = fallbackSegments;
+        rawTranscript = fallbackTranscript;
+        console.log('[省流助手-捕获模式] 手动捕获未命中，已用接口字幕回退');
+        restoreSubtitleAfterCapture(captureSession, 'manual-fallback');
+        panel.querySelectorAll('.tabbit-model-chip').forEach(c => c.classList.remove('disabled'));
+        await runSummary(panel, rawTranscript, videoInfo, rawSubtitleBody);
+      } catch (fallbackErr) {
+        console.error('[省流助手-捕获模式] 捕获和接口回退均失败:', fallbackErr);
+        setFetchBtnState(captureBtn, fallbackErr.message || '捕获失败，请重试', '❌', 3500);
+      }
     } finally {
       // 无论成功、超时、Abort 还是 SPA 切页都尝试恢复；内部会做路由和当前控件校验。
       restoreSubtitleAfterCapture(captureSession, 'manual-finally');
@@ -8072,32 +8103,28 @@
         </div>
         <div class="tabbit-settings-body">
 
-          <div class="tabbit-settings-group">
-            <div class="tabbit-switch-row">
-              <div>
-                <div class="tabbit-settings-label">🚀 自动解析</div>
-                <div class="tabbit-settings-hint" style="margin-top:2px;">开启：进入视频页自动在后台获取字幕和生成摘要；关闭：仅在右侧显示悬浮窗，由你决定是否解析</div>
-              </div>
-              <label class="tabbit-switch">
-                <input type="checkbox" id="ts-autoParse" ${CONFIG.autoParse ? 'checked' : ''} />
-                <span class="tabbit-slider"></span>
-              </label>
+          <div class="tabbit-settings-group tabbit-switch-row tabbit-top-switch-row">
+            <div class="tabbit-switch-copy">
+              <div class="tabbit-settings-label">🚀 自动解析</div>
+              <div class="tabbit-settings-hint" style="margin-top:2px;">开启：进入视频页自动在后台获取字幕和生成摘要；关闭：仅在右侧显示悬浮窗，由你决定是否解析</div>
             </div>
+            <label class="tabbit-switch">
+              <input type="checkbox" id="ts-autoParse" ${CONFIG.autoParse ? 'checked' : ''} />
+              <span class="tabbit-slider"></span>
+            </label>
           </div>
-          <div class="tabbit-settings-group" style="margin-top:8px;">
-            <div class="tabbit-switch-row">
-              <div>
-                <div class="tabbit-settings-label">🪟 处理时自动打开面板</div>
-                <div class="tabbit-settings-hint" style="margin-top:2px;">默认关闭。关闭后通过悬浮按钮查看进度，摘要完成会提示“点击查看”。</div>
-              </div>
-              <label class="tabbit-switch">
-                <input type="checkbox" id="ts-autoOpenPanelWhileProcessing" ${CONFIG.autoOpenPanelWhileProcessing === true ? 'checked' : ''} />
-                <span class="tabbit-slider"></span>
-              </label>
+          <div class="tabbit-settings-group tabbit-switch-row tabbit-top-switch-row" style="margin-top:8px;">
+            <div class="tabbit-switch-copy">
+              <div class="tabbit-settings-label">🪟 处理时自动打开面板</div>
+              <div class="tabbit-settings-hint" style="margin-top:2px;">默认关闭。关闭后通过悬浮按钮查看进度，摘要完成会提示“点击查看”。</div>
             </div>
+            <label class="tabbit-switch">
+              <input type="checkbox" id="ts-autoOpenPanelWhileProcessing" ${CONFIG.autoOpenPanelWhileProcessing === true ? 'checked' : ''} />
+              <span class="tabbit-slider"></span>
+            </label>
           </div>
-          <div class="tabbit-settings-group" style="margin-top:8px;">
-            <div>
+          <div class="tabbit-settings-group tabbit-switch-row tabbit-top-switch-row" style="margin-top:8px;">
+            <div class="tabbit-switch-copy">
               <div class="tabbit-settings-label">🧠 思考模式</div>
               <div class="tabbit-settings-hint" style="margin-top:2px;">关闭后请求不带 thinking 参数，可加快响应速度</div>
             </div>
