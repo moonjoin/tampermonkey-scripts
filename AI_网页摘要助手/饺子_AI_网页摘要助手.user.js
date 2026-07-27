@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         饺子 AI 网页摘要助手
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      2.9.5
+// @version      2.9.6
 // @description  指定网站自动弹出 AI 网页摘要，支持连续对话、多预设、多模板、SPA路由、摘要生图、flomo、坚果云双文件云同步。Shadow DOM 隔离样式。
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
@@ -718,6 +718,25 @@
       .slice(0, 500);
   }
 
+  function getGMResponseText(response) {
+    if (typeof response?.responseText === 'string') return response.responseText;
+    return typeof response?.response === 'string' ? response.response : '';
+  }
+
+  function formatUnparseableStreamResponse(text, apiKey) {
+    const context = sanitizeApiErrorContext(text, apiKey);
+    return context
+      ? '服务端返回了无法解析的响应：' + context
+      : '服务端返回了无法解析的响应（响应正文为空，可能被浏览器或代理拦截）';
+  }
+
+  function formatMissingStreamContent(text, apiKey) {
+    const context = sanitizeApiErrorContext(text, apiKey);
+    return context
+      ? '服务端响应中没有可用内容：' + context
+      : '服务端响应中没有可用内容（响应正文为空，可能被浏览器或代理拦截）';
+  }
+
   function formatStreamApiError(status, body, apiKey) {
     let detail = '';
     try { detail = extractApiErrorMessage(JSON.parse(body)); } catch (e) {}
@@ -943,11 +962,10 @@
             'Accept': 'text/event-stream'
           },
           data: JSON.stringify({ ...body, stream: true }),
-          responseType: 'stream',
           timeout: Math.max(config.apiTimeout || 120000, 180000),
           onprogress: (e) => {
             if (failed || parser.ended) return;
-            const text = e.responseText || '';
+            const text = getGMResponseText(e);
             if (text.length <= receivedLen) return;
             const newChunk = text.substring(receivedLen);
             receivedLen = text.length;
@@ -957,7 +975,7 @@
           onload: (res) => {
             currentRequest = null; currentReject = null;
             if (failed) return;
-            const text = res.responseText || '';
+            const text = getGMResponseText(res);
             if (res.status < 200 || res.status >= 300) {
               reject(new Error(formatStreamApiError(res.status, text, apiKey))); return;
             }
@@ -979,10 +997,10 @@
                 try { onDelta(content, content); } catch (e) {}
                 resolve(content);
               } else {
-                reject(new Error('服务端响应中没有可用内容：' + sanitizeApiErrorContext(text, apiKey)));
+                reject(new Error(formatMissingStreamContent(text, apiKey)));
               }
             } catch (e) {
-              reject(new Error('服务端返回了无法解析的响应：' + sanitizeApiErrorContext(text, apiKey)));
+              reject(new Error(formatUnparseableStreamResponse(text, apiKey)));
             }
           },
           onerror: () => {
