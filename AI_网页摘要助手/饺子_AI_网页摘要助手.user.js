@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         饺子 AI 网页摘要助手
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      2.9.4
+// @version      2.9.5
 // @description  指定网站自动弹出 AI 网页摘要，支持连续对话、多预设、多模板、SPA路由、摘要生图、flomo、坚果云双文件云同步。Shadow DOM 隔离样式。
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
@@ -678,6 +678,118 @@
   let currentRequest = null;
   let currentReject = null;
 
+  function textFromContent(value) {
+    if (typeof value === 'string') return value;
+    if (Array.isArray(value)) return value.map(part => textFromContent(part?.text ?? part)).join('');
+    return '';
+  }
+
+  function extractChatContent(data) {
+    const choice = data?.choices?.[0] || {};
+    const candidates = [
+      choice?.delta?.content,
+      choice?.message?.content,
+      choice?.delta?.reasoning_content,
+      choice?.message?.reasoning_content,
+      choice?.reasoning_content,
+      data?.candidates?.[0]?.content?.parts
+    ];
+    for (const candidate of candidates) {
+      const text = textFromContent(candidate);
+      if (text) return text;
+    }
+    return '';
+  }
+
+  function extractApiErrorMessage(data) {
+    const error = data?.error;
+    if (typeof error === 'string') return error;
+    if (error?.message) return String(error.message);
+    if (data?.message) return String(data.message);
+    return '';
+  }
+
+  function sanitizeApiErrorContext(value, apiKey) {
+    let text = String(value || '').replace(/\s+/g, ' ').trim();
+    if (apiKey) text = text.split(apiKey).join('[REDACTED]');
+    return text
+      .replace(/Bearer\s+[A-Za-z0-9._~+\/-]+=*/gi, 'Bearer [REDACTED]')
+      .replace(/(["']?(?:api[_-]?key|authorization)["']?\s*[:=]\s*["']?)[^\s,"'}]+/gi, '$1[REDACTED]')
+      .slice(0, 500);
+  }
+
+  function formatStreamApiError(status, body, apiKey) {
+    let detail = '';
+    try { detail = extractApiErrorMessage(JSON.parse(body)); } catch (e) {}
+    const context = sanitizeApiErrorContext(detail || body, apiKey);
+    return `HTTP ${status}${context ? '\n' + context : ''}`;
+  }
+
+  function makeStreamPayloadError(message) {
+    const error = new Error(message || '流式响应错误');
+    error.isStreamPayloadError = true;
+    return error;
+  }
+
+  function createStreamPayloadParser(onDelta) {
+    let fullText = '';
+    let buffer = '';
+    let ended = false;
+
+    const appendContent = (content) => {
+      if (!content) return;
+      fullText += content;
+      try { onDelta(content, fullText); } catch (e) { console.warn(e); }
+    };
+
+    const processLine = (line) => {
+      line = line.replace(/\r$/, '').trim();
+      if (!line || line.startsWith(':') || !line.startsWith('data:')) return true;
+      const payload = line.slice(5).trim();
+      if (payload === '[DONE]') { ended = true; return false; }
+      try {
+        const data = JSON.parse(payload);
+        const errorMessage = extractApiErrorMessage(data);
+        if (errorMessage) throw makeStreamPayloadError(errorMessage);
+        appendContent(extractChatContent(data));
+      } catch (error) {
+        if (error?.isStreamPayloadError) throw error;
+        // 某些 SSE 服务会混入非 JSON 的 keep-alive 行，忽略即可。
+      }
+      return true;
+    };
+
+    const drainLines = () => {
+      let index;
+      while (!ended && (index = buffer.indexOf('\n')) !== -1) {
+        const line = buffer.slice(0, index);
+        buffer = buffer.slice(index + 1);
+        if (!processLine(line)) return false;
+      }
+      return !ended;
+    };
+
+    return {
+      push(chunk) {
+        if (!ended) {
+          buffer += String(chunk || '');
+          drainLines();
+        }
+        return !ended;
+      },
+      flush() {
+        if (!ended && buffer.trim()) {
+          const tail = buffer;
+          buffer = '';
+          processLine(tail);
+        }
+        return !ended;
+      },
+      get fullText() { return fullText; },
+      get ended() { return ended; }
+    };
+  }
+
   function callChatApi(messages, onDelta) {
     const profile = getCurrentProfile();
     const useStream = typeof onDelta === 'function';
@@ -728,39 +840,10 @@
         return;
       }
 
-      let fullText = '';
-
       const doFetchStream = async () => {
         const controller = new AbortController();
         currentRequest = { abort: () => controller.abort() };
-
-        let buffer = '';
-
-        const processLine = (line) => {
-          line = line.replace(/\r$/, '').trim();
-          if (!line) return true;
-          if (line.startsWith(':')) return true;
-          if (!line.startsWith('data:')) return true;
-          const payload = line.slice(5).trim();
-          if (payload === '[DONE]') return false;
-          try {
-            const obj = JSON.parse(payload);
-            if (obj.error) {
-              throw new Error(obj.error.message || JSON.stringify(obj.error));
-            }
-            const delta = obj.choices?.[0]?.delta?.content
-                       ?? obj.choices?.[0]?.message?.content
-                       ?? obj.choices?.[0]?.delta?.reasoning_content
-                       ?? '';
-            if (delta) {
-              fullText += delta;
-              try { onDelta(delta, fullText); } catch (e) { console.warn(e); }
-            }
-          } catch (e) {
-            if (e.message && e.message.indexOf('JSON') === -1) throw e;
-          }
-          return true;
-        };
+        const parser = createStreamPayloadParser(onDelta);
 
         try {
           const resp = await fetch(apiUrl, {
@@ -776,23 +859,32 @@
 
           if (!resp.ok) {
             const errText = await resp.text();
-            throw new Error(formatApiError(resp.status, errText));
+            const error = new Error(formatStreamApiError(resp.status, errText, apiKey));
+            error.isResponseError = true;
+            throw error;
           }
 
           const ctype = resp.headers.get('content-type') || '';
-          if (!ctype.includes('text/event-stream') && !resp.body) {
+          const canReadStream = resp.body && typeof resp.body.getReader === 'function';
+          if (!ctype.toLowerCase().includes('text/event-stream') || !canReadStream) {
             const text = await resp.text();
             try {
               const data = JSON.parse(text);
-              const content = data?.choices?.[0]?.message?.content || '';
+              const errorMessage = extractApiErrorMessage(data);
+              if (errorMessage) throw makeStreamPayloadError(errorMessage);
+              const content = extractChatContent(data);
               if (content) {
                 try { onDelta(content, content); } catch (e) {}
                 currentRequest = null; currentReject = null;
                 resolve(content);
                 return true;
               }
-            } catch (e) {}
-            throw new Error('服务端未返回流式响应');
+            } catch (error) {
+              if (error?.isStreamPayloadError) throw error;
+            }
+            const error = new Error('服务端返回非流式响应：' + sanitizeApiErrorContext(text, apiKey));
+            error.isResponseError = true;
+            throw error;
           }
 
           const reader = resp.body.getReader();
@@ -802,21 +894,14 @@
             const { value, done: rDone } = await reader.read();
             done = rDone;
             if (value) {
-              buffer += decoder.decode(value, { stream: !done });
-              let idx;
-              while ((idx = buffer.indexOf('\n')) !== -1) {
-                const line = buffer.slice(0, idx);
-                buffer = buffer.slice(idx + 1);
-                const cont = processLine(line);
-                if (!cont) { done = true; break; }
-              }
+              if (!parser.push(decoder.decode(value, { stream: !done }))) done = true;
             }
           }
-          if (buffer.trim()) processLine(buffer);
+          parser.flush();
 
           currentRequest = null; currentReject = null;
-          if (fullText) {
-            resolve(fullText);
+          if (parser.fullText) {
+            resolve(parser.fullText);
           } else {
             reject(new Error('流式响应为空'));
           }
@@ -827,6 +912,11 @@
             reject(new Error('已取消'));
             return true;
           }
+          if (e?.isResponseError || e?.isStreamPayloadError || parser.fullText) {
+            currentRequest = null; currentReject = null;
+            reject(e);
+            return true;
+          }
           console.warn('[饺子AI] fetch 流式失败,尝试降级 GM_xmlhttpRequest:', e);
           return { fallback: true, error: e };
         }
@@ -834,36 +924,14 @@
 
       const doGMFallback = () => {
         let receivedLen = 0;
-        let buffer = '';
-        let aborted = false;
-
-        const flushBuffer = () => {
-          let idx;
-          while ((idx = buffer.indexOf('\n')) !== -1) {
-            let line = buffer.slice(0, idx);
-            buffer = buffer.slice(idx + 1);
-            line = line.replace(/\r$/, '').trim();
-            if (!line) continue;
-            if (line.startsWith(':')) continue;
-            if (!line.startsWith('data:')) continue;
-            const payload = line.slice(5).trim();
-            if (payload === '[DONE]') { aborted = true; return; }
-            try {
-              const obj = JSON.parse(payload);
-              if (obj.error) {
-                reject(new Error('API Error: ' + (obj.error.message || JSON.stringify(obj.error))));
-                aborted = true;
-                return;
-              }
-              const delta = obj.choices?.[0]?.delta?.content
-                         ?? obj.choices?.[0]?.message?.content
-                         ?? '';
-              if (delta) {
-                fullText += delta;
-                try { onDelta(delta, fullText); } catch (e) { console.warn(e); }
-              }
-            } catch (e) {}
-          }
+        const parser = createStreamPayloadParser(onDelta);
+        let failed = false;
+        const fail = (error) => {
+          if (failed) return;
+          failed = true;
+          try { currentRequest?.abort?.(); } catch (e) {}
+          currentRequest = null; currentReject = null;
+          reject(error);
         };
 
         currentRequest = GM_xmlhttpRequest({
@@ -878,39 +946,43 @@
           responseType: 'stream',
           timeout: Math.max(config.apiTimeout || 120000, 180000),
           onprogress: (e) => {
-            if (aborted) return;
+            if (failed || parser.ended) return;
             const text = e.responseText || '';
             if (text.length <= receivedLen) return;
             const newChunk = text.substring(receivedLen);
             receivedLen = text.length;
-            buffer += newChunk;
-            flushBuffer();
+            try { parser.push(newChunk); }
+            catch (error) { fail(error); }
           },
           onload: (res) => {
             currentRequest = null; currentReject = null;
-            if (aborted && fullText) { resolve(fullText); return; }
+            if (failed) return;
             const text = res.responseText || '';
+            if (res.status < 200 || res.status >= 300) {
+              reject(new Error(formatStreamApiError(res.status, text, apiKey))); return;
+            }
             if (text.length > receivedLen) {
-              buffer += text.substring(receivedLen);
+              const tail = text.substring(receivedLen);
               receivedLen = text.length;
-              flushBuffer();
+              try { parser.push(tail); }
+              catch (error) { reject(error); return; }
             }
-            if (fullText) { resolve(fullText); return; }
-            if (text.trim().startsWith('<')) {
-              reject(new Error('URL 错误（返回了 HTML）')); return;
-            }
+            try { parser.flush(); }
+            catch (error) { reject(error); return; }
+            if (parser.fullText) { resolve(parser.fullText); return; }
             try {
               const data = JSON.parse(text);
-              if (data.error) { reject(new Error('API Error: ' + data.error.message)); return; }
-              const content = data?.choices?.[0]?.message?.content || '';
+              const errorMessage = extractApiErrorMessage(data);
+              if (errorMessage) { reject(makeStreamPayloadError(errorMessage)); return; }
+              const content = extractChatContent(data);
               if (content) {
                 try { onDelta(content, content); } catch (e) {}
                 resolve(content);
               } else {
-                reject(new Error('流式响应为空'));
+                reject(new Error('服务端响应中没有可用内容：' + sanitizeApiErrorContext(text, apiKey)));
               }
             } catch (e) {
-              reject(new Error('流式解析失败'));
+              reject(new Error('服务端返回了无法解析的响应：' + sanitizeApiErrorContext(text, apiKey)));
             }
           },
           onerror: () => {
