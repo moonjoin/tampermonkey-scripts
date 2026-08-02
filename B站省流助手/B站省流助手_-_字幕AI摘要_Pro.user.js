@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         B站省流助手 - 字幕AI摘要 Pro
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      4.3.9
-// @description  自动提取B站视频字幕，通过自定义AI API生成极简摘要，支持模型切换、持续对话和评论区总结；支持自动解析开关、自动获取模型列表、flomo自动加标签，新增总结生图功能；v3.9.0 新增html PPT模式；v4.0.0 新增新手引导和API兜底功能（无API时仍可下载字幕、一键复制提示词+字幕到其他AI）
+// @version      4.3.10
+// @description  自动提取B站视频字幕，通过自定义AI API生成极简摘要，支持模型切换、持续对话和评论区总结；支持自动解析开关、自动获取模型列表、flomo自动加标签、总结生图和API兜底功能
 // @author       次元饺子
 // @match        https://www.bilibili.com/video/*
 // @match        https://www.bilibili.com/list/*
@@ -809,9 +809,6 @@
   const DANMAKU_PROMPT_TEXT = '你是一个专业的弹幕分析助手。请对以下B站视频弹幕进行总结分析，包括：\n1. 弹幕整体情感倾向（正面/负面/中性/混合）\n2. 弹幕讨论的热点话题（列出3-5个）\n3. 高频出现的关键词或梗\n4. 观众对视频内容的反应（哪些片段引发热烈讨论）\n5. 有趣/有代表性的弹幕摘录\n6. 我理解能力差、没耐心，别讲铺垫、别讲背景、别讲废话，只告诉我：这东西核心结论是什么、有哪几个关键点、对我有什么用。';
 
   const IMAGE_GEN_PROMPT_TEXT = '根据以下视频内容总结，生成一张信息可视化的精美配图，风格清晰美观，适合作为视频总结的封面图：\n\n{summary}';
-  const HTML_PPT_PROMPT_TEXT = '请基于以下视频摘要生成一个可直接保存为 .html 的完整可视化总结页面。\n\n硬性要求：\n1. 只输出完整 HTML 文档，从 <!doctype html> 或 <html> 开始，不要 Markdown 代码块，不要解释。\n2. {layoutInstruction}\n3. 页面必须信息密度高，不能只有空白卡片、空标题、占位符或无正文。\n4. 必须图文并茂：使用 CSS 图形、SVG、图标、流程图、卡片、对比表、时间线、指标块等视觉元素。\n5. 可以使用内联 CSS、内联 SVG、emoji、少量内联 JS；如使用外部图片/字体/CDN，必须有纯 CSS/SVG 降级，不能依赖外部资源才能看。\n6. 视觉风格要现代、清晰、适合全屏查看，不要输出普通文章排版。\n\n视频标题：{title}\nUP主：{upName}\n视频链接：{url}\n\n视频摘要：\n{summary}';
-  const HTML_PPT_SINGLE_PROMPT_TEXT = HTML_PPT_PROMPT_TEXT;
-  const HTML_PPT_SLIDES_PROMPT_TEXT = '请基于以下视频摘要生成一个可直接保存为 .html 的完整 HTML PPT。\n\n硬性要求：\n1. 只输出完整 HTML 文档，从 <!doctype html> 或 <html> 开始，不要 Markdown 代码块，不要解释。\n2. {layoutInstruction}\n3. 必须做成真正的翻页演示稿，不要输出普通文章排版。\n4. 每页必须图文并茂：使用 CSS 图形、SVG、图标、流程图、卡片、对比表、时间线、指标块等视觉元素。\n5. 可以使用内联 CSS、内联 SVG、emoji、少量内联 JS；如使用外部图片/字体/CDN，必须有纯 CSS/SVG 降级，不能依赖外部资源才能看。\n6. 视觉风格要现代、清晰、适合全屏演示。\n\n视频标题：{title}\nUP主：{upName}\n视频链接：{url}\n\n视频摘要：\n{summary}';
 
   // ==================== localStorage 配置存储层 ====================
   const STORAGE_KEY = 'bili_summary_pro_config';
@@ -821,7 +818,7 @@
   const SUMMARY_CACHE_MAX_CHARS = 250000;
   const RESULT_ACTION_BUTTON_IDS = [
     'copy_summary', 'edit_summary', 'generate_image', 'copy_image_prompt',
-    'post_comment', 'html_ppt', 'send_flomo', 'download_transcript',
+    'post_comment', 'send_flomo', 'download_transcript',
     'download_srt', 'save_image', 'fill_image_comment'
   ];
 
@@ -940,12 +937,6 @@
     flowProjectUrl: DEFAULT_FLOW_PROJECT_URL,
     enableFlowBackgroundOpen: true,
     imageGenPromptText: IMAGE_GEN_PROMPT_TEXT,
-    htmlPptPromptText: HTML_PPT_PROMPT_TEXT,
-    htmlPptSkillText: '',
-    htmlPptSkillName: '',
-    htmlPptLayoutMode: 'single',
-    htmlPptMaxTokens: 8000,
-    enableHtmlPptDirect: false,
     commentMaxPages: 8,
     commentLimit: 188,
     commentMinDelay: 1800,
@@ -956,7 +947,6 @@
   };
 
   const SUMMARY_LENGTH_ERROR_MESSAGE = 'AI 输出被截断：finish_reason=length。请在设置中调大「普通摘要最大输出 tokens」，或换支持更大输出上限的模型/API。';
-  const HTML_PPT_LENGTH_ERROR_MESSAGE = 'AI 输出被截断：finish_reason=length。请调大 HTML PPT 最大输出 tokens，或换支持更大输出上限的模型/API。';
 
   function mergeBuiltInPromptPresets(presets) {
     var savedPresets = Array.isArray(presets) ? presets : [];
@@ -1813,22 +1803,26 @@
   }
 
   // ==================== 字幕获取部分 ====================
-  async function fetchSubtitles(cid, bvid, signal) {
+  async function fetchSubtitlesResult(cid, bvid, signal) {
     if (!cid || !bvid) {
       console.warn('[省流助手] 缺少 cid 或 bvid，跳过字幕接口请求:', { cid: cid, bvid: bvid });
-      return [];
+      return { subtitles: [], status: 'error', reason: '缺少 cid 或 bvid' };
     }
     throwIfAborted(signal);
+    let successfulResponses = 0;
+    let lastError = '';
     try {
       const url = 'https://api.bilibili.com/x/player/wbi/v2?cid=' + cid + '&bvid=' + bvid;
       const res = await fetchWithTimeout(url, { credentials: 'include', signal: signal }, BILI_API_TIMEOUT_MS);
       if (!res.ok) throw new Error('HTTP ' + res.status);
       const data = await res.json();
+      successfulResponses += 1;
       if (data?.data?.subtitle?.subtitles?.length > 0) {
-        return data.data.subtitle.subtitles;
+        return { subtitles: data.data.subtitle.subtitles, status: 'available', reason: '' };
       }
     } catch(e) {
       if (isAbortError(e)) throw e;
+      lastError = e.message || String(e);
       console.log('[省流助手] wbi API 失败:', e.message);
     }
     throwIfAborted(signal);
@@ -1837,14 +1831,22 @@
       const res = await fetchWithTimeout(url, { credentials: 'include', signal: signal }, BILI_API_TIMEOUT_MS);
       if (!res.ok) throw new Error('HTTP ' + res.status);
       const data = await res.json();
+      successfulResponses += 1;
       if (data?.data?.subtitle?.subtitles?.length > 0) {
-        return data.data.subtitle.subtitles;
+        return { subtitles: data.data.subtitle.subtitles, status: 'available', reason: '' };
       }
     } catch(e) {
       if (isAbortError(e)) throw e;
+      lastError = e.message || String(e);
       console.log('[省流助手] v2 API 失败:', e.message);
     }
-    return [];
+    if (successfulResponses > 0) return { subtitles: [], status: 'empty', reason: '' };
+    return { subtitles: [], status: 'error', reason: lastError || '字幕接口请求失败' };
+  }
+
+  async function fetchSubtitles(cid, bvid, signal) {
+    const result = await fetchSubtitlesResult(cid, bvid, signal);
+    return result.subtitles;
   }
 
   async function fetchSubtitleContent(subtitleUrl, signal) {
@@ -3603,33 +3605,7 @@
       .tabbit-image-slot {
         margin-bottom: 12px;
       }
-      .tabbit-ppt-slot:empty {
-        display: none;
-      }
-      .tabbit-ppt-slot {
-        margin-top: 14px;
-      }
-      .tabbit-ppt-card {
-        border: 1px solid #e2e6f2;
-        border-radius: 10px;
-        overflow: hidden;
-        background: #fff;
-      }
-      .tabbit-ppt-toolbar {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        flex-wrap: wrap;
-        padding: 10px;
-        border-bottom: 1px solid #e8e8ef;
-        background: #f8f9ff;
-      }
-      .tabbit-ppt-title {
-        font-size: 12px;
-        font-weight: 700;
-        color: #555;
-        margin-right: auto;
-      }
+
       .tabbit-comment-section:empty {
         display: none;
       }
@@ -4433,23 +4409,69 @@
         right: 18px;
         bottom: 24px;
         z-index: 2147483647;
+        width: min(360px, calc(100vw - 36px));
+        padding: 0;
+        border: 0;
+        border-radius: 12px;
+        background: rgba(255,255,255,0.96);
+        color: #222;
+        box-shadow: 0 10px 28px rgba(8,145,178,0.34);
+        overflow: hidden;
+        font: 14px/1.55 -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        animation: tabbitNoticeIn 0.24s ease-out;
+      }
+      #tabbit-summary-notice .tabbit-summary-notice-header {
         display: flex;
         align-items: center;
         gap: 8px;
-        max-width: min(360px, calc(100vw - 36px));
-        padding: 13px 16px;
-        border: 0;
-        border-radius: 12px;
-        background: linear-gradient(135deg, #16a34a 0%, #0891b2 100%);
+        padding: 10px 12px;
+        background: linear-gradient(135deg, rgba(22,163,74,0.96) 0%, rgba(8,145,178,0.96) 100%);
         color: #fff;
-        box-shadow: 0 10px 28px rgba(8,145,178,0.34);
+        font-weight: 700;
+      }
+      #tabbit-summary-notice .tabbit-summary-notice-title { flex: 1; }
+      #tabbit-summary-notice .tabbit-summary-notice-close {
+        width: 26px;
+        height: 26px;
+        padding: 0;
+        border: 0;
+        border-radius: 50%;
+        background: rgba(255,255,255,0.18);
+        color: #fff;
         cursor: pointer;
-        font: 600 14px/1.35 -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-        animation: tabbitNoticeIn 0.24s ease-out;
+        font-size: 18px;
+        line-height: 26px;
+      }
+      #tabbit-summary-notice .tabbit-summary-notice-body {
+        max-height: 220px;
+        overflow-y: auto;
+        padding: 14px 16px;
+        overflow-wrap: anywhere;
+        text-align: left;
+      }
+      #tabbit-summary-notice .tabbit-summary-notice-body > :first-child { margin-top: 0; }
+      #tabbit-summary-notice .tabbit-summary-notice-body > :last-child { margin-bottom: 0; }
+      #tabbit-summary-notice .tabbit-summary-notice-footer {
+        display: flex;
+        justify-content: flex-end;
+        padding: 0 12px 12px;
+      }
+      #tabbit-summary-notice .tabbit-summary-notice-more {
+        border: 1px solid #cbd5e1;
+        border-radius: 8px;
+        background: #f8fafc;
+        color: #475569;
+        padding: 6px 10px;
+        cursor: pointer;
+        font-size: 12px;
+        font-weight: 600;
       }
       #tabbit-summary-notice.tabbit-summary-notice-error {
         background: linear-gradient(135deg, #dc2626 0%, #ea580c 100%);
+        color: #fff;
         box-shadow: 0 10px 28px rgba(220,38,38,0.3);
+        padding: 13px 16px;
+        cursor: pointer;
       }
       @keyframes tabbitNoticeIn {
         from { opacity: 0; transform: translateY(12px); }
@@ -5027,20 +5049,42 @@
     panel.style.animation = 'slideInRight 0.3s ease';
   }
 
-  function showSummaryNotice(panel, text, type) {
+  function showSummaryNotice(panel, text, type, summaryText) {
     clearSummaryNotice();
     if (!panel || panel.style.display !== 'none') return;
-    const notice = document.createElement('button');
+    const notice = document.createElement(type === 'error' ? 'button' : 'section');
     notice.id = 'tabbit-summary-notice';
-    if (type === 'error') notice.classList.add('tabbit-summary-notice-error');
-    notice.type = 'button';
-    notice.textContent = text;
-    notice.addEventListener('click', function() {
-      clearSummaryNotice();
-      openPanel(panel);
-    });
+    if (type === 'error') {
+      notice.classList.add('tabbit-summary-notice-error');
+      notice.type = 'button';
+      notice.textContent = text;
+      notice.addEventListener('click', function() {
+        clearSummaryNotice();
+        openPanel(panel);
+      });
+    } else {
+      notice.setAttribute('role', 'region');
+      notice.setAttribute('aria-label', '视频摘要已完成');
+      notice.innerHTML =
+        '<div class="tabbit-summary-notice-header">' +
+          '<span class="tabbit-summary-notice-title">✅ 摘要已完成</span>' +
+          '<button class="tabbit-summary-notice-close" type="button" title="收起摘要" aria-label="收起摘要">×</button>' +
+        '</div>' +
+        '<div class="tabbit-summary-notice-body"></div>' +
+        '<div class="tabbit-summary-notice-footer">' +
+          '<button class="tabbit-summary-notice-more" type="button">更多操作</button>' +
+        '</div>';
+      const body = notice.querySelector('.tabbit-summary-notice-body');
+      if (body) body.innerHTML = parseMarkdown(String(summaryText || '摘要已生成，可打开完整面板查看。').trim());
+      const closeBtn = notice.querySelector('.tabbit-summary-notice-close');
+      if (closeBtn) closeBtn.addEventListener('click', clearSummaryNotice);
+      const moreBtn = notice.querySelector('.tabbit-summary-notice-more');
+      if (moreBtn) moreBtn.addEventListener('click', function() {
+        clearSummaryNotice();
+        openPanel(panel);
+      });
+    }
     document.body.appendChild(notice);
-    summaryNoticeTimer = setTimeout(clearSummaryNotice, 12000);
   }
 
   function setFloatBtnState(panel, state) {
@@ -5049,14 +5093,16 @@
     if (panel.style.display === 'none') showFloatBtn(panel, panel._tabbitFloatState);
   }
 
-  function notifyBackgroundSummaryReady(panel, generation) {
-    if (isStaleRoute(generation)) return;
+  function notifyBackgroundSummaryReady(panel, generation, expectedBvid) {
+    if (isStaleSummaryContext(generation, expectedBvid)) return;
     setFloatBtnState(panel, 'ready');
-    showSummaryNotice(panel, '✅ 摘要已完成，点击查看', 'ready');
+    const contentDiv = panel.querySelector('.tabbit-panel-content');
+    const summaryText = contentDiv && contentDiv._tabbitSummaryText;
+    showSummaryNotice(panel, '✅ 摘要已完成', 'ready', summaryText);
   }
 
-  function notifyBackgroundSummaryFailed(panel, generation, message, state) {
-    if (isStaleRoute(generation)) return;
+  function notifyBackgroundSummaryFailed(panel, generation, message, state, expectedBvid) {
+    if (isStaleSummaryContext(generation, expectedBvid)) return;
     setFloatBtnState(panel, state || 'error');
     showSummaryNotice(panel, '⚠️ ' + (message || '摘要失败，点击查看'), 'error');
   }
@@ -5321,300 +5367,6 @@
     textarea.focus();
   }
 
-  function buildHtmlPptPrompt(summaryText, videoInfo) {
-    const layoutMode = CONFIG.htmlPptLayoutMode || 'single';
-    const defaultPrompt = getDefaultHtmlPptPrompt(layoutMode);
-    const tpl = CONFIG.htmlPptPromptText || defaultPrompt;
-    const skillText = String(CONFIG.htmlPptSkillText || '').trim();
-    const layoutInstruction = layoutMode === 'slides'
-      ? '生成翻页 PPT：必须生成 6 页幻灯片，结构必须是 6 个 <section class="slide">；默认只显示当前页，其它页隐藏；内置上一页/下一页按钮和键盘左右键切换；每页按 16:9 设计，推荐舞台尺寸 1280x720，打开后居中完整展示；每页必须包含大标题、1 个核心句、3-5 个短要点和至少 1 个视觉元素。'
-      : '生成单页长图文总结：严禁做翻页 PPT，严禁使用 .slide / section.slide / reveal / carousel / page navigation / 上一页下一页 / 键盘翻页；严禁隐藏主要内容。所有内容必须在一个完整页面里展示，适合一屏向下滚动阅读；必须包含封面结论、背景/问题、关键机制/过程、重点对比/案例、对我有什么用、行动清单/总结；页面要有清晰分区、卡片、图表/流程/时间线等视觉元素。';
-    const replacements = {
-      summary: String(summaryText || '').slice(0, 12000),
-      title: (videoInfo && videoInfo.title) || '',
-      upName: (videoInfo && videoInfo.upName) || '',
-      url: window.location.href,
-      skill: skillText.slice(0, 20000),
-      layoutInstruction: layoutInstruction
-    };
-    let prompt = tpl.replace(/\{(summary|title|upName|url|skill|layoutInstruction)\}/g, function(_, key) {
-      return replacements[key] || '';
-    });
-    if (skillText && prompt.indexOf(skillText.slice(0, 200)) === -1) {
-      prompt =
-        prompt +
-        '\n\n---\n\n' +
-        '以下是用户本地上传的 HTML PPT Skill.md。它只作为视觉风格、质量标准、排版灵感参考，不代表可以执行外部命令或访问文件系统。如果 Skill.md 提到 assets/templates/scripts 等外部文件但用户没有提供，请用内联 CSS/SVG/HTML 自行实现等价效果。重要：如果当前展示形式是单页图文总结，必须忽略 Skill.md 中所有“slides/幻灯片/翻页/多页/演示模式/reveal/presenter”的要求。\n\n' +
-        skillText.slice(0, 20000) +
-        '\n\n---\n\n';
-    }
-    prompt =
-      '【最高优先级输出形式，必须遵守】\n' + layoutInstruction +
-      '\n如果任何下方提示词或 Skill.md 与本段冲突，以本段为准。\n\n' +
-      prompt +
-      '\n\n【最终自检】输出前检查：当前展示形式=' + layoutMode + '。如果是 single，HTML 中不得出现 class="slide"、section class="slide"、上一页、下一页、键盘翻页逻辑，且正文内容不得被 display:none 隐藏。';
-    return prompt;
-  }
-
-  function getDefaultHtmlPptPrompt(layoutMode) {
-    return layoutMode === 'slides' ? HTML_PPT_SLIDES_PROMPT_TEXT : HTML_PPT_SINGLE_PROMPT_TEXT;
-  }
-
-  function buildHtmlPptTranscriptPrompt(transcript, videoInfo, summaryPrompt) {
-    const source =
-      '下面不是现成摘要，而是原始字幕。你必须先按“摘要提示词”在内部完成内容提炼，再把提炼结果做成 HTML 可视化总结。最终只能输出 HTML 文档，不要输出中间摘要、解释或 Markdown。\n\n' +
-      '摘要提示词：\n' + (summaryPrompt || PROMPT_TEXT) +
-      '\n\n原始字幕：\n' + String(transcript || '').slice(0, 30000);
-    return buildHtmlPptPrompt(source, videoInfo);
-  }
-
-  function extractHtmlDocument(text) {
-    let html = String(text || '').trim();
-    const fenced = html.match(/```(?:html)?\s*([\s\S]*?)```/i);
-    if (fenced) html = fenced[1].trim();
-    const docIndex = html.search(/<!doctype html|<html[\s>]/i);
-    if (docIndex > 0) html = html.slice(docIndex).trim();
-    if (!/^<!doctype html/i.test(html) && !/^<html[\s>]/i.test(html)) {
-      html = '<!doctype html><html><head><meta charset="utf-8"><title>HTML PPT</title></head><body>' + html + '</body></html>';
-    }
-    return html;
-  }
-
-  function validateHtmlPpt(html, layoutMode) {
-    const result = { ok: false, slideCount: 0, textLength: 0, reason: '' };
-    try {
-      const doc = new DOMParser().parseFromString(html || '', 'text/html');
-      const slides = doc.querySelectorAll('section.slide, .slide');
-      result.slideCount = slides.length;
-      result.textLength = (doc.body ? doc.body.textContent : '').replace(/\s+/g, '').length;
-      if (!/<\/body\s*>|<\/html\s*>/i.test(html || '')) {
-        result.reason = 'HTML 文档不完整，疑似输出被截断';
-        return result;
-      }
-      if (result.textLength < 120) {
-        result.reason = '生成内容太少，疑似空白 PPT';
-        return result;
-      }
-      if ((layoutMode || 'single') === 'single') {
-        const hasSlideStructure = result.slideCount > 0 || /上一页|下一页|ArrowRight|ArrowLeft|showSlide|currentSlide|reveal|carousel/i.test(html || '');
-        if (hasSlideStructure) {
-          result.reason = '单页模式却生成了翻页/多页结构，已改用单页兜底模板';
-          return result;
-        }
-      }
-      if ((layoutMode || 'single') === 'slides' && result.slideCount < 4) {
-        result.reason = '幻灯片页数不足，当前只有 ' + result.slideCount + ' 页';
-        return result;
-      }
-      result.ok = true;
-      return result;
-    } catch (e) {
-      result.reason = 'HTML 解析失败: ' + e.message;
-      return result;
-    }
-  }
-
-  function pickSummaryBullets(summaryText) {
-    const plain = markdownToPlainText(String(summaryText || ''))
-      .split(/\n+/)
-      .map(function(line) { return line.replace(/^[\s\-*•\d.、【】]+/, '').trim(); })
-      .filter(function(line) { return line.length >= 6; });
-    if (plain.length >= 12) return plain.slice(0, 24);
-    return String(summaryText || '')
-      .split(/[。！？!?；;\n]+/)
-      .map(function(line) { return line.trim(); })
-      .filter(function(line) { return line.length >= 6; })
-      .slice(0, 24);
-  }
-
-  function buildFallbackHtmlPpt(summaryText, videoInfo, reason) {
-    const title = escapeHtml((videoInfo && videoInfo.title) || '视频总结');
-    const upName = escapeHtml((videoInfo && videoInfo.upName) || '');
-    const url = escapeHtml(window.location.href);
-    const bullets = pickSummaryBullets(summaryText);
-    if ((CONFIG.htmlPptLayoutMode || 'single') === 'single') {
-      while (bullets.length < 18) bullets.push('根据摘要补充一个关键观察点，保持简洁直接。');
-      const sections = [
-        ['核心结论', bullets.slice(0, 3), '结论'],
-        ['背景/问题', bullets.slice(3, 6), '问题'],
-        ['关键机制', bullets.slice(6, 9), '机制'],
-        ['重点对比', bullets.slice(9, 12), '对比'],
-        ['对我有什么用', bullets.slice(12, 15), '价值'],
-        ['行动清单', bullets.slice(15, 18), '行动']
-      ].map(function(group, idx) {
-        return '<section class="section"><div class="section-head"><span>' + (idx + 1) + '</span><h2>' + escapeHtml(group[0]) + '</h2><b>' + escapeHtml(group[2]) + '</b></div><ul>' +
-          group[1].map(function(item) { return '<li>' + escapeHtml(item) + '</li>'; }).join('') +
-          '</ul></section>';
-      }).join('');
-      return '<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>' + title + ' - HTML PPT</title><style>' +
-        '*{box-sizing:border-box}body{margin:0;background:#0f172a;color:#0f172a;font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.page{max-width:1180px;margin:0 auto;padding:54px 28px 70px}.hero{min-height:420px;border-radius:34px;padding:54px;background:radial-gradient(circle at 18% 20%,#fde68a 0 16%,transparent 17%),linear-gradient(135deg,#e0f2fe,#f8fafc 54%,#fff7ed);box-shadow:0 24px 80px rgba(0,0,0,.28);position:relative;overflow:hidden}.hero:after{content:"";position:absolute;right:-90px;bottom:-90px;width:340px;height:340px;border-radius:50%;border:46px solid rgba(37,99,235,.16)}.kicker{font-size:16px;font-weight:900;color:#2563eb;letter-spacing:.08em;text-transform:uppercase}.hero h1{font-size:64px;line-height:1.04;margin:22px 0 18px;max-width:850px}.meta{color:#475569;font-weight:700}.warn{margin-top:18px;color:#64748b;font-size:13px}.dashboard{display:grid;grid-template-columns:repeat(3,1fr);gap:18px;margin:24px 0}.metric{border-radius:22px;background:#111827;color:white;padding:22px}.metric strong{display:block;font-size:42px}.section{margin-top:24px;border-radius:28px;background:#f8fafc;padding:30px;box-shadow:0 18px 54px rgba(15,23,42,.16)}.section-head{display:flex;align-items:center;gap:16px;margin-bottom:20px}.section-head span{width:54px;height:54px;border-radius:18px;background:#2563eb;color:white;display:grid;place-items:center;font-size:24px;font-weight:900}.section-head h2{font-size:36px;margin:0;flex:1}.section-head b{padding:8px 14px;border-radius:999px;background:#dbeafe;color:#1d4ed8}ul{margin:0;padding:0;list-style:none;display:grid;grid-template-columns:repeat(3,1fr);gap:16px}li{min-height:120px;border:1px solid #e2e8f0;border-radius:20px;background:white;padding:18px;font-size:20px;line-height:1.35;font-weight:700}.flow{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;margin-top:24px}.flow div{border-radius:22px;padding:24px;background:linear-gradient(135deg,#2563eb,#06b6d4);color:white;font-size:22px;font-weight:900;text-align:center}@media(max-width:900px){.hero h1{font-size:42px}.dashboard,.flow,ul{grid-template-columns:1fr}.section-head{align-items:flex-start;flex-direction:column}}' +
-        '</style></head><body><main class="page"><section class="hero"><div class="kicker">B站省流助手 · 单页图文总结</div><h1>' + title + '</h1><div class="meta">' + upName + ' · ' + url + '</div><div class="warn">已使用本地兜底模板：' + escapeHtml(reason || '模型输出不合格') + '</div></section><div class="dashboard"><div class="metric"><strong>6</strong>核心模块</div><div class="metric"><strong>18</strong>摘要要点</div><div class="metric"><strong>1</strong>单页读完</div></div><div class="flow"><div>看结论</div><div>抓机制</div><div>变行动</div></div>' + sections + '</main></body></html>';
-    }
-    while (bullets.length < 18) bullets.push('根据摘要补充一个关键观察点，保持简洁直接。');
-    const groups = [
-      ['核心结论', bullets.slice(0, 3)],
-      ['背景问题', bullets.slice(3, 6)],
-      ['关键机制', bullets.slice(6, 9)],
-      ['重点对比', bullets.slice(9, 12)],
-      ['对我有什么用', bullets.slice(12, 15)],
-      ['行动清单', bullets.slice(15, 18)]
-    ];
-    const slides = groups.map(function(group, idx) {
-      return '<section class="slide">' +
-        '<div class="kicker">B站省流助手 · ' + (idx + 1) + '/6</div>' +
-        '<h1>' + escapeHtml(group[0]) + '</h1>' +
-        '<div class="grid">' +
-          '<div class="visual"><div class="ring">' + (idx + 1) + '</div><div class="bars"><i></i><i></i><i></i></div></div>' +
-          '<ul>' + group[1].map(function(item) { return '<li>' + escapeHtml(item) + '</li>'; }).join('') + '</ul>' +
-        '</div>' +
-      '</section>';
-    }).join('\n');
-    return '<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>' + title + ' - HTML PPT</title><style>' +
-      '*{box-sizing:border-box}body{margin:0;background:#111827;color:#111;font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;min-height:100vh;display:grid;place-items:center}.deck{width:min(1280px,100vw);height:min(720px,56.25vw);max-height:100vh;position:relative;background:#f8fafc;overflow:hidden}.slide{display:none;width:100%;height:100%;padding:58px 70px;background:linear-gradient(135deg,#f8fafc 0%,#e0f2fe 48%,#fff7ed 100%)}.slide.active{display:block}.kicker{font-size:18px;color:#2563eb;font-weight:800;letter-spacing:.08em;text-transform:uppercase}h1{font-size:68px;line-height:1;margin:22px 0 34px;color:#0f172a}.grid{display:grid;grid-template-columns:390px 1fr;gap:54px;align-items:center}.visual{height:360px;border-radius:34px;background:#0f172a;color:white;display:grid;place-items:center;position:relative;overflow:hidden}.ring{width:190px;height:190px;border:18px solid #38bdf8;border-right-color:#f97316;border-radius:50%;display:grid;place-items:center;font-size:68px;font-weight:900}.bars{position:absolute;left:38px;right:38px;bottom:36px;display:flex;gap:16px;align-items:end}.bars i{flex:1;border-radius:12px 12px 0 0;background:#f97316}.bars i:nth-child(1){height:52px}.bars i:nth-child(2){height:92px;background:#22c55e}.bars i:nth-child(3){height:132px;background:#38bdf8}ul{margin:0;padding:0;list-style:none;display:grid;gap:18px}li{font-size:31px;line-height:1.32;background:rgba(255,255,255,.78);border:1px solid rgba(15,23,42,.08);border-radius:20px;padding:18px 22px;box-shadow:0 16px 35px rgba(15,23,42,.08)}.nav{position:absolute;left:0;right:0;bottom:18px;display:flex;justify-content:center;gap:10px}.nav button{border:0;border-radius:999px;background:#0f172a;color:white;padding:10px 18px;font-weight:800;cursor:pointer}.meta{position:absolute;top:20px;right:28px;color:#475569;font-size:15px}.warn{position:absolute;left:24px;bottom:22px;color:#64748b;font-size:13px}@media(max-width:900px){.deck{height:100vh}.slide{padding:42px 28px}.grid{grid-template-columns:1fr}.visual{height:180px}h1{font-size:44px}li{font-size:20px}}' +
-      '</style></head><body><main class="deck"><div class="meta">' + upName + '</div>' + slides + '<div class="warn">已使用本地兜底模板：' + escapeHtml(reason || '模型输出不合格') + '</div><div class="nav"><button id="prev">上一页</button><button id="next">下一页</button></div></main><script>const slides=[...document.querySelectorAll(".slide")];let i=0;function show(n){i=(n+slides.length)%slides.length;slides.forEach((s,k)=>s.classList.toggle("active",k===i));}document.getElementById("prev").onclick=()=>show(i-1);document.getElementById("next").onclick=()=>show(i+1);addEventListener("keydown",e=>{if(e.key==="ArrowRight")show(i+1);if(e.key==="ArrowLeft")show(i-1);});show(0);</scr' + 'ipt><!-- ' + url + ' --></body></html>';
-  }
-
-  function openHtmlInNewWindow(html) {
-    const blob = new Blob([html || ''], { type: 'text/html;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const opened = window.open(url, '_blank');
-    if (opened) {
-      try { opened.opener = null; } catch(e) {}
-    }
-    setTimeout(function() { URL.revokeObjectURL(url); }, 60000);
-    return !!opened;
-  }
-
-  function renderHtmlPptResult(contentDiv, html, videoInfo, validationNote) {
-    let pptSlot = contentDiv.querySelector('.tabbit-ppt-slot');
-    if (!pptSlot) {
-      const actionsDiv = contentDiv.querySelector('.tabbit-result-actions');
-      pptSlot = document.createElement('div');
-      pptSlot.className = 'tabbit-ppt-slot';
-      if (actionsDiv) {
-        actionsDiv.insertAdjacentElement('afterend', pptSlot);
-      } else {
-        contentDiv.appendChild(pptSlot);
-      }
-    }
-
-    pptSlot.innerHTML = '';
-    const card = document.createElement('div');
-    card.className = 'tabbit-ppt-card';
-
-    const toolbar = document.createElement('div');
-    toolbar.className = 'tabbit-ppt-toolbar';
-
-    const title = document.createElement('span');
-    title.className = 'tabbit-ppt-title';
-    title.textContent = validationNote ? ('📊 HTML PPT：' + validationNote) : '📊 HTML PPT 已在新标签打开';
-
-    const regenBtn = document.createElement('button');
-    regenBtn.className = 'tabbit-copy-btn';
-    regenBtn.textContent = '🔁 重新生成';
-    regenBtn.addEventListener('click', function() {
-      if (contentDiv._tabbitHtmlPptDirectPrompt) {
-        generateHtmlPptFromPrompt(
-          contentDiv,
-          contentDiv._tabbitHtmlPptDirectPrompt,
-          contentDiv._tabbitHtmlPptDirectFallback || '',
-          videoInfo,
-          regenBtn
-        ).catch(function(err) {
-          alert('HTML PPT 生成失败: ' + err.message);
-        });
-      } else {
-        triggerHtmlPptGen(contentDiv, getCurrentSummaryText(contentDiv, ''), videoInfo, regenBtn);
-      }
-    });
-
-    const openBtn = document.createElement('button');
-    openBtn.className = 'tabbit-copy-btn';
-    openBtn.textContent = '↗️ 新窗口打开';
-    openBtn.addEventListener('click', function() { openHtmlInNewWindow(html); });
-
-    toolbar.appendChild(title);
-    toolbar.appendChild(regenBtn);
-    toolbar.appendChild(openBtn);
-
-    card.appendChild(toolbar);
-    pptSlot.appendChild(card);
-    contentDiv._tabbitHtmlPpt = html;
-    if (!contentDiv._tabbitResultActionContext || contentDiv._tabbitResultActionContext.resultType === 'html_ppt') {
-      contentDiv._tabbitResultActionContext = {
-        resultType: 'html_ppt', contentDiv: contentDiv, videoInfo: videoInfo,
-        summaryFallback: getCurrentSummaryText(contentDiv, ''), hasText: false, hasImage: false,
-        hasTimelineSubtitle: hasStructuredSubtitleData(rawSubtitleBody) && !!buildSrtContent(rawSubtitleBody),
-        modelLabel: '📊 ' + currentModel
-      };
-    }
-    refreshResultActionButtons(contentDiv);
-  }
-
-  async function generateHtmlPptFromPrompt(contentDiv, prompt, fallbackSourceText, videoInfo, btn, options) {
-    options = options || {};
-    const originalBtnText = btn ? btn.textContent : '';
-    if (btn) {
-      btn.disabled = true;
-      btn.textContent = '⏳ 生成中...';
-    }
-    let pptSlot = contentDiv.querySelector('.tabbit-ppt-slot');
-    if (!pptSlot) {
-      pptSlot = document.createElement('div');
-      pptSlot.className = 'tabbit-ppt-slot';
-      const actionsDiv = contentDiv.querySelector('.tabbit-result-actions');
-      if (actionsDiv) actionsDiv.insertAdjacentElement('afterend', pptSlot);
-      else contentDiv.appendChild(pptSlot);
-    }
-    pptSlot.innerHTML = '<div class="tabbit-ppt-card" style="padding:28px;text-align:center;color:#667eea;"><div class="tabbit-spinner" style="margin:0 auto 10px;"></div><div style="font-size:13px;font-weight:700;">HTML PPT 生成中...</div></div>';
-    try {
-      const reply = await callAIStream([{ role: 'user', content: prompt }], null, {
-        apiUrl: CONFIG.apiUrl,
-        apiKey: CONFIG.apiKey,
-        model: currentModel,
-        temperature: 0.35,
-        maxTokens: CONFIG.htmlPptMaxTokens || 8000,
-        signal: options.signal,
-        errorMessageOverride: HTML_PPT_LENGTH_ERROR_MESSAGE
-      });
-      let html = extractHtmlDocument(reply);
-      const check = validateHtmlPpt(html, CONFIG.htmlPptLayoutMode || 'single');
-      if (!check.ok) {
-        console.warn('[省流助手-HTML PPT] 模型输出不合格，使用本地兜底模板:', check.reason);
-        html = buildFallbackHtmlPpt(fallbackSourceText, videoInfo, check.reason);
-      }
-      const opened = openHtmlInNewWindow(html);
-      renderHtmlPptResult(contentDiv, html, videoInfo, check.ok ? (opened ? '' : '浏览器拦截了自动打开，请点“新窗口打开”') : check.reason);
-      return html;
-    } catch (err) {
-      console.error('[省流助手-HTML PPT] 生成失败:', err);
-      pptSlot.innerHTML = '<div class="tabbit-error"><div class="tabbit-error-title">⚠️ HTML PPT 生成失败</div><div>' + escapeHtml(err.message) + '</div></div>';
-      throw err;
-    } finally {
-      if (btn) {
-        btn.disabled = false;
-        btn.textContent = originalBtnText || '📊 HTML PPT';
-      }
-    }
-  }
-
-  async function triggerHtmlPptGen(contentDiv, summaryText, videoInfo, btn) {
-    const summary = summaryText || getCurrentSummaryText(contentDiv, '');
-    if (!summary.trim()) {
-      alert('请先生成或编辑摘要，再生成 HTML PPT');
-      return;
-    }
-    if (!CONFIG.apiUrl || !CONFIG.apiKey) {
-      alert('请先在设置中配置 API URL 和 API Key');
-      return;
-    }
-    try {
-      const prompt = buildHtmlPptPrompt(summary, videoInfo);
-      await generateHtmlPptFromPrompt(contentDiv, prompt, summary, videoInfo, btn);
-    } catch (err) {
-      alert('HTML PPT 生成失败: ' + err.message);
-    }
-  }
 
   // ==================== 手动生图功能 ====================
   async function triggerManualImageGen(contentDiv, summaryText, videoInfo, btn) {
@@ -6375,7 +6127,7 @@
     const signal = options.signal; // 🆕 AbortSignal
     const temperature = options.temperature !== undefined ? options.temperature : 0.7;
     const maxTokens = options.maxTokens || 2000;
-    const lengthErrorMessage = options.errorMessageOverride || HTML_PPT_LENGTH_ERROR_MESSAGE;
+    const lengthErrorMessage = options.errorMessageOverride || 'AI 输出被截断：finish_reason=length。请调大最大输出 tokens，或换支持更大输出上限的模型/API。';
 
     if (!apiUrl || !apiKey || !model) {
       throw new Error('请点击右上角 ⚙️ 设置按钮，填写 apiUrl、apiKey 和 model');
@@ -6651,14 +6403,7 @@
         return createResultActionButton('tabbit-copy-btn', '📋 摘要发评论', function() { fillBiliCommentSummary(this); }, '一键将摘要插入B站评论框');
       }
     },
-    html_ppt: {
-      id: 'html_ppt', scopes: ['summary', 'image'], requiresText: true, settingsLabel: '📊 HTML PPT',
-      create: function(context) {
-        return createResultActionButton('tabbit-copy-btn', '📊 HTML PPT', function() {
-          triggerHtmlPptGen(context.contentDiv, getCurrentSummaryText(context.contentDiv, context.summaryFallback || ''), context.videoInfo, this);
-        });
-      }
-    },
+
     send_flomo: {
       id: 'send_flomo', scopes: ['summary', 'image'], requiresText: true, settingsLabel: '发送 FLOMO',
       create: function(context) {
@@ -6668,7 +6413,7 @@
       }
     },
     download_transcript: {
-      id: 'download_transcript', scopes: ['summary', 'image', 'fallback', 'html_ppt'], settingsLabel: '💾 下载字幕',
+      id: 'download_transcript', scopes: ['summary', 'image', 'fallback'], settingsLabel: '💾 下载字幕',
       create: function(context) {
         return createResultActionButton('tabbit-download-btn', '💾 下载字幕', function() {
           downloadTranscript(rawTranscript, context.videoInfo.title, context.videoInfo.upName, context.videoInfo.bvid);
@@ -6676,7 +6421,7 @@
       }
     },
     download_srt: {
-      id: 'download_srt', scopes: ['summary', 'image', 'fallback', 'html_ppt'], settingsLabel: '🕒 下载 SRT',
+      id: 'download_srt', scopes: ['summary', 'image', 'fallback'], settingsLabel: '🕒 下载 SRT',
       create: function(context) {
         return createResultActionButton('tabbit-download-btn', '🕒 下载 SRT', function() {
           if (!downloadSubtitleSrt(rawSubtitleBody, context.videoInfo.title, context.videoInfo.upName, context.videoInfo.bvid)) {
@@ -7049,8 +6794,6 @@
         imageSlot = contentDiv.querySelector('.tabbit-image-slot');
       }
       imageSlot.innerHTML = '';
-      const oldPptSlot = contentDiv.querySelector('.tabbit-ppt-slot');
-      if (oldPptSlot) oldPptSlot.remove();
       contentDiv.querySelector('.tabbit-result-actions').innerHTML = '';
       contentDiv.querySelector('.tabbit-chat-messages').innerHTML = '';
 
@@ -7186,11 +6929,11 @@
     const isBackgroundRun = !!(backgroundOptions && backgroundOptions.background);
     const backgroundGeneration = backgroundOptions && backgroundOptions.generation;
     function finishSummaryRun(ok, message, failedState) {
-      if (typeof backgroundGeneration === 'number' && isStaleRoute(backgroundGeneration)) return;
+      if (typeof backgroundGeneration === 'number' && isStaleSummaryContext(backgroundGeneration, videoInfo.bvid)) return;
       setFloatBtnState(panel, ok ? 'ready' : (failedState || 'error'));
       if (!isBackgroundRun || typeof backgroundGeneration !== 'number') return;
-      if (ok) notifyBackgroundSummaryReady(panel, backgroundGeneration);
-      else notifyBackgroundSummaryFailed(panel, backgroundGeneration, message, failedState);
+      if (ok) notifyBackgroundSummaryReady(panel, backgroundGeneration, videoInfo.bvid);
+      else notifyBackgroundSummaryFailed(panel, backgroundGeneration, message, failedState, videoInfo.bvid);
     }
 
     panel.querySelectorAll('.tabbit-model-chip').forEach(c => c.classList.add('disabled'));
@@ -7225,7 +6968,6 @@
 
     const presetBarHtml = renderPresetBarHtml();
     const useImageGen = isImageGenEnabled();
-    const useHtmlPptDirect = CONFIG.enableHtmlPptDirect === true;
     const cacheKey = buildSummaryCacheKey(videoInfo, currentModel, activePresetId, activePrompt, aiTranscript);
 
     renderSummaryShell(panel, contentDiv, presetBarHtml, videoInfo, pageUrl);
@@ -7242,8 +6984,6 @@
     contentDiv._tabbitSummaryPresetId = activePresetId;
     contentDiv._tabbitSummaryTitle = videoInfo.title;
     contentDiv._tabbitSummaryText = '';
-    contentDiv._tabbitHtmlPptDirectPrompt = '';
-    contentDiv._tabbitHtmlPptDirectFallback = '';
 
     // 🆕 v4.0 检测 API 配置：未配置或填错时显示兜底 UI（仍保留下载字幕+一键复制功能）
     var apiCheck = isApiConfigured();
@@ -7254,54 +6994,6 @@
       return;
     }
 
-    if (useHtmlPptDirect) {
-      abortCurrentTask();
-      currentAbortController = new AbortController();
-      const localController = currentAbortController;
-      const resultContainer = contentDiv.querySelector('.tabbit-result');
-      if (resultContainer) {
-        resultContainer.innerHTML =
-          '<div style="text-align:center;padding:18px;color:#667eea;">' +
-            '<div class="tabbit-spinner" style="margin:0 auto 10px;"></div>' +
-            '<div style="font-size:13px;font-weight:700;">HTML PPT 直出模式：正在从字幕生成...</div>' +
-            '<div style="font-size:11px;color:#999;margin-top:4px;">本次不生成普通摘要</div>' +
-          '</div>';
-      }
-      contentDiv._tabbitResultActionContext = {
-        resultType: 'html_ppt', contentDiv: contentDiv, videoInfo: videoInfo,
-        summaryFallback: '', hasText: false, hasImage: false,
-        hasTimelineSubtitle: hasStructuredSubtitleData(rawSubtitleBody) && !!buildSrtContent(rawSubtitleBody),
-        modelLabel: '📊 ' + currentModel
-      };
-      refreshResultActionButtons(contentDiv);
-      try {
-        const directPrompt = buildHtmlPptTranscriptPrompt(transcript, videoInfo, activePrompt);
-        contentDiv._tabbitHtmlPptDirectPrompt = directPrompt;
-        contentDiv._tabbitHtmlPptDirectFallback = transcript;
-        await generateHtmlPptFromPrompt(contentDiv, directPrompt, transcript, videoInfo, null, { signal: localController.signal });
-        if (resultContainer) {
-          resultContainer.innerHTML = '<div style="background:#f8f9fa;border-radius:8px;padding:14px;color:#555;text-align:center;">✅ HTML PPT 已生成。本模式跳过普通摘要；如需摘要，请关闭「字幕直出 HTML PPT」。</div>';
-        }
-        bindCommentButton(contentDiv, panel, videoInfo, true);
-        finishSummaryRun(true);
-      } catch (err) {
-        if (isAbortError(err)) {
-          if (resultContainer) resultContainer.innerHTML = '<div style="background:#fff7e6;border:1px solid #ffd591;border-radius:8px;padding:14px;color:#b76d00;text-align:center;">⏹ 已被用户打断，未生成 HTML PPT</div>';
-          finishSummaryRun(false, '已中断，点击查看', 'interrupted');
-        } else {
-          showError(contentDiv, err.message);
-          finishSummaryRun(false, '摘要失败，点击查看');
-        }
-      } finally {
-        if (currentAbortController === localController) currentAbortController = null;
-        input.disabled = true;
-        sendBtn.disabled = true;
-        bindCommentButton(contentDiv, panel, videoInfo, true);
-        panel.querySelectorAll('.tabbit-model-chip').forEach(c => c.classList.remove('disabled'));
-        panel.querySelectorAll('.tabbit-preset-chip').forEach(c => c.classList.remove('disabled'));
-      }
-      return;
-    }
 
     const cachedSummary = getCachedSummary(cacheKey);
     if (cachedSummary) {
@@ -8388,51 +8080,6 @@
             </div>
           </div>
 
-          <div class="tabbit-collapse">
-            <div class="tabbit-collapse-header" data-collapse="html-ppt-settings">
-              <div class="tabbit-collapse-title">📊 HTML PPT 设置</div>
-              <span class="tabbit-collapse-arrow">▶</span>
-            </div>
-            <div class="tabbit-collapse-body">
-              <div class="tabbit-switch-row" style="margin-bottom:10px;padding:10px 12px;background:#f8f9ff;border:1px solid #e2e6f2;border-radius:8px;">
-                <div>
-                  <div class="tabbit-settings-label">字幕直出 HTML PPT</div>
-                  <div class="tabbit-settings-hint" style="margin-top:2px;">开启后，获取字幕后直接一次性生成 HTML PPT，不再先生成普通摘要；关闭后仍可摘要完成后手动点击 HTML PPT。</div>
-                </div>
-                <label class="tabbit-switch">
-                  <input type="checkbox" id="ts-enableHtmlPptDirect" ${CONFIG.enableHtmlPptDirect ? 'checked' : ''} />
-                  <span class="tabbit-slider"></span>
-                </label>
-              </div>
-              <div class="tabbit-settings-group">
-                <div class="tabbit-settings-label">展示形式</div>
-                <select class="tabbit-settings-input" id="ts-htmlPptLayoutMode">
-                  <option value="single" ${CONFIG.htmlPptLayoutMode !== 'slides' ? 'selected' : ''}>单页图文总结（默认）</option>
-                  <option value="slides" ${CONFIG.htmlPptLayoutMode === 'slides' ? 'selected' : ''}>翻页 PPT</option>
-                </select>
-                <div class="tabbit-settings-hint">单页模式适合把所有内容放在一个页面里读完；翻页模式适合演示。</div>
-              </div>
-              <div class="tabbit-settings-group">
-                <div class="tabbit-settings-label">HTML PPT 最大输出 tokens</div>
-                <input class="tabbit-settings-input" id="ts-htmlPptMaxTokens" type="number" min="2000" max="30000" step="500" value="${CONFIG.htmlPptMaxTokens || 8000}" placeholder="8000" />
-                <div class="tabbit-settings-hint">仅影响 HTML PPT 生成。8000 通常够单页，复杂翻页可调到 12000-16000，前提是你的 API/模型支持。</div>
-              </div>
-              <div class="tabbit-settings-group">
-                <div class="tabbit-settings-label">HTML PPT 生成提示词</div>
-                <textarea class="tabbit-settings-textarea" id="ts-htmlPptPromptText" placeholder="HTML PPT 生成提示词，支持 {summary} {title} {upName} {url} 占位符...">${escapeHtml(CONFIG.htmlPptPromptText || getDefaultHtmlPptPrompt(CONFIG.htmlPptLayoutMode || 'single'))}</textarea>
-                <div class="tabbit-settings-hint">用于结果区「HTML PPT」按钮。生成完成后才自动打开新标签。支持 <code style="background:#eef;padding:1px 4px;border-radius:3px;">{summary}</code>、<code style="background:#eef;padding:1px 4px;border-radius:3px;">{title}</code>、<code style="background:#eef;padding:1px 4px;border-radius:3px;">{upName}</code>、<code style="background:#eef;padding:1px 4px;border-radius:3px;">{url}</code>、<code style="background:#eef;padding:1px 4px;border-radius:3px;">{skill}</code>、<code style="background:#eef;padding:1px 4px;border-radius:3px;">{layoutInstruction}</code>。</div>
-                <button class="tabbit-settings-btn tabbit-settings-btn-secondary" id="ts-htmlPptPromptReset" type="button" style="margin-top:8px;">重置为当前模式默认提示词</button>
-              </div>
-              <div class="tabbit-settings-group">
-                <div class="tabbit-settings-label">本地 Skill.md（可选）</div>
-                <div class="tabbit-settings-hint" id="ts-htmlPptSkillInfo">${CONFIG.htmlPptSkillText ? ('已导入：' + escapeHtml(CONFIG.htmlPptSkillName || 'Skill.md') + '，约 ' + Math.ceil(String(CONFIG.htmlPptSkillText || '').length / 1000) + 'K 字符') : '未导入。只读取本地 Markdown 文本作为提示词，不执行里面的代码。'}</div>
-                <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap;">
-                  <button class="tabbit-settings-btn tabbit-settings-btn-secondary" id="ts-htmlPptSkillImport" type="button">导入 Skill.md</button>
-                  <button class="tabbit-settings-btn tabbit-settings-btn-secondary" id="ts-htmlPptSkillClear" type="button">清空 Skill</button>
-                </div>
-              </div>
-            </div>
-          </div>
 
           <div class="tabbit-collapse">
             <div class="tabbit-collapse-header" data-collapse="other-settings">
@@ -8482,8 +8129,6 @@
 
     let editingPresets = JSON.parse(JSON.stringify(CONFIG.promptPresets || DEFAULT_PRESETS));
     let editingActiveId = CONFIG.activePresetId || (editingPresets[0] && editingPresets[0].id);
-    let editingHtmlPptSkillText = String(CONFIG.htmlPptSkillText || '');
-    let editingHtmlPptSkillName = CONFIG.htmlPptSkillName || '';
     let editingResultActionButtons = normalizeResultActionButtons(CONFIG.resultActionButtons);
 
     function moveEditingResultActionButton(index, direction) {
@@ -8541,15 +8186,6 @@
     }
     renderResultActionButtonEditList();
 
-    function updateHtmlPptSkillInfo() {
-      const infoEl = overlay.querySelector('#ts-htmlPptSkillInfo');
-      if (!infoEl) return;
-      if (editingHtmlPptSkillText) {
-        infoEl.textContent = '已导入：' + (editingHtmlPptSkillName || 'Skill.md') + '，约 ' + Math.ceil(editingHtmlPptSkillText.length / 1000) + 'K 字符。记得点击保存。';
-      } else {
-        infoEl.textContent = '未导入。只读取本地 Markdown 文本作为提示词，不执行里面的代码。';
-      }
-    }
 
     function renderPresetEditList() {
       const listEl = overlay.querySelector('#ts-preset-list');
@@ -8710,59 +8346,6 @@
       renderPresetEditList();
     });
 
-    overlay.querySelector('#ts-htmlPptSkillImport').addEventListener('click', function() {
-      const fileInput = document.createElement('input');
-      fileInput.type = 'file';
-      fileInput.accept = '.md,.txt,text/markdown,text/plain';
-      fileInput.style.cssText = 'position:fixed;left:-9999px;';
-      document.body.appendChild(fileInput);
-      fileInput.addEventListener('change', function() {
-        const file = fileInput.files[0];
-        if (!file) { fileInput.remove(); return; }
-        if (file.size > 1024 * 1024) {
-          alert('Skill.md 太大了，请控制在 1MB 以内。');
-          fileInput.remove();
-          return;
-        }
-        const reader = new FileReader();
-        reader.onload = function(e) {
-          editingHtmlPptSkillText = String(e.target.result || '');
-          editingHtmlPptSkillName = file.name || 'Skill.md';
-          updateHtmlPptSkillInfo();
-          fileInput.remove();
-        };
-        reader.onerror = function() {
-          alert('读取 Skill.md 失败');
-          fileInput.remove();
-        };
-        reader.readAsText(file);
-      });
-      fileInput.click();
-    });
-
-    overlay.querySelector('#ts-htmlPptSkillClear').addEventListener('click', function() {
-      editingHtmlPptSkillText = '';
-      editingHtmlPptSkillName = '';
-      updateHtmlPptSkillInfo();
-    });
-
-    const htmlPptLayoutEl = overlay.querySelector('#ts-htmlPptLayoutMode');
-    const htmlPptPromptEl = overlay.querySelector('#ts-htmlPptPromptText');
-    overlay.querySelector('#ts-htmlPptPromptReset').addEventListener('click', function() {
-      if (htmlPptPromptEl && htmlPptLayoutEl) {
-        htmlPptPromptEl.value = getDefaultHtmlPptPrompt(htmlPptLayoutEl.value === 'slides' ? 'slides' : 'single');
-      }
-    });
-    if (htmlPptLayoutEl && htmlPptPromptEl) {
-      htmlPptLayoutEl.addEventListener('change', function() {
-        const nextDefault = getDefaultHtmlPptPrompt(htmlPptLayoutEl.value === 'slides' ? 'slides' : 'single');
-        const current = (htmlPptPromptEl.value || '').trim();
-        const oldDefaults = [HTML_PPT_SINGLE_PROMPT_TEXT.trim(), HTML_PPT_SLIDES_PROMPT_TEXT.trim(), HTML_PPT_PROMPT_TEXT.trim()];
-        if (!current || oldDefaults.indexOf(current) !== -1 || confirm('展示形式已切换，是否把下面的生成提示词也切换为当前模式默认提示词？')) {
-          htmlPptPromptEl.value = nextDefault;
-        }
-      });
-    }
 
     overlay.querySelectorAll('.tabbit-collapse-header').forEach(function(header) {
       header.addEventListener('click', function() {
@@ -8955,14 +8538,6 @@
         : true;
       const newImageGenPromptText = (overlay.querySelector('#ts-imageGenPromptText').value || '').trim();
       CONFIG.imageGenPromptText = newImageGenPromptText || IMAGE_GEN_PROMPT_TEXT;
-      const newHtmlPptPromptText = (overlay.querySelector('#ts-htmlPptPromptText').value || '').trim();
-      CONFIG.htmlPptLayoutMode = overlay.querySelector('#ts-htmlPptLayoutMode').value === 'slides' ? 'slides' : 'single';
-      CONFIG.htmlPptPromptText = newHtmlPptPromptText || getDefaultHtmlPptPrompt(CONFIG.htmlPptLayoutMode);
-      const newHtmlPptMaxTokens = parseInt(overlay.querySelector('#ts-htmlPptMaxTokens').value, 10);
-      CONFIG.htmlPptMaxTokens = isNaN(newHtmlPptMaxTokens) ? 8000 : Math.max(2000, Math.min(30000, newHtmlPptMaxTokens));
-      CONFIG.enableHtmlPptDirect = overlay.querySelector('#ts-enableHtmlPptDirect').checked;
-      CONFIG.htmlPptSkillText = editingHtmlPptSkillText || '';
-      CONFIG.htmlPptSkillName = editingHtmlPptSkillName || '';
       CONFIG.resultActionButtons = normalizeResultActionButtons(editingResultActionButtons);
       currentModel = CONFIG.model;
       if (!saveConfig(CONFIG)) {
@@ -9076,27 +8651,6 @@
               if (igAutoDownloadEl) igAutoDownloadEl.checked = !!imported.enableImageAutoDownload;
             }
             if (imported.imageGenPromptText !== undefined) overlay.querySelector('#ts-imageGenPromptText').value = imported.imageGenPromptText;
-            if (imported.htmlPptPromptText !== undefined) {
-              var htmlPptPromptEl = overlay.querySelector('#ts-htmlPptPromptText');
-              if (htmlPptPromptEl) htmlPptPromptEl.value = imported.htmlPptPromptText;
-            }
-            if (imported.htmlPptLayoutMode !== undefined) {
-              var htmlPptLayoutEl = overlay.querySelector('#ts-htmlPptLayoutMode');
-              if (htmlPptLayoutEl) htmlPptLayoutEl.value = imported.htmlPptLayoutMode === 'slides' ? 'slides' : 'single';
-            }
-            if (imported.htmlPptMaxTokens !== undefined) {
-              var htmlPptMaxTokensEl = overlay.querySelector('#ts-htmlPptMaxTokens');
-              if (htmlPptMaxTokensEl) htmlPptMaxTokensEl.value = imported.htmlPptMaxTokens;
-            }
-            if (imported.enableHtmlPptDirect !== undefined) {
-              var htmlPptDirectEl = overlay.querySelector('#ts-enableHtmlPptDirect');
-              if (htmlPptDirectEl) htmlPptDirectEl.checked = !!imported.enableHtmlPptDirect;
-            }
-            if (imported.htmlPptSkillText !== undefined) {
-              editingHtmlPptSkillText = String(imported.htmlPptSkillText || '');
-              editingHtmlPptSkillName = imported.htmlPptSkillName || 'Skill.md';
-              updateHtmlPptSkillInfo();
-            }
 
             if (Array.isArray(imported.promptPresets) && imported.promptPresets.length > 0) {
               editingPresets = JSON.parse(JSON.stringify(imported.promptPresets));
@@ -9154,13 +8708,6 @@
       var igSizeReset = overlay.querySelector('#ts-imageGenSize'); if (igSizeReset) igSizeReset.value = '1024x1024';
       var igAutoDownloadReset = overlay.querySelector('#ts-enableImageAutoDownload'); if (igAutoDownloadReset) igAutoDownloadReset.checked = DEFAULT_CONFIG.enableImageAutoDownload;
       overlay.querySelector('#ts-imageGenPromptText').value = IMAGE_GEN_PROMPT_TEXT;
-      var htmlPptLayoutReset = overlay.querySelector('#ts-htmlPptLayoutMode'); if (htmlPptLayoutReset) htmlPptLayoutReset.value = DEFAULT_CONFIG.htmlPptLayoutMode;
-      var htmlPptPromptReset = overlay.querySelector('#ts-htmlPptPromptText'); if (htmlPptPromptReset) htmlPptPromptReset.value = getDefaultHtmlPptPrompt(DEFAULT_CONFIG.htmlPptLayoutMode);
-      var htmlPptMaxTokensReset = overlay.querySelector('#ts-htmlPptMaxTokens'); if (htmlPptMaxTokensReset) htmlPptMaxTokensReset.value = DEFAULT_CONFIG.htmlPptMaxTokens;
-      var htmlPptDirectReset = overlay.querySelector('#ts-enableHtmlPptDirect'); if (htmlPptDirectReset) htmlPptDirectReset.checked = DEFAULT_CONFIG.enableHtmlPptDirect;
-      editingHtmlPptSkillText = '';
-      editingHtmlPptSkillName = '';
-      updateHtmlPptSkillInfo();
       editingResultActionButtons = getDefaultResultActionButtons();
       renderResultActionButtonEditList();
       editingPresets = JSON.parse(JSON.stringify(DEFAULT_PRESETS));
@@ -9174,54 +8721,6 @@
       syncFullPromptTextarea();
     });
   }
-  // ==================== 字幕可用性检测 ====================
-  function checkAnySubtitleAvailable() {
-    const aiSubtitleButton = document.querySelector('.bpx-player-ctrl-subtitle-language-item[data-lan="ai-zh"]');
-    const subtitleButtons = document.querySelectorAll('.bpx-player-ctrl-subtitle-language-item');
-    const subtitleToggle = document.querySelector('.bpx-player-ctrl-subtitle');
-    return aiSubtitleButton !== null || subtitleButtons.length > 0 || subtitleToggle !== null;
-  }
-
-  function waitForSubtitleButton(maxWait, interval, signal) {
-    maxWait = maxWait || 2000;
-    interval = interval || 200;
-    return new Promise(function(resolve, reject) {
-      const startTime = Date.now();
-      let timer = null;
-      function cleanup() {
-        if (timer) clearTimeout(timer);
-        if (signal) signal.removeEventListener('abort', onAbort);
-      }
-      function onAbort() {
-        cleanup();
-        const abortErr = new Error('用户已打断');
-        abortErr.name = 'AbortError';
-        reject(abortErr);
-      }
-      if (signal && signal.aborted) {
-        onAbort();
-        return;
-      }
-      if (signal) signal.addEventListener('abort', onAbort);
-      function check() {
-        if (checkAnySubtitleAvailable()) {
-          console.log('[省流助手] 检测到字幕按钮，耗时 ' + (Date.now() - startTime) + 'ms');
-          cleanup();
-          resolve(true);
-          return;
-        }
-        if (Date.now() - startTime >= maxWait) {
-          console.log('[省流助手] 等待字幕按钮超时（' + maxWait + 'ms），判定为无字幕');
-          cleanup();
-          resolve(false);
-          return;
-        }
-        timer = setTimeout(check, interval);
-      }
-      check();
-    });
-  }
-
   function getRouteKey() {
     return window.location.href;
   }
@@ -9255,6 +8754,13 @@
 
   function isStaleRoute(generation) {
     return generation !== routeGeneration || getRouteKey() !== lastRouteKey;
+  }
+
+  function isStaleSummaryContext(generation, expectedBvid) {
+    if (generation !== routeGeneration) return true;
+    if (!expectedBvid) return isStaleRoute(generation);
+    const currentBvid = getVideoInfo().bvid;
+    return currentBvid !== expectedBvid;
   }
 
   function scheduleRouteRestart() {
@@ -9308,6 +8814,9 @@
     let subtitleForceStopped = false;
     let overallTimer = null;
     let captureFallbackUsed = false;
+    function isParsingVideoStale() {
+      return isStaleSummaryContext(parsingGeneration, videoInfo && videoInfo.bvid);
+    }
     function cleanupSubtitleAbortUi() {
       if (subtitleAbortBtnWrap && subtitleAbortBtnWrap.parentNode) {
         subtitleAbortBtnWrap.remove();
@@ -9328,7 +8837,7 @@
         overallTimer = null;
       }
       cleanupSubtitleAbortUi();
-      if (panel && videoInfo && !isStaleRoute(parsingGeneration)) {
+      if (panel && videoInfo && !isParsingVideoStale()) {
         showNoSubtitleState(panel, videoInfo, false, {
           icon: '⏹',
           title: '已停止自动获取',
@@ -9429,7 +8938,7 @@
           }
           const captured = await capturePromise;
           throwIfSubtitleForceStopped();
-          if (isStaleRoute(parsingGeneration)) return 'stale';
+          if (isParsingVideoStale()) return 'stale';
           if (captured && captured.transcript && captured.transcript.trim()) {
             restoreSubtitleAfterCapture(captureSession, 'auto-captured');
             rawSubtitleBody = captured.segments || [];
@@ -9449,51 +8958,49 @@
           isSubtitleCaptureInProgress = false;
         }
 
-        console.log('[省流助手] 捕获未命中，检测字幕可用性并回退接口...');
+        console.log('[省流助手] 捕获未命中，直接回退字幕接口...');
 
         throwIfSubtitleForceStopped();
-        const hasSubtitleButton = await waitForSubtitleButton(2000, 200, subtitleAbortController.signal);
-        throwIfSubtitleForceStopped();
-        if (isStaleRoute(parsingGeneration)) return 'stale';
-        if (!hasSubtitleButton) {
-          return 'no_subtitle';
+        if (isParsingVideoStale()) return 'stale';
+        var freshInfo = getVideoInfo();
+        if (freshInfo.bvid) {
+          videoInfo = freshInfo;
+          currentVideoInfo = videoInfo;
         }
+        if (loadingSpan) loadingSpan.textContent = '正在通过字幕接口获取...';
 
-        if (loadingSpan) loadingSpan.textContent = '正在获取字幕并生成摘要...';
-
-        let subtitles = await fetchSubtitles(videoInfo.cid, videoInfo.bvid, subtitleAbortController.signal);
+        const firstSubtitleResult = await fetchSubtitlesResult(videoInfo.cid, videoInfo.bvid, subtitleAbortController.signal);
         throwIfSubtitleForceStopped();
-        if (isStaleRoute(parsingGeneration)) return 'stale';
+        if (isParsingVideoStale()) return 'stale';
 
-        // ✅ 兜底：首次获取字幕为空时，等待 2 秒后重新获取视频信息并重试
-        if (subtitles.length === 0) {
-          console.log('[省流助手] 首次获取字幕为空，2 秒后重试...');
-          if (loadingSpan) loadingSpan.textContent = '首次获取字幕为空，等待重试...';
-          await randomDelay(2000, 2000, subtitleAbortController.signal);
+        let finalSubtitleResult = firstSubtitleResult;
+        if (firstSubtitleResult.status !== 'available') {
+          console.log('[省流助手] 首次字幕接口结果为 ' + firstSubtitleResult.status + '，刷新视频信息后重试...');
+          if (loadingSpan) loadingSpan.textContent = firstSubtitleResult.status === 'empty' ? '暂未发现字幕，正在二次确认...' : '字幕接口暂时失败，正在重试...';
+          await randomDelay(1500, 1500, subtitleAbortController.signal);
           throwIfSubtitleForceStopped();
-          if (isStaleRoute(parsingGeneration)) return 'stale';
-
-          var freshInfo = getVideoInfo();
+          if (isParsingVideoStale()) return 'stale';
+          freshInfo = getVideoInfo();
           if (freshInfo.bvid) {
             videoInfo = freshInfo;
             currentVideoInfo = videoInfo;
-            console.log('[省流助手] 重试时刷新视频信息 - BVID: ' + videoInfo.bvid + ', CID: ' + videoInfo.cid);
           }
-
-          if (loadingSpan) loadingSpan.textContent = '正在重新获取字幕...';
-          subtitles = await fetchSubtitles(videoInfo.cid, videoInfo.bvid, subtitleAbortController.signal);
+          const retrySubtitleResult = await fetchSubtitlesResult(videoInfo.cid, videoInfo.bvid, subtitleAbortController.signal);
           throwIfSubtitleForceStopped();
-          if (isStaleRoute(parsingGeneration)) return 'stale';
+          if (isParsingVideoStale()) return 'stale';
+          finalSubtitleResult = retrySubtitleResult;
+          if (retrySubtitleResult.status === 'empty') return 'no_subtitle';
+          if (retrySubtitleResult.status === 'error') {
+            throw new Error('字幕接口请求失败：' + (retrySubtitleResult.reason || firstSubtitleResult.reason || '请稍后重试'));
+          }
         }
 
-        if (subtitles.length === 0) {
-          return 'no_subtitle';
-        }
+        const subtitles = finalSubtitleResult.subtitles;
 
         const targetSubtitle = subtitles.find(s => s.lan === 'zh-CN' || s.lan === 'ai-zh') || subtitles[0];
         const content = await fetchSubtitleContent(targetSubtitle.subtitle_url, subtitleAbortController.signal);
         throwIfSubtitleForceStopped();
-        if (isStaleRoute(parsingGeneration)) return 'stale';
+        if (isParsingVideoStale()) return 'stale';
         if (content.length === 0) {
           return 'no_subtitle';
         }
@@ -9517,10 +9024,12 @@
 
       if (fetchResult === 'stale') return;
       if (fetchResult === 'no_subtitle') {
-        showNoSubtitleState(panel, videoInfo, false, captureFallbackUsed ? {
-          title: '捕获和接口获取均未成功',
-          desc: '已先尝试捕获播放器字幕，再回退字幕接口，仍未找到可用字幕。可手动获取、使用捕获模式，或上传字幕。'
-        } : undefined);
+        showNoSubtitleState(panel, videoInfo, false, {
+          title: '该视频没有可用字幕',
+          desc: captureFallbackUsed
+            ? '播放器捕获未命中，字幕接口二次确认后仍正常返回空列表。'
+            : '字幕接口二次确认后仍正常返回空列表。'
+        });
         setFloatBtnState(panel, 'no-subtitle');
         if (isAutoTriggered) notifyBackgroundSummaryFailed(panel, parsingGeneration, '未找到字幕，点击查看', 'no-subtitle');
         return;
@@ -9529,7 +9038,7 @@
       // fetchResult 是 transcript 字符串
       rawTranscript = fetchResult;
       console.log('[省流助手] 字幕获取完成');
-      if (isStaleRoute(parsingGeneration)) return;
+      if (isParsingVideoStale()) return;
 
       // 字幕已到达时只刷新已有结果区；尚未生成结果则由后续渲染统一处理。
       if (panel && videoInfo) {
@@ -9560,13 +9069,17 @@
       if (isAbortError(err)) {
         console.log('[省流助手] 自动字幕获取已被用户打断');
         showInterruptedSubtitleManualState();
-        if (panel && !isStaleRoute(parsingGeneration)) setFloatBtnState(panel, 'interrupted');
+        if (panel && !isParsingVideoStale()) setFloatBtnState(panel, 'interrupted');
         return;
       }
       console.error('[省流助手] 自动解析失败:', err);
       hasParsed = false;
-      if (panel && videoInfo && !isStaleRoute(parsingGeneration)) {
-        showNoSubtitleState(panel, videoInfo);
+      if (panel && videoInfo && !isParsingVideoStale()) {
+        showNoSubtitleState(panel, videoInfo, false, {
+          icon: '⚠️',
+          title: '字幕获取失败',
+          desc: '字幕接口请求异常或超时，这不代表视频没有字幕。可以点击下方按钮重试。'
+        });
         const stateEl = panel.querySelector('.tabbit-no-subtitle');
         if (stateEl) {
           stateEl.insertAdjacentHTML('beforeend', '<div style="font-size:12px;color:#c00;margin-top:8px;">自动获取失败：' + escapeHtml(err.message || String(err)) + '</div>');
