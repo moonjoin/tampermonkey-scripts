@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站省流助手 - 字幕AI摘要 Pro
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      4.3.8
+// @version      4.3.9
 // @description  自动提取B站视频字幕，通过自定义AI API生成极简摘要，支持模型切换、持续对话和评论区总结；支持自动解析开关、自动获取模型列表、flomo自动加标签，新增总结生图功能；v3.9.0 新增html PPT模式；v4.0.0 新增新手引导和API兜底功能（无API时仍可下载字幕、一键复制提示词+字幕到其他AI）
 // @author       次元饺子
 // @match        https://www.bilibili.com/video/*
@@ -1931,10 +1931,12 @@
     if (subtitleCaptureInstalled) return;
     subtitleCaptureInstalled = true;
     var urlRe = /subtitle/i;
+    // 带 @grant 时播放器运行在页面 realm；只改沙箱 window 会漏掉播放器请求。
+    var captureWindow = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
 
-    var originalFetch = window.fetch;
+    var originalFetch = captureWindow.fetch;
     if (typeof originalFetch === 'function') {
-      window.fetch = async function() {
+      captureWindow.fetch = async function() {
         var response = await originalFetch.apply(this, arguments);
         try {
           var req = arguments[0];
@@ -1953,7 +1955,7 @@
       };
     }
 
-    var XHR = window.XMLHttpRequest;
+    var XHR = captureWindow.XMLHttpRequest;
     if (XHR && XHR.prototype) {
       var originalOpen = XHR.prototype.open;
       var originalSend = XHR.prototype.send;

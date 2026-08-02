@@ -11,3 +11,5 @@ B站省流助手/tools/bili-summarize.sh
 B站省流助手/AGENTS.md
 .DS_Store
 AI_网页摘要助手/test-stream-parser.js
+B站省流助手/test_subtitle_capture_interceptor.js
+B站省流助手/tools/test_bili_summarize.sh
