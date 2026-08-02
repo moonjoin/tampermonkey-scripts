@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Folo 网站增强工具
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      14.0.3
+// @version      14.0.5
 // @description  Folo 增强：Jina Reader + Readability + 启发式三级抓取 + AI 总结 + 自动总结 + 手动列表全量预加载 + 后续对话 + 多配置管理 + 坚果云 WebDAV 同步 + 复制对话 + 保存到 flomo
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
@@ -1219,6 +1219,7 @@
             if (panel) {
                 const resultDiv = panel.querySelector('.preload-overview-content');
                 if (resultDiv) { resultDiv.innerHTML = ''; resultDiv.style.display = 'none'; }
+                resetListOverviewChat(panel);
             }
         }
 
@@ -1488,7 +1489,25 @@
                         <button data-act="overview" class="preload-act-primary" style="background:linear-gradient(135deg,#7c3aed,#2563eb);color:white;">✨ 生成列表总览</button>
                         <button data-act="settings">设置</button>
                     </div>
-                    <div class="preload-overview-content" style="display:none;"></div>
+                    <div class="my-ai-content preload-overview-content" style="display:none;"></div>
+                    <div class="my-ai-chat-area preload-overview-chat" style="display:none;">
+                        <div class="my-ai-chat-actions">
+                            <button class="my-ai-chat-clear" title="清空追问记录">🧹 清空追问</button>
+                            <button class="my-ai-chat-copy" title="复制列表总览和追问">📋 复制对话</button>
+                            <button class="my-ai-chat-flomo" title="保存列表总览和追问到 flomo">🌱 保存到 flomo</button>
+                        </div>
+                        <div class="my-ai-chat-history"></div>
+                        <div class="preload-quick-questions" aria-label="快捷追问">
+                            <button data-quick-question="请从当前列表中选出今天最值得看的 3-5 篇，按优先级排序，并引用文章编号和标题说明理由。">今天最值得看</button>
+                            <button data-quick-question="请从当前列表中提取可以实际执行的行动项，按优先级整理，并标明对应的文章编号和标题。没有明确行动项时请直接说明。">提取行动项</button>
+                            <button data-quick-question="请找出当前列表中内容重复或高度相似的文章，按组列出文章编号和标题，并说明重复点。">找重复内容</button>
+                            <button data-quick-question="请总结当前列表反映出的新趋势，按重要程度排序，并引用支持判断的文章编号和标题。">有哪些新趋势</button>
+                        </div>
+                        <div class="my-ai-chat-input-row">
+                            <textarea class="my-ai-chat-input" placeholder="基于当前列表继续追问...（Enter 发送，Shift+Enter 换行）" rows="1"></textarea>
+                            <button class="my-ai-chat-send">发送</button>
+                        </div>
+                    </div>
                 </div>
                 <div class="preload-resize-handle" title="拖动调整大小"></div>`;
             document.body.appendChild(panel);
@@ -1496,6 +1515,7 @@
             panel.querySelector('.preload-toggle').innerText = '展开';
             applyPreloadPanelLayout(panel);
             enablePreloadPanelDragResize(panel);
+            bindListOverviewChat(panel);
             panel.querySelector('.preload-toggle').onclick = () => {
                 const willMinimize = !panel.classList.contains('is-minimized');
                 if (willMinimize) {
@@ -1833,6 +1853,84 @@
         return { entries, cached };
     }
 
+    function resetListOverviewChat(wrapper) {
+        if (!wrapper) return;
+        wrapper.__chatHistory = null;
+        wrapper.__articleContext = null;
+        wrapper.__summaryContent = null;
+        wrapper.__contentLabel = null;
+        const chatArea = wrapper.querySelector('.preload-overview-chat');
+        const historyDiv = wrapper.querySelector('.my-ai-chat-history');
+        const input = wrapper.querySelector('.my-ai-chat-input');
+        if (chatArea) chatArea.style.display = 'none';
+        if (historyDiv) historyDiv.innerHTML = '';
+        if (input) { input.value = ''; input.style.height = 'auto'; }
+    }
+
+    function bindListOverviewChat(wrapper) {
+        if (!wrapper || wrapper.__listOverviewChatBound) return;
+        wrapper.__listOverviewChatBound = true;
+        const input = wrapper.querySelector('.my-ai-chat-input');
+        const sendBtn = wrapper.querySelector('.my-ai-chat-send');
+        const clearBtn = wrapper.querySelector('.my-ai-chat-clear');
+        const copyBtn = wrapper.querySelector('.my-ai-chat-copy');
+        const flomoBtn = wrapper.querySelector('.my-ai-chat-flomo');
+        if (!input || !sendBtn) return;
+        sendBtn.onclick = () => handleChatSend(wrapper);
+        input.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                handleChatSend(wrapper);
+            }
+        });
+        input.addEventListener('input', () => {
+            input.style.height = 'auto';
+            input.style.height = Math.min(input.scrollHeight, 150) + 'px';
+        });
+        if (clearBtn) clearBtn.onclick = () => {
+            if (!wrapper.__chatHistory || wrapper.__chatHistory.length <= 1) return;
+            if (!confirm('确定清空当前追问记录？（列表上下文会保留）')) return;
+            wrapper.__chatHistory = wrapper.__chatHistory.slice(0, 1);
+            wrapper.querySelector('.my-ai-chat-history').innerHTML = '';
+        };
+        if (copyBtn) copyBtn.onclick = () => handleCopyConversation(wrapper);
+        if (flomoBtn) flomoBtn.onclick = () => handleSendToFlomo(wrapper);
+        wrapper.querySelectorAll('[data-quick-question]').forEach(button => {
+            button.onclick = () => {
+                if (sendBtn.disabled || !wrapper.__chatHistory) return;
+                input.value = button.dataset.quickQuestion;
+                handleChatSend(wrapper);
+            };
+        });
+    }
+
+    function initListOverviewChat(wrapper, markdown, meta) {
+        if (!wrapper) return;
+        const route = getTimelineRouteInfo(location.href);
+        const scope = route.scopePath || '当前列表';
+        const sourceText = meta && meta.sourceText ? meta.sourceText : '';
+        wrapper.__articleContext = {
+            title: `Folo 列表总览：${scope}`,
+            text: sourceText,
+            url: location.href,
+            truncated: false
+        };
+        wrapper.__summaryContent = markdown;
+        wrapper.__contentLabel = '列表总览';
+        wrapper.__chatHistory = [
+            { role: 'system', content:
+                '你是 RSS 列表分析助手。请只基于下面的列表总览和文章材料回答追问；信息不足时直接说明，不要声称能访问网络。\n\n' +
+                `==== 列表 ====\n${scope}\n${location.href}\n\n` +
+                `==== 已生成的列表总览 ====\n${markdown}\n\n` +
+                (sourceText ? `==== 文章材料 ====\n${sourceText}` : '')
+            }
+        ];
+        const chatArea = wrapper.querySelector('.preload-overview-chat');
+        const historyDiv = wrapper.querySelector('.my-ai-chat-history');
+        if (chatArea) chatArea.style.display = 'block';
+        if (historyDiv) historyDiv.innerHTML = '';
+    }
+
     function ensureListOverviewWindow() {
         let win = document.getElementById("my-list-overview-window");
         if (win) return win;
@@ -1998,6 +2096,7 @@
         setOvBtn(true, "生成中...");
         setPreloadStatus(`正在生成列表总览：${useItems.length} 篇`, "info");
         const resultDiv = panel.querySelector('.preload-overview-content');
+        resetListOverviewChat(panel);
         if (resultDiv) { resultDiv.style.display = 'block'; resultDiv.innerHTML = '<div style="opacity:0.6">⏳ 正在生成...</div>'; }
 
         let streamStarted = false;
@@ -2009,6 +2108,7 @@
             (content) => {
                 setOvBtn(false, "✨ 生成列表总览");
                 if (resultDiv) resultDiv.innerHTML = _md(content);
+                initListOverviewChat(panel, content, { sourceText: joined });
                 setPreloadStatus("列表总览生成完成", "ok");
             },
             (err) => {
@@ -2709,6 +2809,39 @@
             text-decoration: underline;
             text-underline-offset: 3px;
             overflow-wrap: anywhere;
+        }
+        #my-ai-preload-panel .preload-overview-chat {
+            flex: 0 0 auto;
+            max-height: 42%;
+            overflow-y: auto;
+            margin-top: 0;
+            padding: 10px 4px 0;
+            background: inherit;
+        }
+        #my-ai-preload-panel .preload-overview-chat .my-ai-chat-history {
+            max-height: 180px;
+        }
+        #my-ai-preload-panel .preload-quick-questions {
+            display: flex;
+            gap: 6px;
+            flex-wrap: wrap;
+            margin: 7px 0;
+        }
+        #my-ai-preload-panel .preload-quick-questions button {
+            border: 1px solid rgba(124, 58, 237, 0.28);
+            border-radius: 999px;
+            padding: 5px 10px;
+            background: rgba(124, 58, 237, 0.07);
+            color: inherit;
+            cursor: pointer;
+            font-size: 12px;
+        }
+        #my-ai-preload-panel .preload-quick-questions button:hover {
+            background: rgba(124, 58, 237, 0.14);
+        }
+        #my-ai-preload-panel .preload-quick-questions button:disabled {
+            cursor: not-allowed;
+            opacity: 0.5;
         }
 
         #my-list-overview-window {
@@ -3999,6 +4132,7 @@
         const input = wrapper.querySelector('.my-ai-chat-input');
         const sendBtn = wrapper.querySelector('.my-ai-chat-send');
         const historyDiv = wrapper.querySelector('.my-ai-chat-history');
+        const quickBtns = wrapper.querySelectorAll('[data-quick-question]');
         const userText = input.value.trim();
         if (!userText) return;
         if (!wrapper.__chatHistory) {
@@ -4015,6 +4149,7 @@
         const aiMsg = appendChatMessage(historyDiv, 'assistant', '🤔 思考中...', false);
 
         sendBtn.disabled = true; sendBtn.innerText = '发送中';
+        quickBtns.forEach(btn => { btn.disabled = true; });
 
         let chatStreamStarted = false;
         const onChatChunk = (delta, full) => {
@@ -4030,12 +4165,14 @@
             wrapper.__chatHistory,
             (content) => {
                 sendBtn.disabled = false; sendBtn.innerText = '发送';
+                quickBtns.forEach(btn => { btn.disabled = false; });
                 wrapper.__chatHistory.push({ role: 'assistant', content: content });
                 aiMsg.innerHTML = `<span class="role-label">🤖 AI</span>` + _md(content);
                 historyDiv.scrollTop = historyDiv.scrollHeight;
             },
             (errMsg) => {
                 sendBtn.disabled = false; sendBtn.innerText = '发送';
+                quickBtns.forEach(btn => { btn.disabled = false; });
                 aiMsg.innerHTML = `<span class="role-label">🤖 AI</span><span style="color:red">${errMsg}</span>`;
                 wrapper.__chatHistory.pop();
             },
