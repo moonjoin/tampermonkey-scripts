@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         饺子 AI 网页摘要助手
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      2.9.6
+// @version      3.0.0
 // @description  指定网站自动弹出 AI 网页摘要，支持连续对话、多预设、多模板、SPA路由、摘要生图、flomo、坚果云双文件云同步。Shadow DOM 隔离样式。
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
@@ -83,7 +83,7 @@
     ],
     rulePromptBindings: [],
     autoRun: true,
-    floatButton: { side: 'right', x: null, y: null, offsetX: null, offsetY: null, opacity: 0.55 },
+    floatButton: { layoutVersion: 1, side: 'right', x: null, y: null, offsetX: 16, offsetY: 70, opacity: 1 },
     panel: { width: 420, height: null, heightRatio: 0.8, left: null, top: null },
     extractMaxChars: 16000,
     cloudSync: { account: '', appPassword: '', lastSyncAt: 0, lastSyncDirection: '' },
@@ -483,7 +483,10 @@
       if (typeof GM_getValue !== 'function') return clone(DEFAULT_CONFIG);
       const raw = GM_getValue(STORAGE_KEY, '');
       if (!raw) return clone(DEFAULT_CONFIG);
-      return mergeConfig(clone(DEFAULT_CONFIG), JSON.parse(raw));
+      const saved = JSON.parse(raw);
+      const merged = mergeConfig(clone(DEFAULT_CONFIG), saved);
+      if (saved.floatButton?.layoutVersion !== 1) merged.floatButton = { ...clone(DEFAULT_CONFIG.floatButton), opacity: merged.floatButton.opacity };
+      return merged;
     } catch (err) {
       console.warn('[饺子 AI] 配置加载失败：', err);
       return clone(DEFAULT_CONFIG);
@@ -2467,7 +2470,7 @@
       #${FLOAT_BTN_ID} {
         pointer-events: auto;
         position: fixed; z-index: 2147483646;
-        width: 44px; height: 44px; border-radius: 22px;
+        width: 44px; height: 44px; padding: 0; border-radius: 50%;
         background: linear-gradient(135deg, #8b5cf6, #3b82f6);
         color: white; font-size: 20px;
         display: flex; align-items: center; justify-content: center;
@@ -2530,7 +2533,7 @@
     floatBtn.id = FLOAT_BTN_ID;
     floatBtn.title = '打开 AI 摘要（点击自动总结）';
     floatBtn.textContent = '🥟';
-    floatBtn.style.opacity = config.floatButton.opacity;
+    floatBtn.style.opacity = '1';
     // 静默分析完成徽章
     const badge = document.createElement('div');
     badge.id = 'tabbit-float-badge';
@@ -2562,11 +2565,14 @@
         floatBtn.classList.remove('dragging');
         if (moved) {
           const rect = floatBtn.getBoundingClientRect();
-          config.floatButton.offsetX = window.innerWidth - rect.right;
-          config.floatButton.offsetY = window.innerHeight - rect.bottom;
+          config.floatButton.layoutVersion = 1;
+          config.floatButton.side = rect.left + rect.width / 2 < window.innerWidth / 2 ? 'left' : 'right';
+          config.floatButton.offsetX = 16;
+          config.floatButton.offsetY = Math.max(0, Math.round(window.innerHeight - rect.bottom));
           config.floatButton.x = null;
           config.floatButton.y = null;
           saveConfig();
+          applyFloatButtonPosition();
           const blocker = ev => { ev.stopPropagation(); ev.preventDefault(); floatBtn.removeEventListener('click', blocker, true); };
           floatBtn.addEventListener('click', blocker, true);
         }
@@ -2584,28 +2590,24 @@
 
   function applyFloatButtonPosition() {
     if (!floatBtn) return;
-    if (config.floatButton.offsetX != null && config.floatButton.offsetY != null) {
-      floatBtn.style.right = config.floatButton.offsetX + 'px';
+    if (config.floatButton.offsetY != null) {
+      const side = config.floatButton.side === 'left' ? 'left' : 'right';
+      floatBtn.style[side] = '16px';
+      floatBtn.style[side === 'left' ? 'right' : 'left'] = 'auto';
       floatBtn.style.bottom = config.floatButton.offsetY + 'px';
-      floatBtn.style.left = 'auto';
       floatBtn.style.top = 'auto';
     } else {
-      floatBtn.style.right = '12px';
-      floatBtn.style.bottom = '80px';
+      floatBtn.style.right = '16px';
+      floatBtn.style.bottom = '70px';
       floatBtn.style.left = 'auto';
       floatBtn.style.top = 'auto';
     }
   }
 
   window.addEventListener('resize', () => {
-    if (!floatBtn || !floatBtn.style.left) return;
-    const rect = floatBtn.getBoundingClientRect();
-    const maxLeft = window.innerWidth - 44;
-    const maxTop = window.innerHeight - 44;
-    if (rect.left > maxLeft) floatBtn.style.left = Math.max(0, maxLeft) + 'px';
-    if (rect.top > maxTop) floatBtn.style.top = Math.max(0, maxTop) + 'px';
-    if (rect.left < 0) floatBtn.style.left = '0px';
-    if (rect.top < 0) floatBtn.style.top = '0px';
+    if (!floatBtn) return;
+    config.floatButton.offsetY = Math.max(0, Math.min(config.floatButton.offsetY ?? 70, window.innerHeight - 44));
+    applyFloatButtonPosition();
   });
 
   /******************************************************************

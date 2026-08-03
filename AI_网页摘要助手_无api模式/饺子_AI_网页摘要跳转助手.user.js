@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         饺子 AI 网页摘要跳转助手
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      0.4.5
+// @version      1.0.0
 // @description  精简跳转模式：抓取网页正文，套提示词模板，发送到常驻 ChatGPT 接收端自动提交。
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
@@ -69,7 +69,7 @@
       'https://sspai.com/post/*'
     ],
     autoRunCooldownMinutes: 30,
-    floatButton: { offsetX: null, offsetY: null },
+    floatButton: { layoutVersion: 1, side: 'right', offsetX: 16, offsetY: 124 },
     panel: { width: null, height: null, left: null, top: null },
     defaultPromptTemplateId: 'default',
     promptTemplates: [
@@ -208,6 +208,7 @@
       merged.autoRunRules = normalizeUrlRules(saved.autoRunRules || DEFAULT_CONFIG.autoRunRules);
       merged.autoRunCooldownMinutes = Math.max(1, Number(saved.autoRunCooldownMinutes || DEFAULT_CONFIG.autoRunCooldownMinutes));
       merged.floatButton = { ...clone(DEFAULT_CONFIG.floatButton), ...(saved.floatButton || {}) };
+      if (saved.floatButton?.layoutVersion !== 1) merged.floatButton = clone(DEFAULT_CONFIG.floatButton);
       merged.panel = { ...clone(DEFAULT_CONFIG.panel), ...(saved.panel || {}) };
       return merged;
     } catch (err) {
@@ -1114,10 +1115,11 @@
 
   function applyFloatButtonPosition(btn) {
     if (!btn) return;
-    if (config.floatButton?.offsetX != null && config.floatButton?.offsetY != null) {
-      btn.style.right = config.floatButton.offsetX + 'px';
+    if (config.floatButton?.offsetY != null) {
+      const side = config.floatButton.side === 'left' ? 'left' : 'right';
+      btn.style[side] = '16px';
+      btn.style[side === 'left' ? 'right' : 'left'] = 'auto';
       btn.style.bottom = config.floatButton.offsetY + 'px';
-      btn.style.left = 'auto';
       btn.style.top = 'auto';
     }
   }
@@ -1167,10 +1169,13 @@
       const rect = btn.getBoundingClientRect();
       config.floatButton = {
         ...config.floatButton,
-        offsetX: Math.round(window.innerWidth - rect.right),
+        layoutVersion: 1,
+        side: rect.left + rect.width / 2 < window.innerWidth / 2 ? 'left' : 'right',
+        offsetX: 16,
         offsetY: Math.round(window.innerHeight - rect.bottom)
       };
       saveConfig();
+      applyFloatButtonPosition(btn);
       const blocker = (event) => {
         event.stopPropagation();
         event.preventDefault();
@@ -1186,7 +1191,7 @@
     const btn = document.createElement('button');
     btn.id = FLOAT_BTN_ID;
     btn.type = 'button';
-    btn.textContent = 'AI 跳转';
+    btn.textContent = '🚀';
     btn.title = '左键：发送到 ChatGPT；右键：设置';
     btn.addEventListener('click', () => runPrimaryAction({ flash: true }));
     btn.addEventListener('contextmenu', (event) => {
@@ -1634,24 +1639,29 @@
     const css = `
       #${FLOAT_BTN_ID} {
         position: fixed;
-        right: 18px;
-        bottom: 96px;
+        right: 16px;
+        bottom: 124px;
         z-index: 2147483646;
         border: none;
         background: linear-gradient(135deg, #8b5cf6, #3b82f6);
         color: #fff;
-        border-radius: 10px;
-        padding: 10px 12px;
-        font-size: 13px;
+        width: 44px;
+        height: 44px;
+        padding: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        border-radius: 50%;
+        font-size: 20px;
         font-weight: 700;
         line-height: 1;
-        box-shadow: 0 8px 24px rgba(59, 130, 246, .28);
+        box-shadow: 0 6px 20px rgba(0, 0, 0, .25);
         cursor: pointer;
         transition: transform .18s ease, box-shadow .18s ease, opacity .18s ease;
       }
       #${FLOAT_BTN_ID}:hover {
-        transform: translateY(-1px);
-        box-shadow: 0 12px 30px rgba(99, 102, 241, .34);
+        transform: scale(1.08);
+        box-shadow: 0 8px 24px rgba(59, 130, 246, .34);
       }
       #${FLOAT_BTN_ID}.tabbit-jump-float-dragging {
         transition: none !important;
@@ -2042,11 +2052,8 @@
     if (btn && btn.style.left) {
       keepElementInViewport(btn, 24);
       const rect = btn.getBoundingClientRect();
-      config.floatButton = {
-        ...config.floatButton,
-        offsetX: Math.round(window.innerWidth - rect.right),
-        offsetY: Math.round(window.innerHeight - rect.bottom)
-      };
+      config.floatButton.offsetY = Math.max(0, Math.min(config.floatButton.offsetY ?? 124, window.innerHeight - rect.height));
+      applyFloatButtonPosition(btn);
       saveConfig();
     }
     if (panelEl && !panelEl.classList.contains('tabbit-jump-hidden') && panelEl.style.left) {

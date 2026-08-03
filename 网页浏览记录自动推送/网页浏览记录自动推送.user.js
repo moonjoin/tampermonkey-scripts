@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name        网页浏览记录助手
 // @namespace   https://github.com/moonjoin/tampermonkey-scripts
-// @version     1.9.2
+// @version     2.0.0
 // @description  浏览记录自动存储 + AI 浏览行为分析 + 用户画像生成，支持坚果云增量云同步（和饺子AI网页摘要助手+Folo网站增强工具数据互通）
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
@@ -1517,10 +1517,13 @@ ${lines}`;
    ******************************************************************/
   function addStyle(css) { if (typeof GM_addStyle === 'function') return GM_addStyle(css); const style = document.createElement('style'); style.textContent = css; document.head.appendChild(style); }
   const UI = { rootId: 'mpush-root', btnId: 'mpush-float-btn', panelId: 'mpush-panel', toastId: 'mpush-toast', chatInputId: 'mpush-chat-input', sendBtnId: 'mpush-send-btn', analysisBodyId: 'mpush-analysis-body', badgeId: 'mpush-badge', contextMenuId: 'mpush-context-menu' };
+  const FLOAT_POSITION_KEY = 'mpush_float_position_v1';
+  const FLOAT_EDGE_GAP = 16;
+  const FLOAT_DEFAULT_BOTTOM = 16;
   let historyTabEl = null;
 
   addStyle(`
-    #${UI.btnId} { position:fixed; right:16px; bottom:16px; width:44px; height:44px; border-radius:22px; border:none; cursor:pointer; z-index:2147483647; background:linear-gradient(135deg,#8b5cf6,#3b82f6); color:#fff; font-size:18px; box-shadow:0 4px 16px rgba(0,0,0,.25); backdrop-filter:blur(6px); transition:transform .15s; user-select:none; -webkit-user-select:none; }
+    #${UI.btnId} { position:fixed; right:${FLOAT_EDGE_GAP}px; bottom:${FLOAT_DEFAULT_BOTTOM}px; width:44px; height:44px; padding:0; display:flex; align-items:center; justify-content:center; border-radius:50%; border:none; cursor:pointer; z-index:2147483647; background:linear-gradient(135deg,#8b5cf6,#3b82f6); color:#fff; font-size:20px; line-height:1; box-shadow:0 6px 20px rgba(0,0,0,.25); transition:transform .2s,box-shadow .2s; user-select:none; -webkit-user-select:none; }
     #${UI.btnId}:hover { transform:scale(1.08); }
     #${UI.btnId}.dragging { transition:none!important; transform:scale(1.08); }
     #${UI.badgeId} { position:absolute; top:-4px; right:-4px; min-width:18px; height:18px; border-radius:9px; background:#ef4444; color:#fff; font-size:10px; font-weight:700; display:flex; align-items:center; justify-content:center; padding:0 4px; pointer-events:none; }
@@ -1719,6 +1722,8 @@ ${lines}`;
     root.appendChild(floatBtn); root.appendChild(contextMenu); root.appendChild(panel);
     document.body.appendChild(root); document.body.appendChild(toastNode);
 
+    applyFloatBtnPosition(floatBtn);
+
     enablePanelDrag(header, panel, resizeHandle);
     enableFloatBtnDrag(floatBtn);
     enableFloatContextMenu(floatBtn, contextMenu);
@@ -1815,6 +1820,35 @@ ${lines}`;
   let _panelDrag = { active: false, sx: 0, sy: 0, sl: 0, st: 0, panel: null };
   let _panelResize = { active: false, sx: 0, sy: 0, sw: 0, sh: 0, panel: null };
 
+  function loadFloatBtnPosition() {
+    try {
+      const raw = typeof GM_getValue === 'function' ? GM_getValue(FLOAT_POSITION_KEY, '') : '';
+      return raw ? JSON.parse(raw) : null;
+    } catch (_) { return null; }
+  }
+
+  function saveFloatBtnPosition(position) {
+    if (typeof GM_setValue === 'function') GM_setValue(FLOAT_POSITION_KEY, JSON.stringify(position));
+  }
+
+  function applyFloatBtnPosition(btn) {
+    const saved = loadFloatBtnPosition();
+    const side = saved?.side === 'left' ? 'left' : 'right';
+    const bottom = saved?.bottom == null ? FLOAT_DEFAULT_BOTTOM : Math.max(0, Math.min(saved.bottom, innerHeight - btn.offsetHeight));
+    btn.style[side] = FLOAT_EDGE_GAP + 'px';
+    btn.style[side === 'left' ? 'right' : 'left'] = 'auto';
+    btn.style.bottom = bottom + 'px';
+    btn.style.top = 'auto';
+  }
+
+  function snapFloatBtnToEdge(btn) {
+    const rect = btn.getBoundingClientRect();
+    const side = rect.left + rect.width / 2 < innerWidth / 2 ? 'left' : 'right';
+    const bottom = Math.max(0, Math.min(Math.round(innerHeight - rect.bottom), innerHeight - rect.height));
+    saveFloatBtnPosition({ side, bottom });
+    applyFloatBtnPosition(btn);
+  }
+
   document.addEventListener('mousemove', e => {
     const fd = _floatDrag;
     if (fd.active) {
@@ -1838,6 +1872,7 @@ ${lines}`;
     if (_floatDrag.active) {
       _floatDrag.btn.classList.remove('dragging');
       if (_floatDrag.moved) {
+        snapFloatBtnToEdge(_floatDrag.btn);
         const b = ev => { ev.stopPropagation(); ev.preventDefault(); _floatDrag.btn.removeEventListener('click', b, true); };
         _floatDrag.btn.addEventListener('click', b, true);
       }
@@ -1850,15 +1885,7 @@ ${lines}`;
   // 窗口大小变化时，确保悬浮按钮始终在可视区域内
   window.addEventListener('resize', () => {
     const btn = document.getElementById(UI.btnId);
-    if (!btn || !btn.style.left) return; // 未拖拽过，用 right/bottom 定位，无需修正
-    const rect = btn.getBoundingClientRect();
-    const maxLeft = window.innerWidth - 44;
-    const maxTop = window.innerHeight - 44;
-    let changed = false;
-    if (rect.left > maxLeft) { btn.style.left = Math.max(0, maxLeft) + 'px'; changed = true; }
-    if (rect.top > maxTop) { btn.style.top = Math.max(0, maxTop) + 'px'; changed = true; }
-    if (rect.left < 0) { btn.style.left = '0px'; changed = true; }
-    if (rect.top < 0) { btn.style.top = '0px'; changed = true; }
+    if (btn) applyFloatBtnPosition(btn);
   });
 
   function enableFloatBtnDrag(btn) {

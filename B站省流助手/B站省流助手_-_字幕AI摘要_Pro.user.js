@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站省流助手 - 字幕AI摘要 Pro
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      4.3.10
+// @version      5.0.0
 // @description  自动提取B站视频字幕，通过自定义AI API生成极简摘要，支持模型切换、持续对话和评论区总结；支持自动解析开关、自动获取模型列表、flomo自动加标签、总结生图和API兜底功能
 // @author       次元饺子
 // @match        https://www.bilibili.com/video/*
@@ -992,9 +992,13 @@
   function loadPositions() {
     try {
       const raw = localStorage.getItem(POSITION_KEY);
-      if (raw) return JSON.parse(raw);
+      if (raw) {
+        const saved = JSON.parse(raw);
+        if (saved.layoutVersion === 1) return saved;
+        return { ...saved, layoutVersion: 1, floatBtn: null };
+      }
     } catch(e) {}
-    return {};
+    return { layoutVersion: 1 };
   }
   function savePositions(pos) {
     try {
@@ -4334,55 +4338,57 @@
         from { opacity: 0; transform: scale(0.5); }
         to { opacity: 1; transform: scale(1); }
       }
-      @keyframes tabbitFloatPulse {
-        0%, 100% { box-shadow: 0 4px 16px rgba(102,126,234,0.45); }
-        50% { box-shadow: 0 4px 24px rgba(102,126,234,0.75); }
-      }
       #tabbit-float-btn {
         position: fixed !important;
         top: 50%;
         right: 18px;
         z-index: 2147483647 !important;
         display: flex !important;
-        flex-direction: row;
         align-items: center;
         justify-content: center;
-        min-width: 104px;
-        max-width: calc(100vw - 24px);
-        min-height: 42px;
-        padding: 0 14px;
-        background: linear-gradient(160deg, #667eea 0%, #764ba2 100%) !important;
+        width: 44px;
+        height: 44px;
+        padding: 0;
+        background: linear-gradient(135deg, #8b5cf6, #3b82f6) !important;
         color: white !important;
         border: none !important;
-        border-radius: 999px;
+        border-radius: 50%;
         cursor: grab;
-        font-size: 13px;
-        letter-spacing: 0;
-        font-weight: 600;
+        font-size: 20px;
         font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-        box-shadow: 0 8px 22px rgba(82, 70, 180, 0.32);
-        transform: translateY(-50%);
-        animation: tabbitFloatIn 0.35s cubic-bezier(0.34,1.56,0.64,1) forwards, tabbitFloatPulse 2.5s ease-in-out 0.4s infinite;
+        box-shadow: 0 6px 20px rgba(0,0,0,.25);
+        animation: tabbitFloatIn 0.35s cubic-bezier(0.34,1.56,0.64,1) forwards;
         transition: transform 0.2s, box-shadow 0.2s, background 0.2s;
         user-select: none;
-        gap: 7px;
-        white-space: nowrap;
         pointer-events: auto !important;
         visibility: visible !important;
         opacity: 1 !important;
       }
       #tabbit-float-btn.dragging { cursor: grabbing; animation: none; }
       #tabbit-float-btn:hover {
-        transform: translateY(-50%) scale(1.04);
-        box-shadow: 0 10px 26px rgba(82, 70, 180, 0.42);
-        background: linear-gradient(160deg, #5a6fd6 0%, #6a3d96 100%);
+        transform: scale(1.08);
+        box-shadow: 0 8px 24px rgba(59,130,246,.34);
       }
       #tabbit-float-btn .tabbit-float-icon {
-        font-size: 16px;
+        font-size: 20px;
         line-height: 1;
       }
       #tabbit-float-btn .tabbit-float-label {
-        font-size: 13px;
+        position: absolute;
+        top: -5px;
+        right: -5px;
+        min-width: 16px;
+        height: 16px;
+        padding: 0 3px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        border: 2px solid #fff;
+        border-radius: 999px;
+        background: #64748b;
+        color: #fff;
+        font-size: 10px;
+        font-weight: 800;
         line-height: 1;
       }
       #tabbit-float-btn.tabbit-float-processing {
@@ -4397,12 +4403,7 @@
       @media (max-width: 480px) {
         #tabbit-float-btn {
           right: 12px;
-          min-width: 0;
-          min-height: 38px;
-          padding: 0 12px;
-          font-size: 12px;
         }
-        #tabbit-float-btn .tabbit-float-label { font-size: 12px; }
       }
       #tabbit-summary-notice {
         position: fixed;
@@ -5020,17 +5021,31 @@
   // ==================== 悬浮按钮 ====================
   function applyFloatBtnPosition(btn) {
     if (POSITIONS.floatBtn) {
-      const rect = btn.getBoundingClientRect();
-      const maxLeft = Math.max(0, window.innerWidth - rect.width);
-      const maxTop = Math.max(0, window.innerHeight - rect.height);
-      const left = Math.max(0, Math.min(POSITIONS.floatBtn.left, maxLeft));
-      const top = Math.max(0, Math.min(POSITIONS.floatBtn.top, maxTop));
-      btn.style.left = left + 'px';
-      btn.style.top = top + 'px';
-      btn.style.right = 'auto';
+      const side = POSITIONS.floatBtn.side === 'left' ? 'left' : 'right';
+      const bottom = Math.max(0, Math.min(POSITIONS.floatBtn.bottom ?? 170, window.innerHeight - btn.offsetHeight));
+      btn.style[side] = '16px';
+      btn.style[side === 'left' ? 'right' : 'left'] = 'auto';
+      btn.style.bottom = bottom + 'px';
+      btn.style.top = 'auto';
+      btn.style.transform = 'none';
+    } else {
+      btn.style.right = '16px';
+      btn.style.left = 'auto';
+      btn.style.bottom = '170px';
+      btn.style.top = 'auto';
       btn.style.transform = 'none';
     }
   }
+
+  window.addEventListener('resize', function() {
+    const btn = document.querySelector('#tabbit-float-btn');
+    if (!btn) return;
+    if (POSITIONS.floatBtn) {
+      POSITIONS.floatBtn.bottom = Math.max(0, Math.min(POSITIONS.floatBtn.bottom ?? 170, window.innerHeight - btn.offsetHeight));
+      savePositions(POSITIONS);
+    }
+    applyFloatBtnPosition(btn);
+  });
 
   function clearSummaryNotice() {
     if (summaryNoticeTimer) clearTimeout(summaryNoticeTimer);
@@ -5116,12 +5131,12 @@
     btn.id = 'tabbit-float-btn';
     const floatState = state || (panel && panel._tabbitFloatState) || 'idle';
     const labels = {
-      processing: { icon: '⏳', label: '处理中', title: '处理中，点击查看' },
-      ready: { icon: '✅', label: '已完成', title: '已完成，点击查看' },
-      error: { icon: '⚠️', label: '未完成', title: '未完成，点击查看' },
-      'no-subtitle': { icon: '🔇', label: '无字幕', title: '无字幕，点击查看' },
-      interrupted: { icon: '⏹', label: '已中断', title: '已中断，点击查看' },
-      idle: { icon: '🎬', label: '省流助手', title: panel ? '打开省流助手' : '开始处理' }
+      processing: { badge: '…', label: '处理中', title: '处理中，点击查看' },
+      ready: { badge: '✓', label: '已完成', title: '已完成，点击查看' },
+      error: { badge: '!', label: '未完成', title: '未完成，点击查看' },
+      'no-subtitle': { badge: '!', label: '无字幕', title: '无字幕，点击查看' },
+      interrupted: { badge: '!', label: '已中断', title: '已中断，点击查看' },
+      idle: { badge: '', label: '省流助手', title: panel ? '打开省流助手' : '开始处理' }
     };
     const info = labels[floatState] || labels.idle;
     if (floatState === 'error' || floatState === 'no-subtitle' || floatState === 'interrupted') {
@@ -5131,7 +5146,7 @@
     }
     btn.title = info.title;
     btn.setAttribute('aria-label', '省流助手：' + info.label);
-    btn.innerHTML = '<span class="tabbit-float-icon">' + info.icon + '</span><span class="tabbit-float-label">' + info.label + '</span>';
+    btn.innerHTML = '<span class="tabbit-float-icon">🎬</span>' + (info.badge ? '<span class="tabbit-float-label">' + info.badge + '</span>' : '');
     btn.style.cssText = 'position:fixed!important;z-index:2147483647!important;display:flex!important;visibility:visible!important;opacity:1!important;pointer-events:auto!important;';
     document.body.appendChild(btn);
 
@@ -5139,8 +5154,14 @@
 
     let dragMoved = false;
     makeDraggable(btn, btn, function(left, top) {
-      POSITIONS.floatBtn = { left, top };
+      const rect = btn.getBoundingClientRect();
+      POSITIONS.layoutVersion = 1;
+      POSITIONS.floatBtn = {
+        side: rect.left + rect.width / 2 < window.innerWidth / 2 ? 'left' : 'right',
+        bottom: Math.max(0, Math.round(window.innerHeight - rect.bottom))
+      };
       savePositions(POSITIONS);
+      applyFloatBtnPosition(btn);
       dragMoved = true;
       setTimeout(() => { dragMoved = false; }, 150);
     });
