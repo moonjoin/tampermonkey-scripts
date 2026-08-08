@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站省流助手 - 字幕AI摘要 Pro
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      5.0.0
+// @version      5.0.1
 // @description  自动提取B站视频字幕，通过自定义AI API生成极简摘要，支持模型切换、持续对话和评论区总结；支持自动解析开关、自动获取模型列表、flomo自动加标签、总结生图和API兜底功能
 // @author       次元饺子
 // @match        https://www.bilibili.com/video/*
@@ -1303,6 +1303,7 @@
   let routeRestartTimer = null;
   let routeGeneration = 0;
   let summaryNoticeTimer = null;
+  let panelOutsidePointerHandler = null;
   // 🆕 当前正在进行的 AI 任务的 AbortController（用于打断流式输出）
   let currentAbortController = null;
   let currentSubtitleManualFallback = null;
@@ -4454,18 +4455,24 @@
       #tabbit-summary-notice .tabbit-summary-notice-body > :last-child { margin-bottom: 0; }
       #tabbit-summary-notice .tabbit-summary-notice-footer {
         display: flex;
-        justify-content: flex-end;
-        padding: 0 12px 12px;
-      }
-      #tabbit-summary-notice .tabbit-summary-notice-more {
-        border: 1px solid #cbd5e1;
-        border-radius: 8px;
-        background: #f8fafc;
+        align-items: center;
+        justify-content: center;
+        width: 100%;
+        box-sizing: border-box;
+        padding: 13px 12px;
+        border: 0;
+        border-top: 1px solid rgba(203,213,225,0.7);
+        background: rgba(248,250,252,0.72);
         color: #475569;
-        padding: 6px 10px;
         cursor: pointer;
-        font-size: 12px;
+        font-size: 13px;
         font-weight: 600;
+        transition: background 0.18s ease;
+      }
+      #tabbit-summary-notice .tabbit-summary-notice-footer:hover,
+      #tabbit-summary-notice .tabbit-summary-notice-footer:focus-visible {
+        background: rgba(8,145,178,0.08);
+        outline: none;
       }
       #tabbit-summary-notice.tabbit-summary-notice-error {
         background: linear-gradient(135deg, #dc2626 0%, #ea580c 100%);
@@ -4861,12 +4868,10 @@
     }
 
     panel.querySelector('.tabbit-close-btn').addEventListener('click', () => {
-      panel.style.animation = 'slideOutRight 0.3s ease forwards';
-      setTimeout(() => {
-        panel.style.display = 'none';
-        try { showFloatBtn(panel, panel._tabbitFloatState || 'idle'); } catch(e) { console.warn('[省流助手] 显示悬浮窗失败:', e); }
-      }, 350);
+      collapsePanel(panel);
     });
+
+    bindOutsidePanelCollapse(panel);
 
     bindModelChips(panel);
 
@@ -5056,12 +5061,42 @@
 
   function openPanel(panel) {
     if (!panel) return;
+    if (panel._tabbitCollapseTimer) clearTimeout(panel._tabbitCollapseTimer);
+    panel._tabbitCollapseTimer = null;
+    panel._tabbitClosing = false;
     clearSummaryNotice();
     hideFloatBtn();
     panel.style.animation = 'none';
     panel.style.display = 'flex';
     void panel.offsetWidth;
     panel.style.animation = 'slideInRight 0.3s ease';
+  }
+
+  function collapsePanel(panel) {
+    if (!panel || panel.style.display === 'none' || panel._tabbitClosing) return;
+    panel._tabbitClosing = true;
+    panel.style.animation = 'slideOutRight 0.3s ease forwards';
+    panel._tabbitCollapseTimer = setTimeout(() => {
+      panel.style.display = 'none';
+      panel._tabbitClosing = false;
+      panel._tabbitCollapseTimer = null;
+      try { showFloatBtn(panel, panel._tabbitFloatState || 'idle'); } catch(e) { console.warn('[省流助手] 显示悬浮窗失败:', e); }
+    }, 350);
+  }
+
+  function bindOutsidePanelCollapse(panel) {
+    if (panelOutsidePointerHandler) {
+      document.removeEventListener('pointerdown', panelOutsidePointerHandler, true);
+    }
+    panelOutsidePointerHandler = function(event) {
+      if (!panel || panel.style.display === 'none' || panel._tabbitClosing) return;
+      const target = event.target;
+      if (target && target.closest && target.closest(
+        '#tabbit-ai-summary-panel, #tabbit-settings-overlay, #tabbit-upload-overlay, #tabbit-summary-notice, #tabbit-float-btn'
+      )) return;
+      collapsePanel(panel);
+    };
+    document.addEventListener('pointerdown', panelOutsidePointerHandler, true);
   }
 
   function showSummaryNotice(panel, text, type, summaryText) {
@@ -5086,15 +5121,13 @@
           '<button class="tabbit-summary-notice-close" type="button" title="收起摘要" aria-label="收起摘要">×</button>' +
         '</div>' +
         '<div class="tabbit-summary-notice-body"></div>' +
-        '<div class="tabbit-summary-notice-footer">' +
-          '<button class="tabbit-summary-notice-more" type="button">更多操作</button>' +
-        '</div>';
+        '<button class="tabbit-summary-notice-footer" type="button">查看更多</button>';
       const body = notice.querySelector('.tabbit-summary-notice-body');
       if (body) body.innerHTML = parseMarkdown(String(summaryText || '摘要已生成，可打开完整面板查看。').trim());
       const closeBtn = notice.querySelector('.tabbit-summary-notice-close');
       if (closeBtn) closeBtn.addEventListener('click', clearSummaryNotice);
-      const moreBtn = notice.querySelector('.tabbit-summary-notice-more');
-      if (moreBtn) moreBtn.addEventListener('click', function() {
+      const moreArea = notice.querySelector('.tabbit-summary-notice-footer');
+      if (moreArea) moreArea.addEventListener('click', function() {
         clearSummaryNotice();
         openPanel(panel);
       });
