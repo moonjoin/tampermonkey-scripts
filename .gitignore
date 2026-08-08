@@ -14,3 +14,8 @@ AI_网页摘要助手/test-stream-parser.js
 B站省流助手/test_subtitle_capture_interceptor.js
 B站省流助手/tools/test_bili_summarize.sh
 Folo_网站增强/test_list_overview_followup.js
+B站省流助手/test_auto_subtitle_fallback.js
+B站省流助手/test_background_summary_route.js
+.gitignore
+B站省流助手/test_summary_notice.js
+B站省流助手/test_html_ppt_removed.js
