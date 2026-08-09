@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站省流助手 - 字幕AI摘要 Pro
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      5.0.5
+// @version      5.0.11
 // @description  自动提取B站视频字幕，通过自定义AI API生成极简摘要，支持模型切换、持续对话和评论区总结；支持自动解析开关、自动获取模型列表、flomo自动加标签、总结生图和API兜底功能
 // @author       次元饺子
 // @match        https://www.bilibili.com/video/*
@@ -12,7 +12,6 @@
 // @grant        GM_getValue
 // @grant        GM_addValueChangeListener
 // @grant        GM_openInTab
-// @grant        GM_download
 // @grant        unsafeWindow
 // @license      MIT
 // @downloadURL https://update.greasyfork.org/scripts/574935/B%E7%AB%99%E7%9C%81%E6%B5%81%E5%8A%A9%E6%89%8B%20-%20%E5%AD%97%E5%B9%95AI%E6%91%98%E8%A6%81%20Pro.user.js
@@ -2314,65 +2313,175 @@
     return str.replace(/[\\/:*?"<>|]/g, '_').replace(/\s+/g, ' ').trim();
   }
 
-  function triggerDownload(content, filename, mimeType) {
-    const downloadFile = new File([content], filename, { type: mimeType });
-    function startBrowserFallback() {
-      try {
-        const url = URL.createObjectURL(downloadFile);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = filename;
-        a.style.display = 'none';
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        setTimeout(function() { URL.revokeObjectURL(url); }, 60000);
-        return 'started';
-      } catch(e) {
-        console.error('[省流助手] 浏览器下载兜底失败:', e);
-        return 'failed';
-      }
-    }
-    if (typeof GM_download !== 'function') return Promise.resolve(startBrowserFallback());
-    return new Promise(function(resolve) {
-      var settled = false;
-      function finish(result) {
-        if (settled) return;
-        settled = true;
-        resolve(result);
-      }
-      function fallback(message, detail) {
-        if (settled) return;
-        if (detail) console.warn(message, detail);
-        else console.warn(message);
-        finish(startBrowserFallback());
-      }
-      try {
-        GM_download({
-          url: downloadFile,
-          name: filename,
-          saveAs: false,
-          conflictAction: 'uniquify',
-          onload: function() { finish('downloaded'); },
-          onerror: function(error) {
-            fallback('[省流助手] GM_download 失败，改用浏览器下载:', error && (error.error || error.details || error));
-          },
-          ontimeout: function() {
-            fallback('[省流助手] GM_download 超时，改用浏览器下载');
-          }
-        });
-      } catch(e) {
-        fallback('[省流助手] GM_download 不可用，改用浏览器下载:', e.message);
-      }
+  const DOWNLOAD_DIRECTORY_DB = 'tabbit_subtitle_download_v1';
+  const DOWNLOAD_DIRECTORY_STORE = 'handles';
+  const DOWNLOAD_DIRECTORY_KEY = 'subtitle-directory';
+
+  function openDownloadDirectoryDb() {
+    const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+    if (!pageWindow.indexedDB) return Promise.resolve(null);
+    return new Promise(function(resolve, reject) {
+      const request = pageWindow.indexedDB.open(DOWNLOAD_DIRECTORY_DB, 1);
+      request.onupgradeneeded = function() {
+        if (!request.result.objectStoreNames.contains(DOWNLOAD_DIRECTORY_STORE)) {
+          request.result.createObjectStore(DOWNLOAD_DIRECTORY_STORE);
+        }
+      };
+      request.onsuccess = function() { resolve(request.result); };
+      request.onerror = function() { reject(request.error); };
     });
   }
 
-  async function downloadTranscript(text, title, upName, bvid) {
+  async function loadDownloadDirectoryHandle() {
+    try {
+      const db = await openDownloadDirectoryDb();
+      if (!db) return null;
+      return await new Promise(function(resolve, reject) {
+        const request = db.transaction(DOWNLOAD_DIRECTORY_STORE, 'readonly').objectStore(DOWNLOAD_DIRECTORY_STORE).get(DOWNLOAD_DIRECTORY_KEY);
+        request.onsuccess = function() { resolve(request.result || null); };
+        request.onerror = function() { reject(request.error); };
+      });
+    } catch(e) {
+      console.warn('[省流助手] 读取字幕保存目录失败:', e);
+      return null;
+    }
+  }
+
+  async function saveDownloadDirectoryHandle(handle) {
+    try {
+      const db = await openDownloadDirectoryDb();
+      if (!db) return false;
+      await new Promise(function(resolve, reject) {
+        const transaction = db.transaction(DOWNLOAD_DIRECTORY_STORE, 'readwrite');
+        transaction.objectStore(DOWNLOAD_DIRECTORY_STORE).put(handle, DOWNLOAD_DIRECTORY_KEY);
+        transaction.oncomplete = function() { resolve(); };
+        transaction.onerror = function() { reject(transaction.error); };
+      });
+      return true;
+    } catch(e) {
+      console.warn('[省流助手] 记住字幕保存目录失败:', e);
+      return false;
+    }
+  }
+
+  async function clearDownloadDirectoryHandle() {
+    try {
+      const db = await openDownloadDirectoryDb();
+      if (!db) return false;
+      await new Promise(function(resolve, reject) {
+        const transaction = db.transaction(DOWNLOAD_DIRECTORY_STORE, 'readwrite');
+        transaction.objectStore(DOWNLOAD_DIRECTORY_STORE).delete(DOWNLOAD_DIRECTORY_KEY);
+        transaction.oncomplete = function() { resolve(); };
+        transaction.onerror = function() { reject(transaction.error); };
+      });
+      return true;
+    } catch(e) {
+      console.warn('[省流助手] 清除失效字幕目录失败:', e);
+      return false;
+    }
+  }
+
+  async function triggerDownload(content, filename, mimeType, options) {
+    options = options || {};
+    const downloadWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+    const BlobCtor = downloadWindow.Blob || Blob;
+    const blob = new BlobCtor([content], { type: mimeType });
+    if (options.useDirectory && typeof downloadWindow.showDirectoryPicker === 'function') {
+      async function getAvailableFilename(directoryHandle, desiredName) {
+        const match = String(desiredName || 'download').match(/^(.*?)(\.[^.]+)?$/);
+        const base = match ? match[1] : desiredName;
+        const extension = match && match[2] ? match[2] : '';
+        for (let index = 0; index < 1000; index++) {
+          const candidate = index === 0 ? desiredName : base + ' (' + index + ')' + extension;
+          try {
+            await directoryHandle.getFileHandle(candidate, { create: false });
+          } catch(e) {
+            if (e && e.name === 'NotFoundError') return candidate;
+            throw e;
+          }
+        }
+        return base + ' (' + Date.now() + ')' + extension;
+      }
+      async function writeToDirectory(directoryHandle) {
+        const targetDirectory = options.directorySubdirectory
+          ? await directoryHandle.getDirectoryHandle(options.directorySubdirectory, { create: true })
+          : directoryHandle;
+        const availableFilename = await getAvailableFilename(targetDirectory, filename);
+        const fileHandle = await targetDirectory.getFileHandle(availableFilename, { create: true });
+        const writable = await fileHandle.createWritable();
+        await writable.write(blob);
+        await writable.close();
+      }
+      let directoryHandle = await loadDownloadDirectoryHandle();
+      if (directoryHandle) {
+        try {
+          let permission = await directoryHandle.queryPermission({ mode: 'readwrite' });
+          if (permission === 'prompt') permission = await directoryHandle.requestPermission({ mode: 'readwrite' });
+          if (permission !== 'granted') throw new DOMException('目录授权已失效', 'NotAllowedError');
+          await writeToDirectory(directoryHandle);
+          return 'downloaded';
+        } catch(e) {
+          if (e && e.name === 'AbortError') return 'cancelled';
+          console.warn('[省流助手] 原字幕目录已失效，需要重新选择:', e);
+          await clearDownloadDirectoryHandle();
+          directoryHandle = null;
+        }
+      }
+      if (options.allowDirectoryPicker === false && !directoryHandle) return 'needs-directory';
+      try {
+        directoryHandle = await downloadWindow.showDirectoryPicker({ id: 'tabbit-subtitle-downloads', mode: 'readwrite' });
+        await saveDownloadDirectoryHandle(directoryHandle);
+        await writeToDirectory(directoryHandle);
+        return 'downloaded';
+      } catch(e) {
+        if (e && e.name === 'AbortError') return 'cancelled';
+        console.warn('[省流助手] 保存到已授权目录失败，改用单文件另存为:', e);
+      }
+    }
+    if (options.allowFilePicker === false) return 'needs-interaction';
+    if (typeof downloadWindow.showSaveFilePicker === 'function') {
+      try {
+        const extensionMatch = String(filename || '').match(/(\.[^.]+)$/);
+        const extension = extensionMatch ? extensionMatch[1] : '.txt';
+        const plainMime = String(mimeType || 'application/octet-stream').split(';')[0];
+        const handle = await downloadWindow.showSaveFilePicker({
+          suggestedName: filename,
+          types: [{ description: extension.toUpperCase().slice(1) + ' 文件', accept: { [plainMime]: [extension] } }]
+        });
+        const writable = await handle.createWritable();
+        await writable.write(blob);
+        await writable.close();
+        return 'downloaded';
+      } catch(e) {
+        if (e && e.name === 'AbortError') return 'cancelled';
+        console.warn('[省流助手] 原生另存为失败，改用浏览器下载:', e);
+      }
+    }
+    try {
+      const urlApi = downloadWindow.URL || URL;
+      const url = urlApi.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      a.style.display = 'none';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(function() { urlApi.revokeObjectURL(url); }, 60000);
+      return 'started';
+    } catch(e) {
+      console.error('[省流助手] 下载失败:', e);
+      return 'failed';
+    }
+  }
+
+  async function downloadTranscript(text, title, upName, bvid, options) {
     const safeTitle = sanitizeFilename(title) || '未知标题';
     const safeUpName = sanitizeFilename(upName) || '未知UP主';
     const safeBvid = bvid || '未知BV号';
     const filename = safeUpName + '__' + safeTitle + '__' + safeBvid + '.txt';
-    const result = await triggerDownload(text, filename, 'text/plain;charset=utf-8');
+    const downloadOptions = Object.assign({ useDirectory: true, allowDirectoryPicker: true }, options || {});
+    const result = await triggerDownload(text, filename, 'text/plain;charset=utf-8', downloadOptions);
     if (result === 'downloaded') console.log('[省流助手] 已下载字幕: ' + filename);
     else if (result === 'started') console.log('[省流助手] 已发起字幕下载: ' + filename);
     return result;
@@ -2408,7 +2517,7 @@
     const safeUpName = sanitizeFilename(upName) || '未知UP主';
     const safeBvid = bvid || '未知BV号';
     const filename = safeUpName + '__' + safeTitle + '__' + safeBvid + '.srt';
-    const result = await triggerDownload(srt, filename, 'text/plain;charset=utf-8');
+    const result = await triggerDownload(srt, filename, 'text/plain;charset=utf-8', { useDirectory: true, allowDirectoryPicker: true });
     if (result === 'downloaded') console.log('[省流助手] 已下载 SRT: ' + filename);
     else if (result === 'started') console.log('[省流助手] 已发起 SRT 下载: ' + filename);
     return result;
@@ -2418,18 +2527,20 @@
     return normalizeSubtitleSegments(subtitles).length > 0;
   }
 
-  function downloadGeneratedImage(imageDataUrl, videoInfo, suffix) {
+  async function downloadGeneratedImage(imageDataUrl, videoInfo, suffix, options) {
     if (!imageDataUrl || imageDataUrl === 'ERROR') return false;
     const safeTitle = sanitizeFilename((videoInfo && videoInfo.title) || '视频总结') || '视频总结';
     const filename = safeTitle + (suffix || '_总结') + '.png';
-    const a = document.createElement('a');
-    a.href = imageDataUrl;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    console.log('[省流助手-生图] 已触发图片下载: ' + filename);
-    return true;
+    const match = String(imageDataUrl).match(/^data:([^;,]+)?(;base64)?,([\s\S]*)$/);
+    if (!match) return 'failed';
+    const downloadWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+    const binary = match[2] ? downloadWindow.atob(match[3]) : decodeURIComponent(match[3]);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    const result = await triggerDownload(bytes, filename, match[1] || 'image/png', options || {});
+    if (result === 'downloaded') console.log('[省流助手-生图] 已保存图片: ' + filename);
+    else if (result === 'needs-directory' || result === 'needs-interaction') console.warn('[省流助手-生图] 自动保存未执行：请先选择字幕保存目录，或点击“保存图片”手动保存');
+    return result;
   }
 
   function sleep(ms) {
@@ -3191,147 +3302,6 @@
     plain = plain.replace(/^---$/gm, '');
     plain = plain.replace(/\n{3,}/g, '\n\n');
     return plain.trim();
-  }
-
-  function parseMarkdownInlineLegacy(raw) {
-    const codeParts = [];
-    const linkParts = [];
-    let source = String(raw || '').replace(/`([^`]+)`/g, function(match, code) {
-      const token = '\u0000CODE' + codeParts.length + '\u0000';
-      codeParts.push('<code class="md-code">' + escapeHtml(code) + '</code>');
-      return token;
-    });
-    source = source.replace(/\[([^\]]+)\]\(([^)]+)\)/g, function(match, label, href) {
-      const token = '\u0000LINK' + linkParts.length + '\u0000';
-      linkParts.push('<a class="md-link" href="' + safeHref(href) + '" target="_blank" rel="noopener">' + escapeHtml(label) + '</a>');
-      return token;
-    });
-    let html = escapeHtml(source);
-    html = html.replace(/\*\*(.+?)\*\*/g, '<strong class="md-bold">$1</strong>');
-    html = html.replace(/(^|[^\*])\*([^\*\n]+)\*/g, '$1<em class="md-em">$2</em>');
-    html = html.replace(/\u0000CODE(\d+)\u0000/g, function(match, idx) {
-      return codeParts[Number(idx)] || '';
-    });
-    html = html.replace(/\u0000LINK(\d+)\u0000/g, function(match, idx) {
-      return linkParts[Number(idx)] || '';
-    });
-    return html;
-  }
-
-  function parseMarkdownLegacy(text) {
-    const lines = String(text || '').replace(/\r/g, '').split('\n');
-    const out = [];
-    let paragraph = [];
-    let listType = '';
-    let inCode = false;
-    let codeLines = [];
-
-    function flushParagraph() {
-      if (!paragraph.length) return;
-      out.push('<p class="md-p">' + paragraph.map(parseMarkdownInlineLegacy).join('<br>') + '</p>');
-      paragraph = [];
-    }
-    function closeList() {
-      if (!listType) return;
-      out.push(listType === 'ol' ? '</ol>' : '</ul>');
-      listType = '';
-    }
-    function startList(type, startNumber) {
-      if (listType === type) return;
-      closeList();
-      out.push(type === 'ol' ? '<ol class="md-ol"' + (startNumber !== 1 ? ' start="' + startNumber + '"' : '') + '>' : '<ul class="md-ul">');
-      listType = type;
-    }
-
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      const trimmed = line.trim();
-
-      if (/^```/.test(trimmed)) {
-        if (inCode) {
-          out.push('<pre class="md-pre"><code>' + escapeHtml(codeLines.join('\n')) + '</code></pre>');
-          codeLines = [];
-          inCode = false;
-        } else {
-          flushParagraph();
-          closeList();
-          inCode = true;
-        }
-        continue;
-      }
-      if (inCode) {
-        codeLines.push(line);
-        continue;
-      }
-      if (!trimmed) {
-        flushParagraph();
-        closeList();
-        continue;
-      }
-
-      if (trimmed.includes('|') && lines[i + 1] && /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/.test(lines[i + 1])) {
-        flushParagraph();
-        closeList();
-        const headerCells = trimmed.replace(/^\||\|$/g, '').split('|').map(c => c.trim());
-        i += 2;
-        const rows = [];
-        while (i < lines.length && lines[i].trim().includes('|')) {
-          rows.push(lines[i].trim().replace(/^\||\|$/g, '').split('|').map(c => c.trim()));
-          i++;
-        }
-        i--;
-        let table = '<table class="md-table"><thead><tr>' + headerCells.map(c => '<th>' + parseMarkdownInlineLegacy(c) + '</th>').join('') + '</tr></thead><tbody>';
-        rows.forEach(row => {
-          table += '<tr>' + row.map(c => '<td>' + parseMarkdownInlineLegacy(c) + '</td>').join('') + '</tr>';
-        });
-        table += '</tbody></table>';
-        out.push(table);
-        continue;
-      }
-
-      const heading = trimmed.match(/^(#{1,3})\s+(.+)$/);
-      if (heading) {
-        flushParagraph();
-        closeList();
-        const level = heading[1].length;
-        out.push('<h' + level + ' class="md-h' + level + '">' + parseMarkdownInlineLegacy(heading[2]) + '</h' + level + '>');
-        continue;
-      }
-      if (/^---+$/.test(trimmed)) {
-        flushParagraph();
-        closeList();
-        out.push('<hr class="md-hr">');
-        continue;
-      }
-      if (/^>\s+/.test(trimmed)) {
-        flushParagraph();
-        closeList();
-        out.push('<blockquote class="md-quote">' + parseMarkdownInlineLegacy(trimmed.replace(/^>\s+/, '')) + '</blockquote>');
-        continue;
-      }
-
-      const ul = trimmed.match(/^[-*]\s+(.+)$/);
-      if (ul) {
-        flushParagraph();
-        startList('ul');
-        out.push('<li class="md-li">' + parseMarkdownInlineLegacy(ul[1]) + '</li>');
-        continue;
-      }
-      const ol = trimmed.match(/^(\d+)\.\s+(.+)$/);
-      if (ol) {
-        flushParagraph();
-        startList('ol', Number(ol[1]));
-        out.push('<li class="md-li-ol">' + parseMarkdownInlineLegacy(ol[2]) + '</li>');
-        continue;
-      }
-
-      closeList();
-      paragraph.push(line);
-    }
-    if (inCode) out.push('<pre class="md-pre"><code>' + escapeHtml(codeLines.join('\n')) + '</code></pre>');
-    flushParagraph();
-    closeList();
-    return out.join('\n');
   }
 
   const parseMarkdown = (function() {
@@ -5677,7 +5647,7 @@
       }
 
       if (!imageSlot && CONFIG.enableImageAutoDownload !== false) {
-        downloadGeneratedImage(imageDataUrl, videoInfo, '_配图');
+        await downloadGeneratedImage(imageDataUrl, videoInfo, '_配图', { useDirectory: true, directorySubdirectory: '图片', allowDirectoryPicker: false });
       }
 
       btn.textContent = '🔁 重新生成配图';
@@ -6593,7 +6563,11 @@
     var result = 'failed';
     try {
       result = await task();
-      button.textContent = result === 'downloaded' ? '✅ 已下载' : (result === 'started' ? '✅ 已发起' : '❌ 下载失败');
+      button.textContent = result === 'downloaded' ? '✅ 已保存'
+        : (result === 'started' ? '✅ 已发起'
+          : (result === 'cancelled' ? '已取消'
+            : (result === 'needs-directory' ? '⚠️ 先选字幕目录'
+              : (result === 'needs-interaction' ? '⚠️ 请手动保存' : '❌ 下载失败'))));
     } catch(e) {
       console.error('[省流助手] 下载失败:', e);
       button.textContent = '❌ 下载失败';
@@ -6691,7 +6665,10 @@
       id: 'save_image', imageRow: true, settingsLabel: '💾 保存图片',
       create: function(context) {
         return createResultActionButton('tabbit-copy-btn tabbit-save-img-btn', '💾 保存图片', function() {
-          downloadGeneratedImage(context.imageDataUrl, context.videoInfo, context.imageFilenameSuffix || '_总结');
+          var btn = this;
+          runDownloadButton(btn, '💾 保存图片', function() {
+            return downloadGeneratedImage(context.imageDataUrl, context.videoInfo, context.imageFilenameSuffix || '_总结');
+          });
         });
       }
     },
@@ -6877,8 +6854,8 @@
       wrap.appendChild(createImageActionRow(imageDataUrl, videoInfo, '_总结'));
 
       if (CONFIG.enableImageAutoDownload !== false) {
-        setTimeout(function() {
-          try { downloadGeneratedImage(imageDataUrl, videoInfo, '_总结'); } catch(e) { console.warn('[省流助手] 自动下载失败', e); }
+        setTimeout(async function() {
+          try { await downloadGeneratedImage(imageDataUrl, videoInfo, '_总结', { useDirectory: true, directorySubdirectory: '图片', allowDirectoryPicker: false }); } catch(e) { console.warn('[省流助手] 自动下载失败', e); }
         }, 0);
       }
     }
@@ -8322,7 +8299,7 @@
               <div class="tabbit-switch-row" style="margin-top:10px;padding:10px 12px;background:white;border:1px solid #e2e6f2;border-radius:8px;">
                 <div>
                   <div class="tabbit-settings-label">生成后自动下载图片</div>
-                  <div class="tabbit-settings-hint" style="margin-top:2px;">开启后，自动生图和手动生成配图成功时都会下载到本地。</div>
+                  <div class="tabbit-settings-hint" style="margin-top:2px;">开启后，已授权字幕目录时自动保存到“图片”子目录；未授权时请点“保存图片”手动保存。</div>
                 </div>
                 <label class="tabbit-switch">
                   <input type="checkbox" id="ts-enableImageAutoDownload" ${CONFIG.enableImageAutoDownload !== false ? 'checked' : ''} />
@@ -8358,6 +8335,11 @@
                   <input type="checkbox" id="ts-enableAutoDownloadSubtitle" ${CONFIG.enableAutoDownloadSubtitle ? 'checked' : ''} />
                   <span class="tabbit-slider"></span>
                 </label>
+              </div>
+              <div class="tabbit-settings-group">
+                <div class="tabbit-settings-label">📁 字幕保存目录</div>
+                <button class="tabbit-settings-btn tabbit-settings-btn-secondary" id="ts-change-subtitle-directory">重新选择字幕保存目录</button>
+                <div class="tabbit-settings-hint">TXT/SRT 保存在这里；自动保存的图片进入“图片”子目录。评论、弹幕、全面分析和配置导出不会保存到这里。</div>
               </div>
               <div class="tabbit-settings-group">
                 <div class="tabbit-settings-label">📍 位置和尺寸</div>
@@ -8648,6 +8630,28 @@
     }
     overlay.querySelector('#ts-fetch-models').addEventListener('click', function() { doFetchModels(false); });
     overlay.querySelector('#ts-append-models').addEventListener('click', function() { doFetchModels(true); });
+
+    overlay.querySelector('#ts-change-subtitle-directory').addEventListener('click', async function() {
+      const btn = this;
+      const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+      if (typeof pageWindow.showDirectoryPicker !== 'function') {
+        alert('当前浏览器不支持固定字幕保存目录');
+        return;
+      }
+      const originalText = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = '正在选择…';
+      try {
+        const handle = await pageWindow.showDirectoryPicker({ id: 'tabbit-subtitle-downloads', mode: 'readwrite' });
+        await clearDownloadDirectoryHandle();
+        await saveDownloadDirectoryHandle(handle);
+        btn.textContent = '✅ 已更新字幕目录';
+      } catch(e) {
+        btn.textContent = e && e.name === 'AbortError' ? '已取消' : '❌ 选择失败';
+        if (!e || e.name !== 'AbortError') console.warn('[省流助手] 重新选择字幕目录失败:', e);
+      }
+      setTimeout(function() { btn.disabled = false; btn.textContent = originalText; }, 2200);
+    });
 
     overlay.querySelector('#ts-reset-pos').addEventListener('click', function() {
       POSITIONS = {};
@@ -9304,8 +9308,10 @@
         // 🆕 自动下载字幕
         if (CONFIG.enableAutoDownloadSubtitle) {
           try {
-            downloadTranscript(fetchResult, videoInfo.title, videoInfo.upName, videoInfo.bvid);
-            console.log('[省流助手] 已自动下载字幕');
+            const autoDownloadResult = await downloadTranscript(fetchResult, videoInfo.title, videoInfo.upName, videoInfo.bvid, { allowDirectoryPicker: false });
+            if (autoDownloadResult === 'downloaded') console.log('[省流助手] 已自动下载字幕');
+            else if (autoDownloadResult === 'needs-directory') console.warn('[省流助手] 自动下载未执行：请先手动下载一次字幕并授权保存目录');
+            else if (autoDownloadResult !== 'cancelled') console.warn('[省流助手] 自动下载字幕未完成:', autoDownloadResult);
           } catch(e) {
             console.warn('[省流助手] 自动下载字幕失败:', e.message);
           }
