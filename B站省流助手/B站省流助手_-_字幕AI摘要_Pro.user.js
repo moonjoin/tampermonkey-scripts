@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站省流助手 - 字幕AI摘要 Pro
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      5.0.3
+// @version      5.0.4
 // @description  自动提取B站视频字幕，通过自定义AI API生成极简摘要，支持模型切换、持续对话和评论区总结；支持自动解析开关、自动获取模型列表、flomo自动加标签、总结生图和API兜底功能
 // @author       次元饺子
 // @match        https://www.bilibili.com/video/*
@@ -12,6 +12,7 @@
 // @grant        GM_getValue
 // @grant        GM_addValueChangeListener
 // @grant        GM_openInTab
+// @grant        GM_download
 // @grant        unsafeWindow
 // @license      MIT
 // @downloadURL https://update.greasyfork.org/scripts/574935/B%E7%AB%99%E7%9C%81%E6%B5%81%E5%8A%A9%E6%89%8B%20-%20%E5%AD%97%E5%B9%95AI%E6%91%98%E8%A6%81%20Pro.user.js
@@ -2315,23 +2316,66 @@
 
   function triggerDownload(content, filename, mimeType) {
     const blob = new Blob([content], { type: mimeType });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+    function startBrowserFallback() {
+      try {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        a.style.display = 'none';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(function() { URL.revokeObjectURL(url); }, 60000);
+        return 'started';
+      } catch(e) {
+        console.error('[省流助手] 浏览器下载兜底失败:', e);
+        return 'failed';
+      }
+    }
+    if (typeof GM_download !== 'function') return Promise.resolve(startBrowserFallback());
+    return new Promise(function(resolve) {
+      var settled = false;
+      function finish(result) {
+        if (settled) return;
+        settled = true;
+        resolve(result);
+      }
+      function fallback(message, detail) {
+        if (settled) return;
+        if (detail) console.warn(message, detail);
+        else console.warn(message);
+        finish(startBrowserFallback());
+      }
+      try {
+        GM_download({
+          url: blob,
+          name: filename,
+          saveAs: false,
+          conflictAction: 'uniquify',
+          onload: function() { finish('downloaded'); },
+          onerror: function(error) {
+            fallback('[省流助手] GM_download 失败，改用浏览器下载:', error && (error.error || error.details || error));
+          },
+          ontimeout: function() {
+            fallback('[省流助手] GM_download 超时，改用浏览器下载');
+          }
+        });
+      } catch(e) {
+        fallback('[省流助手] GM_download 不可用，改用浏览器下载:', e.message);
+      }
+    });
   }
 
-  function downloadTranscript(text, title, upName, bvid) {
+  async function downloadTranscript(text, title, upName, bvid) {
     const safeTitle = sanitizeFilename(title) || '未知标题';
     const safeUpName = sanitizeFilename(upName) || '未知UP主';
     const safeBvid = bvid || '未知BV号';
     const filename = safeUpName + '__' + safeTitle + '__' + safeBvid + '.txt';
-    triggerDownload(text, filename, 'text/plain;charset=utf-8');
-    console.log('[省流助手] 已下载字幕: ' + filename);
+    const result = await triggerDownload(text, filename, 'text/plain;charset=utf-8');
+    if (result === 'downloaded') console.log('[省流助手] 已下载字幕: ' + filename);
+    else if (result === 'started') console.log('[省流助手] 已发起字幕下载: ' + filename);
+    return result;
   }
 
   function toSrtTimestamp(sec) {
@@ -2357,16 +2401,17 @@
     }).join('\n\n');
   }
 
-  function downloadSubtitleSrt(subtitles, title, upName, bvid) {
+  async function downloadSubtitleSrt(subtitles, title, upName, bvid) {
     var srt = buildSrtContent(subtitles);
     if (!srt) return false;
     const safeTitle = sanitizeFilename(title) || '未知标题';
     const safeUpName = sanitizeFilename(upName) || '未知UP主';
     const safeBvid = bvid || '未知BV号';
     const filename = safeUpName + '__' + safeTitle + '__' + safeBvid + '.srt';
-    triggerDownload(srt, filename, 'text/plain;charset=utf-8');
-    console.log('[省流助手] 已下载 SRT: ' + filename);
-    return true;
+    const result = await triggerDownload(srt, filename, 'text/plain;charset=utf-8');
+    if (result === 'downloaded') console.log('[省流助手] 已下载 SRT: ' + filename);
+    else if (result === 'started') console.log('[省流助手] 已发起 SRT 下载: ' + filename);
+    return result;
   }
 
   function hasStructuredSubtitleData(subtitles) {
@@ -6541,6 +6586,25 @@
     return btn;
   }
 
+  async function runDownloadButton(button, idleText, task) {
+    if (!button || button.disabled) return;
+    button.disabled = true;
+    button.textContent = '⏳ 下载中…';
+    var result = 'failed';
+    try {
+      result = await task();
+      button.textContent = result === 'downloaded' ? '✅ 已下载' : (result === 'started' ? '✅ 已发起' : '❌ 下载失败');
+    } catch(e) {
+      console.error('[省流助手] 下载失败:', e);
+      button.textContent = '❌ 下载失败';
+    }
+    setTimeout(function() {
+      button.disabled = false;
+      button.textContent = idleText;
+    }, 2200);
+    return result;
+  }
+
   const RESULT_ACTION_BUTTONS = {
     copy_summary: {
       id: 'copy_summary', scopes: ['summary', 'image'], requiresText: true, settingsLabel: '📋 复制摘要',
@@ -6603,7 +6667,10 @@
       id: 'download_transcript', scopes: ['summary', 'image', 'fallback'], settingsLabel: '💾 下载字幕',
       create: function(context) {
         return createResultActionButton('tabbit-download-btn', '💾 下载字幕', function() {
-          downloadTranscript(rawTranscript, context.videoInfo.title, context.videoInfo.upName, context.videoInfo.bvid);
+          var btn = this;
+          runDownloadButton(btn, '💾 下载字幕', function() {
+            return downloadTranscript(rawTranscript, context.videoInfo.title, context.videoInfo.upName, context.videoInfo.bvid);
+          });
         });
       }
     },
@@ -6611,9 +6678,12 @@
       id: 'download_srt', scopes: ['summary', 'image', 'fallback'], settingsLabel: '🕒 下载 SRT',
       create: function(context) {
         return createResultActionButton('tabbit-download-btn', '🕒 下载 SRT', function() {
-          if (!downloadSubtitleSrt(rawSubtitleBody, context.videoInfo.title, context.videoInfo.upName, context.videoInfo.bvid)) {
-            alert('当前没有可导出的时间轴字幕');
-          }
+          var btn = this;
+          runDownloadButton(btn, '🕒 下载 SRT', async function() {
+            var result = await downloadSubtitleSrt(rawSubtitleBody, context.videoInfo.title, context.videoInfo.upName, context.videoInfo.bvid);
+            if (!result) alert('当前没有可导出的时间轴字幕');
+            return result;
+          });
         }, '导出当前拿到的原始时间轴字幕');
       }
     },
