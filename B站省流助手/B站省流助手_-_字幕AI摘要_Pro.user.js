@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站省流助手 - 字幕AI摘要 Pro
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      5.0.1
+// @version      5.0.2
 // @description  自动提取B站视频字幕，通过自定义AI API生成极简摘要，支持模型切换、持续对话和评论区总结；支持自动解析开关、自动获取模型列表、flomo自动加标签、总结生图和API兜底功能
 // @author       次元饺子
 // @match        https://www.bilibili.com/video/*
@@ -3191,10 +3191,10 @@
       out.push(listType === 'ol' ? '</ol>' : '</ul>');
       listType = '';
     }
-    function startList(type) {
+    function startList(type, startNumber) {
       if (listType === type) return;
       closeList();
-      out.push(type === 'ol' ? '<ol class="md-ol">' : '<ul class="md-ul">');
+      out.push(type === 'ol' ? '<ol class="md-ol"' + (startNumber !== 1 ? ' start="' + startNumber + '"' : '') + '>' : '<ul class="md-ul">');
       listType = type;
     }
 
@@ -3272,11 +3272,11 @@
         out.push('<li class="md-li">' + parseMarkdownInline(ul[1]) + '</li>');
         continue;
       }
-      const ol = trimmed.match(/^\d+\.\s+(.+)$/);
+      const ol = trimmed.match(/^(\d+)\.\s+(.+)$/);
       if (ol) {
         flushParagraph();
-        startList('ol');
-        out.push('<li class="md-li-ol">' + parseMarkdownInline(ol[1]) + '</li>');
+        startList('ol', Number(ol[1]));
+        out.push('<li class="md-li-ol">' + parseMarkdownInline(ol[2]) + '</li>');
         continue;
       }
 

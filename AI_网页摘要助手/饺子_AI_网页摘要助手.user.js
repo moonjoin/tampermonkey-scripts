@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         饺子 AI 网页摘要助手
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      3.0.1
+// @version      3.0.2
 // @description  指定网站自动弹出 AI 网页摘要，支持连续对话、多预设、多模板、SPA路由、摘要生图、flomo、坚果云双文件云同步。Shadow DOM 隔离样式。
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
@@ -227,15 +227,16 @@
           continue;
         }
         const ul = line.match(/^(\s*)[-*+]\s+(.*)$/);
-        const ol = line.match(/^(\s*)\d+\.\s+(.*)$/);
+        const ol = line.match(/^(\s*)(\d+)\.\s+(.*)$/);
         if (ul || ol) {
           const m = ul || ol;
           const type = ul ? 'ul' : 'ol';
           const indent = m[1].length;
-          const content = m[2];
+          const content = ul ? m[2] : m[3];
+          const startNumber = ol ? Number(m[2]) : 1;
           while (listStack.length && listStack[listStack.length - 1].indent > indent) html += '</li></' + listStack.pop().type + '>';
           if (listStack.length && listStack[listStack.length - 1].indent === indent && listStack[listStack.length - 1].type !== type) html += '</li></' + listStack.pop().type + '>';
-          if (!listStack.length || listStack[listStack.length - 1].indent < indent) { html += '<' + type + '><li>'; listStack.push({ type: type, indent: indent }); }
+          if (!listStack.length || listStack[listStack.length - 1].indent < indent) { html += '<' + type + (type === 'ol' && startNumber !== 1 ? ' start="' + startNumber + '"' : '') + '><li>'; listStack.push({ type: type, indent: indent }); }
           else html += '</li><li>';
           html += renderInline(content);
           i++; continue;

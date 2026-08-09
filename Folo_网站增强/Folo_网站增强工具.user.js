@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Folo 网站增强工具
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      14.0.5
+// @version      14.0.6
 // @description  Folo 增强：Jina Reader + Readability + 启发式三级抓取 + AI 总结 + 自动总结 + 手动列表全量预加载 + 后续对话 + 多配置管理 + 坚果云 WebDAV 同步 + 复制对话 + 保存到 flomo
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
@@ -217,15 +217,16 @@
                     continue;
                 }
                 const ul = line.match(/^(\s*)[-*+]\s+(.*)$/);
-                const ol = line.match(/^(\s*)\d+\.\s+(.*)$/);
+                const ol = line.match(/^(\s*)(\d+)\.\s+(.*)$/);
                 if (ul || ol) {
                     const m = ul || ol;
                     const type = ul ? 'ul' : 'ol';
                     const indent = m[1].length;
-                    const content = m[2];
+                    const content = ul ? m[2] : m[3];
+                    const startNumber = ol ? Number(m[2]) : 1;
                     while (listStack.length && listStack[listStack.length - 1].indent > indent) html += '</li></' + listStack.pop().type + '>';
                     if (listStack.length && listStack[listStack.length - 1].indent === indent && listStack[listStack.length - 1].type !== type) html += '</li></' + listStack.pop().type + '>';
-                    if (!listStack.length || listStack[listStack.length - 1].indent < indent) { html += '<' + type + '><li>'; listStack.push({ type: type, indent: indent }); }
+                    if (!listStack.length || listStack[listStack.length - 1].indent < indent) { html += '<' + type + (type === 'ol' && startNumber !== 1 ? ' start="' + startNumber + '"' : '') + '><li>'; listStack.push({ type: type, indent: indent }); }
                     else html += '</li><li>';
                     html += renderInline(content);
                     i++; continue;

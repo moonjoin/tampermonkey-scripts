@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name        网页浏览记录助手
 // @namespace   https://github.com/moonjoin/tampermonkey-scripts
-// @version     2.0.1
+// @version     2.0.2
 // @description  浏览记录自动存储 + AI 浏览行为分析 + 用户画像生成，支持坚果云增量云同步（和饺子AI网页摘要助手+Folo网站增强工具数据互通）
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
@@ -272,12 +272,13 @@
           continue;
         }
         const ul = line.match(/^(\s*)[-*+]\s+(.*)$/);
-        const ol = line.match(/^(\s*)\d+\.\s+(.*)$/);
+        const ol = line.match(/^(\s*)(\d+)\.\s+(.*)$/);
         if (ul || ol) {
-          const m = ul || ol; const type = ul ? 'ul' : 'ol'; const indent = m[1].length; const content = m[2];
+          const m = ul || ol; const type = ul ? 'ul' : 'ol'; const indent = m[1].length;
+          const content = ul ? m[2] : m[3]; const startNumber = ol ? Number(m[2]) : 1;
           while (listStack.length && listStack[listStack.length - 1].indent > indent) html += '</li></' + listStack.pop().type + '>';
           if (listStack.length && listStack[listStack.length - 1].indent === indent && listStack[listStack.length - 1].type !== type) html += '</li></' + listStack.pop().type + '>';
-          if (!listStack.length || listStack[listStack.length - 1].indent < indent) { html += '<' + type + '><li>'; listStack.push({ type, indent }); }
+          if (!listStack.length || listStack[listStack.length - 1].indent < indent) { html += '<' + type + (type === 'ol' && startNumber !== 1 ? ' start="' + startNumber + '"' : '') + '><li>'; listStack.push({ type, indent }); }
           else html += '</li><li>';
           html += renderInline(content); i++; continue;
         }
