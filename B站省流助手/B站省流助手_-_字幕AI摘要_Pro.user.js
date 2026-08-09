@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站省流助手 - 字幕AI摘要 Pro
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      5.0.2
+// @version      5.0.3
 // @description  自动提取B站视频字幕，通过自定义AI API生成极简摘要，支持模型切换、持续对话和评论区总结；支持自动解析开关、自动获取模型列表、flomo自动加标签、总结生图和API兜底功能
 // @author       次元饺子
 // @match        https://www.bilibili.com/video/*
@@ -3148,7 +3148,7 @@
     return plain.trim();
   }
 
-  function parseMarkdownInline(raw) {
+  function parseMarkdownInlineLegacy(raw) {
     const codeParts = [];
     const linkParts = [];
     let source = String(raw || '').replace(/`([^`]+)`/g, function(match, code) {
@@ -3173,7 +3173,7 @@
     return html;
   }
 
-  function parseMarkdown(text) {
+  function parseMarkdownLegacy(text) {
     const lines = String(text || '').replace(/\r/g, '').split('\n');
     const out = [];
     let paragraph = [];
@@ -3183,7 +3183,7 @@
 
     function flushParagraph() {
       if (!paragraph.length) return;
-      out.push('<p class="md-p">' + paragraph.map(parseMarkdownInline).join('<br>') + '</p>');
+      out.push('<p class="md-p">' + paragraph.map(parseMarkdownInlineLegacy).join('<br>') + '</p>');
       paragraph = [];
     }
     function closeList() {
@@ -3235,9 +3235,9 @@
           i++;
         }
         i--;
-        let table = '<table class="md-table"><thead><tr>' + headerCells.map(c => '<th>' + parseMarkdownInline(c) + '</th>').join('') + '</tr></thead><tbody>';
+        let table = '<table class="md-table"><thead><tr>' + headerCells.map(c => '<th>' + parseMarkdownInlineLegacy(c) + '</th>').join('') + '</tr></thead><tbody>';
         rows.forEach(row => {
-          table += '<tr>' + row.map(c => '<td>' + parseMarkdownInline(c) + '</td>').join('') + '</tr>';
+          table += '<tr>' + row.map(c => '<td>' + parseMarkdownInlineLegacy(c) + '</td>').join('') + '</tr>';
         });
         table += '</tbody></table>';
         out.push(table);
@@ -3249,7 +3249,7 @@
         flushParagraph();
         closeList();
         const level = heading[1].length;
-        out.push('<h' + level + ' class="md-h' + level + '">' + parseMarkdownInline(heading[2]) + '</h' + level + '>');
+        out.push('<h' + level + ' class="md-h' + level + '">' + parseMarkdownInlineLegacy(heading[2]) + '</h' + level + '>');
         continue;
       }
       if (/^---+$/.test(trimmed)) {
@@ -3261,7 +3261,7 @@
       if (/^>\s+/.test(trimmed)) {
         flushParagraph();
         closeList();
-        out.push('<blockquote class="md-quote">' + parseMarkdownInline(trimmed.replace(/^>\s+/, '')) + '</blockquote>');
+        out.push('<blockquote class="md-quote">' + parseMarkdownInlineLegacy(trimmed.replace(/^>\s+/, '')) + '</blockquote>');
         continue;
       }
 
@@ -3269,14 +3269,14 @@
       if (ul) {
         flushParagraph();
         startList('ul');
-        out.push('<li class="md-li">' + parseMarkdownInline(ul[1]) + '</li>');
+        out.push('<li class="md-li">' + parseMarkdownInlineLegacy(ul[1]) + '</li>');
         continue;
       }
       const ol = trimmed.match(/^(\d+)\.\s+(.+)$/);
       if (ol) {
         flushParagraph();
         startList('ol', Number(ol[1]));
-        out.push('<li class="md-li-ol">' + parseMarkdownInline(ol[2]) + '</li>');
+        out.push('<li class="md-li-ol">' + parseMarkdownInlineLegacy(ol[2]) + '</li>');
         continue;
       }
 
@@ -3288,6 +3288,139 @@
     closeList();
     return out.join('\n');
   }
+
+  const parseMarkdown = (function() {
+    function safeImageSrc(raw) {
+      const value = String(raw || '').trim();
+      const compact = value.replace(/[\u0000-\u0020\u007f]+/g, '');
+      if (/^(https?:\/\/|\/|\.\.?\/)/i.test(compact)) return escapeAttr(value);
+      if (/^data:image\/(?:png|jpe?g|gif|webp);base64,/i.test(compact)) return escapeAttr(value);
+      return '#';
+    }
+    function findClosing(text, start, open, close) {
+      let depth = 1;
+      for (let i = start; i < text.length; i++) {
+        if (text[i] === '\\') { i++; continue; }
+        if (text[i] === open) depth++;
+        else if (text[i] === close && --depth === 0) return i;
+      }
+      return -1;
+    }
+    function inline(text) {
+      const tokens = [];
+      const token = html => { const id = '\u0000MD' + tokens.length + '\u0000'; tokens.push(html); return id; };
+      let source = String(text || '').replace(/`([^`\n]+?)`/g, (_, code) => token('<code class="md-code">' + escapeHtml(code) + '</code>'));
+      let linked = '', cursor = 0;
+      while (cursor < source.length) {
+        let start = source.indexOf('[', cursor), image = false;
+        const imageStart = source.indexOf('![', cursor);
+        if (imageStart >= 0 && (start < 0 || imageStart <= start)) { start = imageStart; image = true; }
+        if (start < 0) { linked += source.slice(cursor); break; }
+        linked += source.slice(cursor, start);
+        const labelStart = start + (image ? 2 : 1);
+        const labelEnd = findClosing(source, labelStart, '[', ']');
+        if (labelEnd < 0 || source[labelEnd + 1] !== '(') { linked += source.slice(start, labelStart); cursor = labelStart; continue; }
+        const targetEnd = findClosing(source, labelEnd + 2, '(', ')');
+        if (targetEnd < 0) { linked += source.slice(start, labelStart); cursor = labelStart; continue; }
+        const label = source.slice(labelStart, labelEnd).replace(/\\([\[\]])/g, '$1');
+        const targetRaw = source.slice(labelEnd + 2, targetEnd).trim();
+        const target = targetRaw.replace(/\s+(?:"[^"]*"|'[^']*')\s*$/, '').trim();
+        linked += image
+          ? token('<img src="' + safeImageSrc(target) + '" alt="' + escapeAttr(label) + '" style="max-width:100%;border-radius:6px">')
+          : token('<a class="md-link" href="' + safeHref(target) + '" target="_blank" rel="noopener noreferrer">' + escapeHtml(label) + '</a>');
+        cursor = targetEnd + 1;
+      }
+      source = linked.replace(/\\([\\`*_[\]{}()#+\-.!|>])/g, (_, ch) => token(escapeHtml(ch)));
+      let html = escapeHtml(source);
+      html = html.replace(/\*\*([^\*]+?)\*\*/g, '<strong class="md-bold">$1</strong>');
+      html = html.replace(/__([^_]+?)__/g, '<strong class="md-bold">$1</strong>');
+      html = html.replace(/(^|[^\*])\*([^\*\n]+?)\*(?!\*)/g, '$1<em class="md-em">$2</em>');
+      html = html.replace(/(^|[^_])_([^_\n]+?)_(?!_)/g, '$1<em class="md-em">$2</em>');
+      html = html.replace(/~~([^~]+?)~~/g, '<s>$1</s>');
+      html = html.replace(/(^|[\s>])(https?:\/\/[^\s<]+)/g, (_, lead, url) => lead + '<a class="md-link" href="' + safeHref(url) + '" target="_blank" rel="noopener noreferrer">' + url + '</a>');
+      return html.replace(/\u0000MD(\d+)\u0000/g, (_, idx) => tokens[Number(idx)] || '');
+    }
+    function tableRow(line) {
+      let s = line.trim();
+      if (s.startsWith('|')) s = s.slice(1);
+      if (s.endsWith('|')) s = s.slice(0, -1);
+      const cells = []; let buf = '', inCode = false;
+      for (let i = 0; i < s.length; i++) {
+        const ch = s[i];
+        if (ch === '\\' && s[i + 1] === '|') { buf += '|'; i++; continue; }
+        if (ch === '`') { inCode = !inCode; buf += ch; continue; }
+        if (ch === '|' && !inCode) { cells.push(buf.trim()); buf = ''; continue; }
+        buf += ch;
+      }
+      cells.push(buf.trim());
+      return cells;
+    }
+    function tableSeparator(line) {
+      const cells = tableRow(line);
+      return /\|/.test(line) && cells.length > 0 && cells.every(cell => /^:?-{1,}:?$/.test(cell));
+    }
+    return function(md) {
+      if (!md) return '';
+      const lines = String(md).replace(/\r\n?/g, '\n').split('\n');
+      let html = '', i = 0, inCode = false, codeLang = '', codeLines = [], listStack = [];
+      const closeLists = () => { while (listStack.length) html += '</li></' + listStack.pop().type + '>'; };
+      while (i < lines.length) {
+        const line = lines[i];
+        const fence = line.match(/^```\s*([^\s`]*)[^`]*$/);
+        if (fence) {
+          if (!inCode) { closeLists(); inCode = true; codeLang = fence[1] || ''; codeLines = []; }
+          else { html += '<pre class="md-pre"><code' + (codeLang ? ' class="language-' + escapeAttr(codeLang) + '"' : '') + '>' + escapeHtml(codeLines.join('\n')) + '</code></pre>'; inCode = false; codeLang = ''; }
+          i++; continue;
+        }
+        if (inCode) { codeLines.push(line); i++; continue; }
+        if (/^\s*$/.test(line)) {
+          let next = i + 1;
+          while (next < lines.length && /^\s*$/.test(lines[next])) next++;
+          if (listStack.length && next < lines.length && (/^\s+\S/.test(lines[next]) || /^(\s*)(?:[-*+]|\d+\.)\s+/.test(lines[next]))) { i++; continue; }
+          closeLists(); i++; continue;
+        }
+        if (/\|/.test(line) && i + 1 < lines.length && tableSeparator(lines[i + 1])) {
+          closeLists();
+          const headers = tableRow(line), separators = tableRow(lines[i + 1]);
+          const aligns = separators.map(cell => cell.startsWith(':') && cell.endsWith(':') ? 'center' : cell.endsWith(':') ? 'right' : cell.startsWith(':') ? 'left' : '');
+          i += 2; const rows = [];
+          while (i < lines.length && /\|/.test(lines[i]) && !/^\s*$/.test(lines[i])) rows.push(tableRow(lines[i++]));
+          html += '<div class="md-table-wrap"><table class="md-table"><thead><tr>' + headers.map((cell, col) => '<th' + (aligns[col] ? ' style="text-align:' + aligns[col] + '"' : '') + '>' + inline(cell) + '</th>').join('') + '</tr></thead><tbody>';
+          rows.forEach(row => { html += '<tr>' + headers.map((_, col) => '<td' + (aligns[col] ? ' style="text-align:' + aligns[col] + '"' : '') + '>' + inline(row[col] || '') + '</td>').join('') + '</tr>'; });
+          html += '</tbody></table></div>'; continue;
+        }
+        const heading = line.match(/^(#{1,6})\s+(.*)$/);
+        if (heading) { closeLists(); const level = heading[1].length; html += '<h' + level + ' class="md-h' + level + '">' + inline(heading[2]) + '</h' + level + '>'; i++; continue; }
+        if (/^\s*([-*_])\s*\1\s*\1[-*_\s]*$/.test(line)) { closeLists(); html += '<hr class="md-hr">'; i++; continue; }
+        if (/^\s*>\s?/.test(line)) {
+          closeLists(); const quoted = [];
+          while (i < lines.length && /^\s*>\s?/.test(lines[i])) quoted.push(lines[i++].replace(/^\s*>\s?/, ''));
+          html += '<blockquote class="md-quote">' + parseMarkdown(quoted.join('\n')) + '</blockquote>'; continue;
+        }
+        const ul = line.match(/^(\s*)[-*+]\s+(.*)$/), ol = line.match(/^(\s*)(\d+)\.\s+(.*)$/);
+        if (ul || ol) {
+          const match = ul || ol, type = ul ? 'ul' : 'ol', indent = match[1].length;
+          const content = ul ? match[2] : match[3], start = ol ? Number(match[2]) : 1;
+          while (listStack.length && listStack[listStack.length - 1].indent > indent) html += '</li></' + listStack.pop().type + '>';
+          if (listStack.length && listStack[listStack.length - 1].indent === indent && listStack[listStack.length - 1].type !== type) html += '</li></' + listStack.pop().type + '>';
+          if (!listStack.length || listStack[listStack.length - 1].indent < indent) { html += '<' + type + ' class="md-' + type + '"' + (type === 'ol' && start !== 1 ? ' start="' + start + '"' : '') + '><li class="md-li">'; listStack.push({ type, indent }); }
+          else html += '</li><li class="md-li">';
+          const task = content.match(/^\[([ xX])\]\s+(.*)$/);
+          html += task ? '<input type="checkbox" disabled' + (/x/i.test(task[1]) ? ' checked' : '') + '> ' + inline(task[2]) : inline(content);
+          i++; continue;
+        }
+        if (listStack.length && /^\s+\S/.test(line)) { html += '<br>' + inline(line.trim()); i++; continue; }
+        closeLists(); const paragraph = [line]; i++;
+        while (i < lines.length && !/^\s*$/.test(lines[i]) && !/^```/.test(lines[i]) && !/^#{1,6}\s+/.test(lines[i]) && !/^\s*>\s?/.test(lines[i]) && !/^(\s*)(?:[-*+]|\d+\.)\s+/.test(lines[i])) {
+          if (/\|/.test(lines[i]) && i + 1 < lines.length && tableSeparator(lines[i + 1])) break;
+          paragraph.push(lines[i++]);
+        }
+        html += '<p class="md-p">' + inline(paragraph.join(' ').trim()) + '</p>';
+      }
+      if (inCode) html += '<pre class="md-pre"><code>' + escapeHtml(codeLines.join('\n')) + '</code></pre>';
+      closeLists(); return html;
+    };
+  })();
 
   // ==================== UI 样式 ====================
   function createStyles() {
@@ -4933,8 +5066,8 @@
     const href = String(raw || '').trim();
     if (!href) return '#';
     const normalized = href.replace(/[\u0000-\u001F\u007F\s]+/g, '').toLowerCase();
-    if (/^(javascript|data|vbscript):/.test(normalized)) return '#';
-    return escapeAttr(href);
+    if (/^(https?:\/\/|mailto:|\/|\.\.?\/|#)/i.test(normalized)) return escapeAttr(href);
+    return '#';
   }
 
   function renderVideoMetaBottomHtml(videoInfo, url) {

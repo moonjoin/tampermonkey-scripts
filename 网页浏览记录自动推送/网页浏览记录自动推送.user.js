@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name        网页浏览记录助手
 // @namespace   https://github.com/moonjoin/tampermonkey-scripts
-// @version     2.0.2
+// @version     2.0.3
 // @description  浏览记录自动存储 + AI 浏览行为分析 + 用户画像生成，支持坚果云增量云同步（和饺子AI网页摘要助手+Folo网站增强工具数据互通）
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
@@ -182,29 +182,76 @@
    ******************************************************************/
   const _md = (function () {
     function escapeHtml(str) {
-      return String(str).replace(/&/g, '&').replace(/</g, '<').replace(/>/g, '>').replace(/"/g, '"').replace(/'/g, '&#39;');
+      return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    }
+    function escapeAttr(str) { return escapeHtml(str); }
+    function safeUrl(raw, image) {
+      const value = String(raw || '').trim();
+      const compact = value.replace(/[\u0000-\u0020\u007f]+/g, '');
+      if (/^(https?:\/\/|\/|\.\.?\/|#)/i.test(compact)) return escapeAttr(value);
+      if (image && /^data:image\/(?:png|jpe?g|gif|webp);base64,/i.test(compact)) return escapeAttr(value);
+      if (!image && /^mailto:/i.test(compact)) return escapeAttr(value);
+      return '#';
+    }
+    function findClosing(text, start, open, close) {
+      let depth = 1;
+      for (let i = start; i < text.length; i++) {
+        if (text[i] === '\\') { i++; continue; }
+        if (text[i] === open) depth++;
+        else if (text[i] === close && --depth === 0) return i;
+      }
+      return -1;
     }
     function renderInline(text) {
-      let s = escapeHtml(text);
-      s = s.replace(/`([^`]+?)`/g, '<code>$1</code>');
-      s = s.replace(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g, '<img src="$2" alt="$1" style="max-width:100%;border-radius:6px">');
-      s = s.replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+      const tokens = [];
+      function token(html) { const id = '\u0000MD' + tokens.length + '\u0000'; tokens.push(html); return id; }
+      let source = String(text || '').replace(/`([^`\n]+?)`/g, (_, code) => token('<code>' + escapeHtml(code) + '</code>'));
+      let linked = '', cursor = 0;
+      while (cursor < source.length) {
+        let start = source.indexOf('[', cursor), image = false;
+        const imageStart = source.indexOf('![', cursor);
+        if (imageStart >= 0 && (start < 0 || imageStart <= start)) { start = imageStart; image = true; }
+        if (start < 0) { linked += source.slice(cursor); break; }
+        linked += source.slice(cursor, start);
+        const labelStart = start + (image ? 2 : 1);
+        const labelEnd = findClosing(source, labelStart, '[', ']');
+        if (labelEnd < 0 || source[labelEnd + 1] !== '(') { linked += source.slice(start, labelStart); cursor = labelStart; continue; }
+        const targetEnd = findClosing(source, labelEnd + 2, '(', ')');
+        if (targetEnd < 0) { linked += source.slice(start, labelStart); cursor = labelStart; continue; }
+        const label = source.slice(labelStart, labelEnd).replace(/\\([\[\]])/g, '$1');
+        const targetRaw = source.slice(labelEnd + 2, targetEnd).trim();
+        const target = targetRaw.replace(/\s+(?:"[^"]*"|'[^']*')\s*$/, '').trim();
+        linked += image
+          ? token('<img src="' + safeUrl(target, true) + '" alt="' + escapeAttr(label) + '" style="max-width:100%;border-radius:6px">')
+          : token('<a href="' + safeUrl(target, false) + '" target="_blank" rel="noopener noreferrer">' + escapeHtml(label) + '</a>');
+        cursor = targetEnd + 1;
+      }
+      source = linked;
+      source = source.replace(/\\([\\`*_[\]{}()#+\-.!|>])/g, (_, ch) => token(escapeHtml(ch)));
+      let s = escapeHtml(source);
       s = s.replace(/\*\*([^\*]+?)\*\*/g, '<strong>$1</strong>');
       s = s.replace(/__([^_]+?)__/g, '<strong>$1</strong>');
       s = s.replace(/(^|[^\*])\*([^\*\n]+?)\*(?!\*)/g, '$1<em>$2</em>');
       s = s.replace(/(^|[^_])_([^_\n]+?)_(?!_)/g, '$1<em>$2</em>');
       s = s.replace(/~~([^~]+?)~~/g, '<s>$1</s>');
+      s = s.replace(/(^|[\s>])(https?:\/\/[^\s<]+)/g, (_, lead, url) => {
+        let tail = '';
+        while (/[.,!?;:]$/.test(url)) { tail = url.slice(-1) + tail; url = url.slice(0, -1); }
+        return lead + '<a href="' + safeUrl(url, false) + '" target="_blank" rel="noopener noreferrer">' + url + '</a>' + tail;
+      });
+      s = s.replace(/\u0000MD(\d+)\u0000/g, (_, idx) => tokens[Number(idx)] || '');
       return s;
     }
     function parseTableRow(line) {
       let s = line.trim();
       if (s.startsWith('|')) s = s.slice(1);
       if (s.endsWith('|')) s = s.slice(0, -1);
-      const cells = []; let buf = '';
+      const cells = []; let buf = '', inCode = false;
       for (let i = 0; i < s.length; i++) {
         const ch = s[i];
         if (ch === '\\' && s[i + 1] === '|') { buf += '|'; i++; continue; }
-        if (ch === '|') { cells.push(buf.trim()); buf = ''; continue; }
+        if (ch === '`') { inCode = !inCode; buf += ch; continue; }
+        if (ch === '|' && !inCode) { cells.push(buf.trim()); buf = ''; continue; }
         buf += ch;
       }
       cells.push(buf.trim());
@@ -234,14 +281,19 @@
       function closeAllLists() { while (listStack.length) html += '</li></' + listStack.pop().type + '>'; }
       while (i < lines.length) {
         const line = lines[i];
-        const fence = line.match(/^```(\w*)\s*$/);
+        const fence = line.match(/^```\s*([^\s`]*)[^`]*$/);
         if (fence) {
           if (!inCode) { closeAllLists(); inCode = true; codeLang = fence[1] || ''; codeBuf = []; }
           else { html += '<pre><code' + (codeLang ? ' class="language-' + escapeHtml(codeLang) + '"' : '') + '>' + escapeHtml(codeBuf.join('\n')) + '</code></pre>'; inCode = false; codeLang = ''; codeBuf = []; }
           i++; continue;
         }
         if (inCode) { codeBuf.push(line); i++; continue; }
-        if (/^\s*$/.test(line)) { closeAllLists(); i++; continue; }
+        if (/^\s*$/.test(line)) {
+          let next = i + 1;
+          while (next < lines.length && /^\s*$/.test(lines[next])) next++;
+          if (listStack.length && next < lines.length && (/^\s+\S/.test(lines[next]) || /^(\s*)(?:[-*+]|\d+\.)\s+/.test(lines[next]))) { i++; continue; }
+          closeAllLists(); i++; continue;
+        }
         if (/\|/.test(line) && i + 1 < lines.length && isTableSeparator(lines[i + 1])) {
           closeAllLists();
           const headers = parseTableRow(line);
@@ -280,8 +332,11 @@
           if (listStack.length && listStack[listStack.length - 1].indent === indent && listStack[listStack.length - 1].type !== type) html += '</li></' + listStack.pop().type + '>';
           if (!listStack.length || listStack[listStack.length - 1].indent < indent) { html += '<' + type + (type === 'ol' && startNumber !== 1 ? ' start="' + startNumber + '"' : '') + '><li>'; listStack.push({ type, indent }); }
           else html += '</li><li>';
-          html += renderInline(content); i++; continue;
+          const task = content.match(/^\[([ xX])\]\s+(.*)$/);
+          html += task ? '<input type="checkbox" disabled' + (/x/i.test(task[1]) ? ' checked' : '') + '> ' + renderInline(task[2]) : renderInline(content);
+          i++; continue;
         }
+        if (listStack.length && /^\s+\S/.test(line)) { html += '<br>' + renderInline(line.trim()); i++; continue; }
         closeAllLists();
         let pBuf = [line]; i++;
         while (i < lines.length && !/^\s*$/.test(lines[i]) && !/^```/.test(lines[i]) && !/^#{1,6}\s+/.test(lines[i]) && !/^\s*>\s?/.test(lines[i]) && !/^(\s*)[-*+]\s+/.test(lines[i]) && !/^(\s*)\d+\.\s+/.test(lines[i])) {
@@ -300,7 +355,7 @@
    * 2. 工具函数
    ******************************************************************/
   function makeId(prefix) { return (prefix || 'id') + '_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 7); }
-  function escapeAttr(v) { return String(v ?? '').replace(/&/g, '&').replace(/"/g, '"').replace(/</g, '<').replace(/>/g, '>'); }
+  function escapeAttr(v) { return String(v ?? '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
   function buildModelsUrl(apiUrl) {
     if (apiUrl.includes('/chat/completions')) return apiUrl.replace(/\/chat\/completions.*$/, '/models');
     if (apiUrl.endsWith('/')) return apiUrl + 'models';
