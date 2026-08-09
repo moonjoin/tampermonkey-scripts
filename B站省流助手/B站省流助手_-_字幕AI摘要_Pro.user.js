@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站省流助手 - 字幕AI摘要 Pro
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      5.0.4
+// @version      5.0.5
 // @description  自动提取B站视频字幕，通过自定义AI API生成极简摘要，支持模型切换、持续对话和评论区总结；支持自动解析开关、自动获取模型列表、flomo自动加标签、总结生图和API兜底功能
 // @author       次元饺子
 // @match        https://www.bilibili.com/video/*
@@ -2315,10 +2315,10 @@
   }
 
   function triggerDownload(content, filename, mimeType) {
-    const blob = new Blob([content], { type: mimeType });
+    const downloadFile = new File([content], filename, { type: mimeType });
     function startBrowserFallback() {
       try {
-        const url = URL.createObjectURL(blob);
+        const url = URL.createObjectURL(downloadFile);
         const a = document.createElement('a');
         a.href = url;
         a.download = filename;
@@ -2349,7 +2349,7 @@
       }
       try {
         GM_download({
-          url: blob,
+          url: downloadFile,
           name: filename,
           saveAs: false,
           conflictAction: 'uniquify',
