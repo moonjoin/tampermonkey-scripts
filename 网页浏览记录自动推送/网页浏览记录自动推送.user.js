@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name        网页浏览记录助手
 // @namespace   https://github.com/moonjoin/tampermonkey-scripts
-// @version     2.0.0
+// @version     2.0.1
 // @description  浏览记录自动存储 + AI 浏览行为分析 + 用户画像生成，支持坚果云增量云同步（和饺子AI网页摘要助手+Folo网站增强工具数据互通）
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
@@ -1718,6 +1718,12 @@ ${lines}`;
         }, 300);
       }
     });
+
+    document.addEventListener('pointerdown', e => {
+      if (!panel.classList.contains('show')) return;
+      if (e.target.closest(`#${UI.rootId}, #mpush-rule-overlay`)) return;
+      panel.classList.remove('show');
+    }, true);
 
     root.appendChild(floatBtn); root.appendChild(contextMenu); root.appendChild(panel);
     document.body.appendChild(root); document.body.appendChild(toastNode);

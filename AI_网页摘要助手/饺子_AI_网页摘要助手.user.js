@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         饺子 AI 网页摘要助手
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      3.0.0
+// @version      3.0.1
 // @description  指定网站自动弹出 AI 网页摘要，支持连续对话、多预设、多模板、SPA路由、摘要生图、flomo、坚果云双文件云同步。Shadow DOM 隔离样式。
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
@@ -1225,6 +1225,7 @@
 
   function openImagePreview(imageDataUrl) {
     const overlay = document.createElement('div');
+    overlay.className = 'tabbit-image-preview-overlay';
     overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.85);z-index:2147483647;display:flex;align-items:center;justify-content:center;cursor:zoom-out;';
     const bigImg = document.createElement('img');
     bigImg.src = imageDataUrl;
@@ -2865,6 +2866,19 @@
     renderModelSelect();
   }
 
+  function bindOutsidePanelCollapse() {
+    if (document.documentElement.dataset.tabbitAiOutsideCollapseReady === '1') return;
+    document.documentElement.dataset.tabbitAiOutsideCollapseReady = '1';
+    document.addEventListener('pointerdown', event => {
+      if (!panelEl || panelEl.classList.contains('tabbit-hidden')) return;
+      const path = typeof event.composedPath === 'function' ? event.composedPath() : [];
+      if (shadowHost && path.includes(shadowHost)) return;
+      const target = event.target;
+      if (target && target.closest && target.closest('.tabbit-image-preview-overlay')) return;
+      closePanel();
+    }, true);
+  }
+
   function enablePanelDrag() {
     const handle = panelEl.querySelector('#tabbit-drag-handle');
     let dragging = false, startX = 0, startY = 0, startLeft = 0, startTop = 0;
@@ -2921,6 +2935,7 @@
 
   function openPanel(autoRun) {
     if (!panelEl) createPanel();
+    bindOutsidePanelCollapse();
     panelEl.classList.remove('tabbit-hidden');
     renderModelSelect();
     // 🤫 优先展示静默分析的结果
