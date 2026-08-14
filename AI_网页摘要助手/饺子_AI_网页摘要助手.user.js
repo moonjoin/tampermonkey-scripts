@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         饺子 AI 网页摘要助手
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      3.0.3
+// @version      3.0.4
 // @description  指定网站自动弹出 AI 网页摘要，支持连续对话、多预设、多模板、SPA路由、摘要生图、flomo、坚果云双文件云同步。Shadow DOM 隔离样式。
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
@@ -2384,7 +2384,7 @@
       .tabbit-settings-content {
         background: #fff; color: #222;
         width: 600px; max-width: 96vw; max-height: 90vh; overflow-y: auto;
-        border-radius: 14px; padding: 18px 20px;
+        border-radius: 14px; padding: 16px 18px;
       }
       .tabbit-settings-header {
         display: flex; justify-content: space-between; align-items: center;
@@ -2395,12 +2395,20 @@
         font-weight: 700; margin: 14px 0 6px; color: #5a43c8;
         border-top: 1px dashed #e5e5ea; padding-top: 12px;
       }
+      .tabbit-settings-section-group { margin: 0 0 18px; }
+      .tabbit-settings-group-label {
+        margin: 0 2px 8px;
+        color: #5a43c8;
+        font-size: 12px;
+        font-weight: 800;
+        letter-spacing: .08em;
+      }
       .tabbit-help { display:block; color: #888; font-size: 12px; margin-bottom: 8px; line-height: 1.6; }
       .tabbit-help code {
         background: rgba(139,92,246,.12); padding: 1px 5px;
         border-radius: 3px; font-size: 11px; color: #be185d;
       }
-      .tabbit-field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px; font-size: 13px; }
+      .tabbit-field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px; font-size: 13px; }
       .tabbit-field span { color: #555; font-weight: 600; }
       .tabbit-field input, .tabbit-field textarea, .tabbit-field select {
         border: 1px solid #ddd; border-radius: 8px; padding: 7px 9px; font-size: 13px;
@@ -2464,7 +2472,7 @@
       .tabbit-collapse {
         border: 1px solid #e5e5ea;
         border-radius: 10px;
-        margin-bottom: 10px;
+        margin-bottom: 8px;
         overflow: hidden;
         background: #fff;
       }
@@ -2472,7 +2480,7 @@
         display: flex;
         align-items: center;
         justify-content: space-between;
-        padding: 10px 12px;
+        padding: 9px 12px;
         background: linear-gradient(135deg, rgba(139, 92, 246, .06), rgba(59, 130, 246, .04));
         cursor: pointer;
         user-select: none;
@@ -3599,9 +3607,11 @@
           <button id="tabbit-set-close" class="tabbit-icon-btn" style="background:#eee;color:#333;">×</button>
         </div>
 
+        <section class="tabbit-settings-section-group">
+          <div class="tabbit-settings-group-label">连接与模型</div>
         <div class="tabbit-collapse">
           <div class="tabbit-collapse-header" data-collapse="toggle">
-            <span class="tabbit-collapse-title">📦 API 配置预设</span>
+            <span class="tabbit-collapse-title">🔌 连接与模型</span>
             <span class="tabbit-collapse-arrow">▶</span>
           </div>
           <div class="tabbit-collapse-content">
@@ -3634,38 +3644,21 @@
                 <input id="tabbit-set-max-tokens" type="number" min="100">
               </label>
             </div>
-          </div>
-        </div>
-
-        <div class="tabbit-collapse">
-          <div class="tabbit-collapse-header" data-collapse="toggle">
-            <span class="tabbit-collapse-title">🤖 模型预设</span>
-            <span class="tabbit-collapse-arrow">▶</span>
-          </div>
-          <div class="tabbit-collapse-content">
+            <div class="tabbit-section-title">🤖 模型预设</div>
+            <small class="tabbit-help">模型属于当前连接预设；可分别设置 temperature 和最大输出。</small>
             <div id="tabbit-model-list"></div>
             <div class="tabbit-settings-actions">
               <button id="tabbit-add-model" class="tabbit-secondary-btn" type="button">➕ 添加模型</button>
             </div>
           </div>
         </div>
+        </section>
 
+        <section class="tabbit-settings-section-group">
+          <div class="tabbit-settings-group-label">自动化与显示</div>
         <div class="tabbit-collapse">
           <div class="tabbit-collapse-header" data-collapse="toggle">
-            <span class="tabbit-collapse-title">📝 提示词模板（全局共用）</span>
-            <span class="tabbit-collapse-arrow">▶</span>
-          </div>
-          <div class="tabbit-collapse-content">
-            <div id="tabbit-tpl-list"></div>
-            <div class="tabbit-settings-actions">
-              <button id="tabbit-add-tpl" class="tabbit-secondary-btn" type="button">➕ 添加模板</button>
-            </div>
-          </div>
-        </div>
-
-        <div class="tabbit-collapse">
-          <div class="tabbit-collapse-header" data-collapse="toggle">
-            <span class="tabbit-collapse-title">🌐 网址规则（自动弹出 + 模板绑定）</span>
+            <span class="tabbit-collapse-title">🌐 网址规则</span>
             <span class="tabbit-collapse-arrow">▶</span>
           </div>
           <div class="tabbit-collapse-content">
@@ -3680,7 +3673,7 @@
 
         <div class="tabbit-collapse">
           <div class="tabbit-collapse-header" data-collapse="toggle">
-            <span class="tabbit-collapse-title">🔧 通用参数 + 自动复制</span>
+            <span class="tabbit-collapse-title">⚙️ 自动化与显示</span>
             <span class="tabbit-collapse-arrow">▶</span>
           </div>
           <div class="tabbit-collapse-content">
@@ -3736,6 +3729,30 @@
             <label class="tabbit-field">
               <span><input id="tabbit-set-auto-copy-source" type="checkbox"> 复制时附带出处信息（页面标题 + 链接）</span>
             </label>
+          </div>
+        </div>
+        </section>
+
+        <section class="tabbit-settings-section-group">
+          <div class="tabbit-settings-group-label">内容与集成</div>
+        <div class="tabbit-collapse">
+          <div class="tabbit-collapse-header" data-collapse="toggle">
+            <span class="tabbit-collapse-title">📝 提示词模板</span>
+            <span class="tabbit-collapse-arrow">▶</span>
+          </div>
+          <div class="tabbit-collapse-content">
+            <div id="tabbit-tpl-list"></div>
+            <div class="tabbit-settings-actions">
+              <button id="tabbit-add-tpl" class="tabbit-secondary-btn" type="button">➕ 添加模板</button>
+            </div>
+          </div>
+        </div>
+        <div class="tabbit-collapse">
+          <div class="tabbit-collapse-header" data-collapse="toggle">
+            <span class="tabbit-collapse-title">🌱 Flomo</span>
+            <span class="tabbit-collapse-arrow">▶</span>
+          </div>
+          <div class="tabbit-collapse-content">
             <label class="tabbit-field"><span>flomo API（可选，PRO 会员功能）</span>
               <input id="tabbit-set-flomo-api" type="text" placeholder="https://flomoapp.com/iwh/...">
             </label>
@@ -3745,10 +3762,9 @@
             </label>
           </div>
         </div>
-
         <div class="tabbit-collapse">
           <div class="tabbit-collapse-header" data-collapse="toggle">
-            <span class="tabbit-collapse-title">🖼️ 生图设置</span>
+            <span class="tabbit-collapse-title">🖼️ 生图</span>
             <span class="tabbit-collapse-arrow">▶</span>
           </div>
           <div class="tabbit-collapse-content">
@@ -3793,7 +3809,7 @@
         </div>
         <div class="tabbit-collapse">
           <div class="tabbit-collapse-header" data-collapse="toggle">
-            <span class="tabbit-collapse-title">📎 预加载上下文（MD 文件）</span>
+            <span class="tabbit-collapse-title">📚 预加载上下文</span>
             <span class="tabbit-collapse-arrow">▶</span>
           </div>
           <div class="tabbit-collapse-content">
@@ -3815,12 +3831,14 @@
             </label>
           </div>
         </div>
+        </section>
 
 
-
+        <section class="tabbit-settings-section-group">
+          <div class="tabbit-settings-group-label">高级与维护</div>
         <div class="tabbit-collapse">
           <div class="tabbit-collapse-header" data-collapse="toggle">
-            <span class="tabbit-collapse-title">☁️ 坚果云 WebDAV 云同步</span>
+            <span class="tabbit-collapse-title">🛠️ 坚果云 WebDAV</span>
             <span class="tabbit-collapse-arrow">▶</span>
           </div>
           <div class="tabbit-collapse-content">
@@ -3852,6 +3870,7 @@
             </div>
           </div>
         </div>
+        </section>
 
         <div class="tabbit-modal-footer">
           <button id="tabbit-set-cancel" class="tabbit-secondary-btn">取消</button>
@@ -4267,6 +4286,11 @@
     }
   }
 
+  function extractModelIds(payload) {
+    const list = Array.isArray(payload?.data) ? payload.data : (Array.isArray(payload?.models) ? payload.models : (Array.isArray(payload) ? payload : []));
+    return Array.from(new Set(list.map(item => typeof item === 'string' ? item : (item?.id || item?.model || item?.name)).filter(Boolean).map(String)));
+  }
+
   function fetchModelsFromApi() {
     syncCurrentProfileFromForm();
     const profile = getCurrentProfile();
@@ -4284,7 +4308,7 @@
         try {
           if (res.status < 200 || res.status >= 300) { alert(`获取失败：${res.status}`); return; }
           const data = JSON.parse(res.responseText);
-          const ids = Array.isArray(data?.data) ? data.data.map(x => x.id || x.name || x.model).filter(Boolean) : [];
+          const ids = extractModelIds(data);
           if (!ids.length) { alert('没有从响应中识别到模型列表。'); return; }
           syncModelsFromSettings();
           ids.forEach(id => {

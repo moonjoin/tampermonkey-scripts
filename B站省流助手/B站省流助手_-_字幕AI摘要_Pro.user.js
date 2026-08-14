@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站省流助手 - 字幕AI摘要 Pro
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      5.0.11
+// @version      5.0.14
 // @description  自动提取B站视频字幕，通过自定义AI API生成极简摘要，支持模型切换、持续对话和评论区总结；支持自动解析开关、自动获取模型列表、flomo自动加标签、总结生图和API兜底功能
 // @author       次元饺子
 // @match        https://www.bilibili.com/video/*
@@ -12,7 +12,9 @@
 // @grant        GM_getValue
 // @grant        GM_addValueChangeListener
 // @grant        GM_openInTab
+// @grant        GM_xmlhttpRequest
 // @grant        unsafeWindow
+// @connect      *
 // @license      MIT
 // @downloadURL https://update.greasyfork.org/scripts/574935/B%E7%AB%99%E7%9C%81%E6%B5%81%E5%8A%A9%E6%89%8B%20-%20%E5%AD%97%E5%B9%95AI%E6%91%98%E8%A6%81%20Pro.user.js
 // @updateURL https://update.greasyfork.org/scripts/574935/B%E7%AB%99%E7%9C%81%E6%B5%81%E5%8A%A9%E6%89%8B%20-%20%E5%AD%97%E5%B9%95AI%E6%91%98%E8%A6%81%20Pro.meta.js
@@ -912,6 +914,8 @@
       'gpt-5.4',
       'deepseek-v4-flash',
     ],
+    apiProfiles: [],
+    activeApiProfileId: 'api_profile_default',
     promptText: PROMPT_TEXT,
     commentPromptText: COMMENT_PROMPT_TEXT,
     commentTextPresets: ['省流'],
@@ -966,6 +970,11 @@
       if (raw) {
         const saved = JSON.parse(raw);
         const merged = Object.assign({}, DEFAULT_CONFIG, saved);
+        merged.apiProfiles = normalizeApiProfiles(saved.apiProfiles, merged);
+        if (!merged.apiProfiles.some(function(profile) { return profile.id === merged.activeApiProfileId; })) {
+          merged.activeApiProfileId = merged.apiProfiles[0].id;
+        }
+        applyActiveApiProfile(merged);
         merged.promptPresets = mergeBuiltInPromptPresets(merged.promptPresets);
         merged.resultActionButtons = normalizeResultActionButtons(saved.resultActionButtons);
         return merged;
@@ -974,9 +983,50 @@
       console.warn('[省流助手] 读取配置失败，使用默认配置:', e.message);
     }
     return Object.assign({}, DEFAULT_CONFIG, {
+      apiProfiles: normalizeApiProfiles([], DEFAULT_CONFIG),
       promptPresets: mergeBuiltInPromptPresets(DEFAULT_CONFIG.promptPresets),
       resultActionButtons: normalizeResultActionButtons(undefined)
     });
+  }
+
+  function createApiProfileId() {
+    return 'api_profile_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+  }
+
+  function normalizeApiProfiles(profiles, fallback) {
+    var source = Array.isArray(profiles) ? profiles : [];
+    var normalized = source.map(function(profile, index) {
+      if (!profile || typeof profile !== 'object') return null;
+      var models = Array.isArray(profile.modelList) ? profile.modelList.map(String).filter(Boolean) : [];
+      return {
+        id: String(profile.id || createApiProfileId()),
+        name: String(profile.name || ('配置 ' + (index + 1))),
+        apiUrl: String(profile.apiUrl || ''),
+        apiKey: String(profile.apiKey || ''),
+        model: String(profile.model || models[0] || ''),
+        modelList: models
+      };
+    }).filter(Boolean);
+    if (normalized.length) return normalized;
+    return [{
+      id: 'api_profile_default',
+      name: '默认配置',
+      apiUrl: String(fallback.apiUrl || ''),
+      apiKey: String(fallback.apiKey || ''),
+      model: String(fallback.model || ''),
+      modelList: Array.isArray(fallback.modelList) ? fallback.modelList.slice() : []
+    }];
+  }
+
+  function applyActiveApiProfile(config) {
+    var profiles = Array.isArray(config.apiProfiles) ? config.apiProfiles : [];
+    var active = profiles.find(function(profile) { return profile.id === config.activeApiProfileId; }) || profiles[0];
+    if (!active) return;
+    config.activeApiProfileId = active.id;
+    config.apiUrl = active.apiUrl;
+    config.apiKey = active.apiKey;
+    config.model = active.model;
+    config.modelList = active.modelList.slice();
   }
 
   function saveConfig(cfg) {
@@ -4303,6 +4353,15 @@
       .tabbit-collapse-body .tabbit-settings-group:last-child {
         margin-bottom: 0;
       }
+      .tabbit-settings-subsection-title {
+        margin: 14px 0 10px;
+        padding-bottom: 7px;
+        border-bottom: 1px solid #ececf2;
+        color: #4f5360;
+        font-size: 13px;
+        font-weight: 700;
+      }
+      .tabbit-settings-subsection-title:first-child { margin-top: 0; }
       .tabbit-settings-label {
         font-size: 12px;
         font-weight: 600;
@@ -4324,6 +4383,17 @@
         color: #333;
       }
       .tabbit-settings-input:focus { border-color: #667eea; }
+      .tabbit-api-profile-help { margin-bottom: 10px; }
+      .tabbit-api-profile-row { display: grid; grid-template-columns: minmax(190px, 1fr) auto auto auto auto; gap: 8px; align-items: center; margin-bottom: 14px; }
+      .tabbit-api-profile-row .tabbit-settings-input { min-width: 0; }
+      .tabbit-api-profile-btn { height: 38px; padding: 0 14px; border: 1px solid #dedee8; border-radius: 9px; background: #f7f7fa; color: #444; cursor: pointer; white-space: nowrap; font: inherit; }
+      .tabbit-api-profile-btn:hover { border-color: #667eea; color: #5368dd; background: #f5f7ff; }
+      .tabbit-api-profile-btn-danger { color: #d9534f; border-color: #f2b8b5; background: #fff4f3; }
+      .tabbit-api-test-row { display: flex; gap: 10px; flex-wrap: wrap; margin: 2px 0 14px; }
+      @media (max-width: 720px) {
+        .tabbit-api-profile-row { grid-template-columns: 1fr 1fr; }
+        .tabbit-api-profile-row select { grid-column: 1 / -1; }
+      }
       .tabbit-settings-textarea {
         width: 100%;
         padding: 9px 12px;
@@ -6289,25 +6359,129 @@
     return body;
   }
 
+  function gmRequest(options) {
+    return new Promise(function(resolve, reject) {
+      var request = GM_xmlhttpRequest(Object.assign({}, options, {
+        timeout: options.timeout || 120000,
+        onload: resolve,
+        onerror: function(error) { reject(new Error('网络请求失败: ' + (error && error.error ? error.error : 'GM_xmlhttpRequest error'))); },
+        ontimeout: function() { reject(new Error('API 请求超时')); },
+        onabort: function() {
+          var error = new Error('用户已打断');
+          error.name = 'AbortError';
+          reject(error);
+        }
+      }));
+      if (options.signal) {
+        var abort = function() { try { request.abort(); } catch (e) {} };
+        if (options.signal.aborted) abort();
+        else options.signal.addEventListener('abort', abort, { once: true });
+      }
+    });
+  }
+
+  function callAIStreamWithGM(apiUrl, apiKey, model, messages, onDelta, options) {
+    return new Promise(function(resolve, reject) {
+      var fullText = '';
+      var receivedLength = 0;
+      var buffer = '';
+      var finishReason = '';
+      var settled = false;
+      var signal = options.signal;
+      var lengthErrorMessage = options.lengthErrorMessage;
+
+      function consume(text, flush) {
+        buffer += text;
+        var lines = buffer.split(/\r?\n/);
+        buffer = flush ? '' : (lines.pop() || '');
+        lines.forEach(function(line) {
+          var trimmed = line.trim();
+          if (!trimmed || !trimmed.startsWith('data:')) return;
+          var payload = trimmed.slice(5).trim();
+          if (!payload || payload === '[DONE]') return;
+          try {
+            var json = JSON.parse(payload);
+            var choice = json.choices && json.choices[0];
+            if (choice && choice.finish_reason) finishReason = choice.finish_reason;
+            var delta = choice && ((choice.delta && choice.delta.content) || (choice.message && choice.message.content)) || '';
+            if (delta) {
+              fullText += delta;
+              if (typeof onDelta === 'function') onDelta(fullText, delta);
+            }
+          } catch (e) {}
+        });
+      }
+
+      var request = GM_xmlhttpRequest({
+        method: 'POST',
+        url: apiUrl,
+        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + apiKey, 'Accept': 'text/event-stream' },
+        data: JSON.stringify(buildReqBody(model, messages, { temperature: options.temperature, maxTokens: options.maxTokens, stream: true })),
+        timeout: 180000,
+        onprogress: function(event) {
+          var text = String(event.responseText || '');
+          if (text.length <= receivedLength) return;
+          consume(text.slice(receivedLength), false);
+          receivedLength = text.length;
+        },
+        onload: function(response) {
+          if (settled) return;
+          settled = true;
+          var text = String(response.responseText || '');
+          if (response.status < 200 || response.status >= 300) {
+            reject(new Error('API 错误: ' + response.status + ' ' + text.slice(0, 500)));
+            return;
+          }
+          if (text.length > receivedLength) consume(text.slice(receivedLength), false);
+          consume('', true);
+          if (!fullText) {
+            try {
+              var data = JSON.parse(text);
+              fullText = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content || '';
+              finishReason = data.choices && data.choices[0] && data.choices[0].finish_reason || finishReason;
+              if (fullText && typeof onDelta === 'function') onDelta(fullText, fullText);
+            } catch (e) {}
+          }
+          if (finishReason === 'length') { reject(new Error(lengthErrorMessage)); return; }
+          if (!fullText) { reject(new Error('API 响应格式异常')); return; }
+          resolve(fullText);
+        },
+        onerror: function() { if (!settled) { settled = true; reject(new Error('网络请求失败')); } },
+        ontimeout: function() { if (!settled) { settled = true; reject(new Error('API 请求超时')); } },
+        onabort: function() {
+          if (settled) return;
+          settled = true;
+          if (fullText.trim()) resolve(fullText + '\n\n_⏹ 已被用户打断_');
+          else { var error = new Error('用户已打断'); error.name = 'AbortError'; reject(error); }
+        }
+      });
+      if (signal) {
+        var abort = function() { try { request.abort(); } catch (e) {} };
+        if (signal.aborted) abort();
+        else signal.addEventListener('abort', abort, { once: true });
+      }
+    });
+  }
+
   // 兼容旧逻辑：非流式
   async function callAI(messages) {
     if (!CONFIG.apiUrl || !CONFIG.apiKey || !currentModel) {
       throw new Error('请点击右上角 ⚙️ 设置按钮，填写 apiUrl、apiKey 和 model');
     }
     const chatApiUrl = buildChatCompletionsUrl(CONFIG.apiUrl);
-    const res = await fetch(chatApiUrl, {
+    const res = await gmRequest({
       method: 'POST',
+      url: chatApiUrl,
       headers: {
         'Content-Type': 'application/json',
         'Authorization': 'Bearer ' + CONFIG.apiKey
       },
-      body: JSON.stringify(buildReqBody(currentModel, messages, { temperature: 0.7, maxTokens: 2000 }))
+      data: JSON.stringify(buildReqBody(currentModel, messages, { temperature: 0.7, maxTokens: 2000 }))
     });
-    if (!res.ok) {
-      const errText = await res.text();
-      throw new Error('API 错误: ' + res.status + ' ' + errText);
+    if (res.status < 200 || res.status >= 300) {
+      throw new Error('API 错误: ' + res.status + ' ' + String(res.responseText || '').slice(0, 500));
     }
-    const data = await res.json();
+    const data = JSON.parse(res.responseText);
     if (!data.choices?.[0]?.message?.content) {
       throw new Error('API响应格式异常');
     }
@@ -6334,6 +6508,13 @@
     if (!apiUrl || !apiKey || !model) {
       throw new Error('请点击右上角 ⚙️ 设置按钮，填写 apiUrl、apiKey 和 model');
     }
+
+    return callAIStreamWithGM(apiUrl, apiKey, model, messages, onDelta, {
+      signal: signal,
+      temperature: temperature,
+      maxTokens: maxTokens,
+      lengthErrorMessage: lengthErrorMessage
+    });
 
     let res;
     try {
@@ -6879,18 +7060,19 @@
     }
     const modelsUrl = deriveModelsUrl(apiUrl);
     console.log('[省流助手] 获取模型列表:', modelsUrl);
-    const res = await fetchWithTimeout(modelsUrl, {
+    const res = await gmRequest({
       method: 'GET',
+      url: modelsUrl,
       headers: {
         'Authorization': 'Bearer ' + apiKey,
         'Content-Type': 'application/json'
-      }
-    }, AUX_REQUEST_TIMEOUT_MS);
-    if (!res.ok) {
-      const errText = await res.text();
-      throw new Error('HTTP ' + res.status + ': ' + errText.slice(0, 200));
+      },
+      timeout: AUX_REQUEST_TIMEOUT_MS
+    });
+    if (res.status < 200 || res.status >= 300) {
+      throw new Error('HTTP ' + res.status + ': ' + String(res.responseText || '').slice(0, 200));
     }
-    const data = await res.json();
+    const data = JSON.parse(res.responseText);
     let models = [];
     if (Array.isArray(data?.data)) {
       models = data.data.map(m => m.id || m.model || m.name).filter(Boolean);
@@ -8019,7 +8201,11 @@
     const overlay = document.createElement('div');
     overlay.id = 'tabbit-settings-overlay';
 
-    const currentModelList = (CONFIG.modelList || DEFAULT_CONFIG.modelList).join('\n');
+    let editingApiProfiles = normalizeApiProfiles(CONFIG.apiProfiles, CONFIG);
+    let editingActiveApiProfileId = CONFIG.activeApiProfileId;
+    if (!editingApiProfiles.some(function(profile) { return profile.id === editingActiveApiProfileId; })) editingActiveApiProfileId = editingApiProfiles[0].id;
+    const activeApiProfile = editingApiProfiles.find(function(profile) { return profile.id === editingActiveApiProfileId; }) || editingApiProfiles[0];
+    const currentModelList = (activeApiProfile.modelList || DEFAULT_CONFIG.modelList).join('\n');
     const currentCommentTextPresets = getCommentTextPresets().join('\n');
     const cacheStats = getSummaryCacheStats();
 
@@ -8043,7 +8229,7 @@
           </div>
           <div class="tabbit-settings-group tabbit-switch-row tabbit-top-switch-row" style="margin-top:8px;">
             <div class="tabbit-switch-copy">
-              <div class="tabbit-settings-label">🪟 处理时自动打开面板</div>
+              <div class="tabbit-settings-label">🪟 自动展开</div>
               <div class="tabbit-settings-hint" style="margin-top:2px;">默认关闭。关闭后通过悬浮按钮查看进度，摘要完成会提示“点击查看”。</div>
             </div>
             <label class="tabbit-switch">
@@ -8053,7 +8239,7 @@
           </div>
           <div class="tabbit-settings-group tabbit-switch-row tabbit-top-switch-row" style="margin-top:8px;">
             <div class="tabbit-switch-copy">
-              <div class="tabbit-settings-label">🧠 思考模式</div>
+              <div class="tabbit-settings-label">🧠 深度思考</div>
               <div class="tabbit-settings-hint" style="margin-top:2px;">关闭后请求不带 thinking 参数，可加快响应速度</div>
             </div>
             <label class="tabbit-switch">
@@ -8064,7 +8250,7 @@
 
           <div class="tabbit-collapse">
             <div class="tabbit-collapse-header" data-collapse="result-action-settings">
-              <div class="tabbit-collapse-title">🎛️ 摘要结果操作按钮</div>
+              <div class="tabbit-collapse-title">📤 结果与发送</div>
               <span class="tabbit-collapse-arrow">▶</span>
             </div>
             <div class="tabbit-collapse-body">
@@ -8075,24 +8261,42 @@
 
           <div class="tabbit-collapse">
             <div class="tabbit-collapse-header" data-collapse="api-settings">
-              <div class="tabbit-collapse-title">🤖 大模型 API 设置</div>
+              <div class="tabbit-collapse-title">🤖 AI 连接与模型</div>
               <span class="tabbit-collapse-arrow">▶</span>
             </div>
             <div class="tabbit-collapse-body">
+              <div class="tabbit-settings-hint tabbit-api-profile-help">不同 API 服务商可建多个预设，一键切换。提示词模板和其他设置跨预设共用。</div>
+              <div class="tabbit-api-profile-row">
+                <select class="tabbit-settings-input" id="ts-apiProfileSelect"></select>
+                <button class="tabbit-api-profile-btn" id="ts-apiProfileAdd" type="button">➕ 新建</button>
+                <button class="tabbit-api-profile-btn" id="ts-apiProfileClone" type="button">📋 复制</button>
+                <button class="tabbit-api-profile-btn" id="ts-apiProfileRename" type="button">✏️ 改名</button>
+                <button class="tabbit-api-profile-btn tabbit-api-profile-btn-danger" id="ts-apiProfileDelete" type="button" title="删除当前预设">🗑️</button>
+              </div>
               <div class="tabbit-settings-group">
-                <div class="tabbit-settings-label">API URL</div>
-                <input class="tabbit-settings-input" id="ts-apiUrl" type="text" value="${escapeHtml(CONFIG.apiUrl || '')}" placeholder="https://your-api/v1" />
+                <div class="tabbit-settings-label">预设名称</div>
+                <input class="tabbit-settings-input" id="ts-apiProfileName" type="text" value="${escapeHtml(activeApiProfile.name || '')}" placeholder="如：SenseNova、OpenAI" />
+              </div>
+              <div class="tabbit-settings-group">
+                <div class="tabbit-settings-label">API 地址</div>
+                <input class="tabbit-settings-input" id="ts-apiUrl" type="text" value="${escapeHtml(activeApiProfile.apiUrl || '')}" placeholder="https://api.openai.com/v1/chat/completions" />
                 <div class="tabbit-settings-hint">可填 https://xxx/v1，脚本会自动补成 /chat/completions 和 /models；也兼容完整 /v1/chat/completions</div>
               </div>
               <div class="tabbit-settings-group">
                 <div class="tabbit-settings-label">API Key</div>
-                <input class="tabbit-settings-input" id="ts-apiKey" type="password" value="${escapeHtml(CONFIG.apiKey || '')}" placeholder="sk-..." />
+                <input class="tabbit-settings-input" id="ts-apiKey" type="password" value="${escapeHtml(activeApiProfile.apiKey || '')}" placeholder="sk-..." />
                 <div class="tabbit-settings-hint">你的 API 密钥（本地存储，不会上传）</div>
+              </div>
+              <div class="tabbit-api-test-row">
+                <button class="tabbit-api-profile-btn" id="ts-fetch-models" type="button">🔄 获取模型列表</button>
               </div>
               <div class="tabbit-settings-group">
                 <div class="tabbit-settings-label">默认模型</div>
-                <input class="tabbit-settings-input" id="ts-model" type="text" value="${escapeHtml(CONFIG.model || '')}" placeholder="gpt-4o" />
-                <div class="tabbit-settings-hint">启动时默认选中的模型名称</div>
+                <select class="tabbit-settings-input" id="ts-model"></select>
+                <div class="tabbit-settings-hint">先获取模型列表，再选择用于摘要和测试的默认模型。</div>
+              </div>
+              <div class="tabbit-api-test-row">
+                <button class="tabbit-api-profile-btn" id="ts-test-api" type="button">⚡ 测试当前模型</button>
               </div>
               <div class="tabbit-settings-group">
                 <div class="tabbit-settings-label">普通摘要最大输出 tokens</div>
@@ -8100,13 +8304,12 @@
                 <div class="tabbit-settings-hint">影响视频摘要、评论总结、弹幕分析、全面分析和对话。详细笔记版容易超，可调到 6000-10000，前提是你的 API/模型支持。</div>
               </div>
               <div class="tabbit-settings-group">
-                <div class="tabbit-settings-label">候选模型列表</div>
+                <div class="tabbit-settings-label">模型列表（可手动补充）</div>
                 <div class="tabbit-input-with-btn" style="margin-bottom:6px;">
-                  <button class="tabbit-fetch-models-btn" id="ts-fetch-models">🔍 自动获取所有模型</button>
                   <button class="tabbit-fetch-models-btn" id="ts-append-models" style="border-color:#aaa;color:#666;">➕ 追加获取（不覆盖）</button>
                 </div>
                 <textarea class="tabbit-settings-textarea" id="ts-modelList" placeholder="每行一个模型名称">${escapeHtml(currentModelList)}</textarea>
-                <div class="tabbit-settings-hint">每行一个模型名称。点击「自动获取」会从 API URL 自动调用 /v1/models 拉取并覆盖列表</div>
+                <div class="tabbit-settings-hint">获取成功后会自动显示在上方下拉框。每行一个模型名称，也可以手动补充。</div>
               </div>
             </div>
           </div>
@@ -8132,7 +8335,7 @@
 
           <div class="tabbit-collapse">
             <div class="tabbit-collapse-header" data-collapse="preset-settings">
-              <div class="tabbit-collapse-title">🎨 视频摘要预设</div>
+              <div class="tabbit-collapse-title">🎨 摘要模板</div>
               <span class="tabbit-collapse-arrow">▶</span>
             </div>
             <div class="tabbit-collapse-body">
@@ -8197,7 +8400,7 @@
 
           <div class="tabbit-collapse">
             <div class="tabbit-collapse-header" data-collapse="analysis-settings">
-              <div class="tabbit-collapse-title">📡 弹幕 & 全面分析</div>
+              <div class="tabbit-collapse-title">💬 内容分析</div>
               <span class="tabbit-collapse-arrow">▶</span>
             </div>
             <div class="tabbit-collapse-body">
@@ -8229,7 +8432,7 @@
 
           <div class="tabbit-collapse">
             <div class="tabbit-collapse-header" data-collapse="image-settings">
-              <div class="tabbit-collapse-title">🖼️ 生图设置</div>
+              <div class="tabbit-collapse-title">🖼️ 摘要配图</div>
               <span class="tabbit-collapse-arrow">▶</span>
             </div>
             <div class="tabbit-collapse-body" id="ts-imageGen-fields">
@@ -8317,7 +8520,7 @@
 
           <div class="tabbit-collapse">
             <div class="tabbit-collapse-header" data-collapse="other-settings">
-              <div class="tabbit-collapse-title">⚙️ 其他设置</div>
+              <div class="tabbit-collapse-title">⚙️ 界面与数据</div>
               <span class="tabbit-collapse-arrow">▶</span>
             </div>
             <div class="tabbit-collapse-body">
@@ -8365,6 +8568,52 @@
       </div>
     `;
     document.body.appendChild(overlay);
+
+    // 设置页信息架构：合并同类功能，并按常用配置流程排序。
+    (function organizeSettingsSections() {
+      var body = overlay.querySelector('.tabbit-settings-body');
+      var getCollapse = function(name) {
+        var header = overlay.querySelector('[data-collapse="' + name + '"]');
+        return header ? header.parentElement : null;
+      };
+      var addSectionTitle = function(container, text) {
+        var title = document.createElement('div');
+        title.className = 'tabbit-settings-subsection-title';
+        title.textContent = text;
+        container.appendChild(title);
+      };
+
+      var resultCollapse = getCollapse('result-action-settings');
+      var flomoCollapse = getCollapse('flomo-settings');
+      if (resultCollapse && flomoCollapse) {
+        var resultBody = resultCollapse.querySelector('.tabbit-collapse-body');
+        var flomoBody = flomoCollapse.querySelector('.tabbit-collapse-body');
+        var originalResultNodes = Array.from(resultBody.childNodes);
+        resultBody.innerHTML = '';
+        addSectionTitle(resultBody, '摘要操作按钮');
+        originalResultNodes.forEach(function(node) { resultBody.appendChild(node); });
+        addSectionTitle(resultBody, '发送到 Flomo（可选）');
+        Array.from(flomoBody.childNodes).forEach(function(node) { resultBody.appendChild(node); });
+        flomoCollapse.remove();
+      }
+
+      var commentCollapse = getCollapse('comment-settings');
+      var analysisCollapse = getCollapse('analysis-settings');
+      if (commentCollapse && analysisCollapse) {
+        var commentBody = commentCollapse.querySelector('.tabbit-collapse-body');
+        var analysisBody = analysisCollapse.querySelector('.tabbit-collapse-body');
+        var originalAnalysisNodes = Array.from(analysisBody.childNodes);
+        analysisBody.innerHTML = '';
+        addSectionTitle(analysisBody, '评论区分析');
+        Array.from(commentBody.childNodes).forEach(function(node) { analysisBody.appendChild(node); });
+        addSectionTitle(analysisBody, '弹幕与全面分析');
+        originalAnalysisNodes.forEach(function(node) { analysisBody.appendChild(node); });
+        commentCollapse.remove();
+      }
+
+      ['api-settings', 'preset-settings', 'analysis-settings', 'image-settings', 'result-action-settings', 'other-settings']
+        .map(getCollapse).filter(Boolean).forEach(function(section) { body.appendChild(section); });
+    })();
 
     let editingPresets = JSON.parse(JSON.stringify(CONFIG.promptPresets || DEFAULT_PRESETS));
     let editingActiveId = CONFIG.activePresetId || (editingPresets[0] && editingPresets[0].id);
@@ -8586,6 +8835,105 @@
     });
 
 
+    function getEditingApiProfile() {
+      return editingApiProfiles.find(function(profile) { return profile.id === editingActiveApiProfileId; }) || editingApiProfiles[0];
+    }
+    function syncEditingApiProfileFromForm() {
+      var profile = getEditingApiProfile();
+      if (!profile) return;
+      profile.name = overlay.querySelector('#ts-apiProfileName').value.trim() || profile.name || '未命名配置';
+      profile.apiUrl = overlay.querySelector('#ts-apiUrl').value.trim();
+      profile.apiKey = overlay.querySelector('#ts-apiKey').value.trim();
+      profile.model = overlay.querySelector('#ts-model').value.trim();
+      profile.modelList = overlay.querySelector('#ts-modelList').value.split('\n').map(function(item) { return item.trim(); }).filter(Boolean);
+    }
+    function renderModelOptions(preferredModel) {
+      var modelSelect = overlay.querySelector('#ts-model');
+      var models = overlay.querySelector('#ts-modelList').value.split('\n').map(function(item) { return item.trim(); }).filter(Boolean);
+      var selectedModel = preferredModel || modelSelect.value || '';
+      modelSelect.innerHTML = '';
+      if (!models.length) {
+        var emptyOption = document.createElement('option');
+        emptyOption.value = ''; emptyOption.textContent = '请先获取模型列表'; emptyOption.selected = true;
+        modelSelect.appendChild(emptyOption);
+      } else {
+        Array.from(new Set(models)).forEach(function(model) {
+          var option = document.createElement('option');
+          option.value = model; option.textContent = model; option.selected = model === selectedModel;
+          modelSelect.appendChild(option);
+        });
+        if (!models.includes(selectedModel)) modelSelect.value = models[0];
+      }
+      var testBtn = overlay.querySelector('#ts-test-api');
+      if (testBtn) testBtn.disabled = !modelSelect.value;
+    }
+    function renderApiProfileForm() {
+      var select = overlay.querySelector('#ts-apiProfileSelect');
+      select.innerHTML = '';
+      editingApiProfiles.forEach(function(profile) {
+        var option = document.createElement('option');
+        option.value = profile.id; option.textContent = profile.name; option.selected = profile.id === editingActiveApiProfileId;
+        select.appendChild(option);
+      });
+      var profile = getEditingApiProfile();
+      overlay.querySelector('#ts-apiProfileName').value = profile.name || '';
+      overlay.querySelector('#ts-apiUrl').value = profile.apiUrl || '';
+      overlay.querySelector('#ts-apiKey').value = profile.apiKey || '';
+      overlay.querySelector('#ts-modelList').value = (profile.modelList || []).join('\n');
+      renderModelOptions(profile.model || '');
+    }
+    renderApiProfileForm();
+    overlay.querySelector('#ts-apiProfileSelect').addEventListener('change', function() {
+      syncEditingApiProfileFromForm(); editingActiveApiProfileId = this.value; renderApiProfileForm();
+    });
+    overlay.querySelector('#ts-apiProfileAdd').addEventListener('click', function() {
+      syncEditingApiProfileFromForm();
+      var name = prompt('新预设名称：', '新配置'); if (!name) return;
+      var profile = { id: createApiProfileId(), name: name.trim() || '新配置', apiUrl: '', apiKey: '', model: '', modelList: [] };
+      editingApiProfiles.push(profile); editingActiveApiProfileId = profile.id; renderApiProfileForm();
+    });
+    overlay.querySelector('#ts-apiProfileClone').addEventListener('click', function() {
+      syncEditingApiProfileFromForm();
+      var source = getEditingApiProfile(); var name = prompt('复制为新预设：', source.name + '（副本）'); if (!name) return;
+      var profile = JSON.parse(JSON.stringify(source)); profile.id = createApiProfileId(); profile.name = name.trim() || source.name + '（副本）';
+      editingApiProfiles.push(profile); editingActiveApiProfileId = profile.id; renderApiProfileForm();
+    });
+    overlay.querySelector('#ts-apiProfileRename').addEventListener('click', function() {
+      syncEditingApiProfileFromForm();
+      var profile = getEditingApiProfile(); var name = prompt('重命名当前预设：', profile.name); if (!name) return;
+      profile.name = name.trim() || profile.name; renderApiProfileForm();
+    });
+    overlay.querySelector('#ts-apiProfileDelete').addEventListener('click', function() {
+      if (editingApiProfiles.length <= 1) { alert('至少保留一个 API 预设。'); return; }
+      var profile = getEditingApiProfile(); if (!confirm('确定删除预设「' + profile.name + '」？')) return;
+      editingApiProfiles = editingApiProfiles.filter(function(item) { return item.id !== profile.id; });
+      editingActiveApiProfileId = editingApiProfiles[0].id; renderApiProfileForm();
+    });
+    overlay.querySelector('#ts-model').addEventListener('change', function() {
+      var profile = getEditingApiProfile();
+      if (profile) profile.model = this.value;
+      overlay.querySelector('#ts-test-api').disabled = !this.value;
+    });
+    overlay.querySelector('#ts-modelList').addEventListener('input', function() {
+      renderModelOptions(overlay.querySelector('#ts-model').value);
+    });
+    overlay.querySelector('#ts-test-api').addEventListener('click', async function() {
+      syncEditingApiProfileFromForm();
+      var profile = getEditingApiProfile();
+      if (!profile.apiUrl || !profile.apiKey || !profile.model) { alert('请先填写 API 地址、API Key 和默认模型。'); return; }
+      var btn = this; var originalText = btn.textContent; btn.disabled = true; btn.textContent = '⏳ 测试中...';
+      try {
+        var response = await gmRequest({ method: 'POST', url: buildChatCompletionsUrl(profile.apiUrl),
+          headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + profile.apiKey },
+          data: JSON.stringify(buildReqBody(profile.model, [{ role: 'user', content: '请只回复 OK' }], { temperature: 0.1, maxTokens: 20 })), timeout: AUX_REQUEST_TIMEOUT_MS });
+        if (response.status < 200 || response.status >= 300) throw new Error('HTTP ' + response.status + ': ' + String(response.responseText || '').slice(0, 500));
+        var data = JSON.parse(response.responseText);
+        if (!data.choices || !data.choices[0] || !data.choices[0].message) throw new Error('API 响应格式异常');
+        alert('✅ 预设「' + profile.name + '」API 测试成功。');
+      } catch (error) { alert('❌ API 测试失败：\n\n' + (error.message || String(error))); }
+      finally { btn.disabled = false; btn.textContent = originalText; }
+    });
+
     overlay.querySelectorAll('.tabbit-collapse-header').forEach(function(header) {
       header.addEventListener('click', function() {
         const collapse = header.parentElement;
@@ -8616,6 +8964,8 @@
         } else {
           textarea.value = models.join('\n');
         }
+        renderModelOptions(overlay.querySelector('#ts-model').value);
+        syncEditingApiProfileFromForm();
         fetchBtn.textContent = '✅ 已获取 ' + models.length + ' 个';
         setTimeout(function() {
           fetchBtn.textContent = originalText;
@@ -8686,6 +9036,8 @@
     });
 
     overlay.querySelector('#ts-save').addEventListener('click', function() {
+      syncEditingApiProfileFromForm();
+      const savedApiProfile = getEditingApiProfile();
       const newApiUrl = overlay.querySelector('#ts-apiUrl').value.trim();
       const newApiKey = overlay.querySelector('#ts-apiKey').value.trim();
       const newModel = overlay.querySelector('#ts-model').value.trim();
@@ -8728,6 +9080,12 @@
       CONFIG.apiUrl = newApiUrl;
       CONFIG.apiKey = newApiKey;
       CONFIG.model = newModel || CONFIG.model;
+      savedApiProfile.apiUrl = CONFIG.apiUrl;
+      savedApiProfile.apiKey = CONFIG.apiKey;
+      savedApiProfile.model = CONFIG.model;
+      savedApiProfile.modelList = newModelList.length > 0 ? newModelList.slice() : DEFAULT_CONFIG.modelList.slice();
+      CONFIG.apiProfiles = editingApiProfiles;
+      CONFIG.activeApiProfileId = editingActiveApiProfileId;
       CONFIG.summaryMaxTokens = isNaN(newSummaryMaxTokens) ? DEFAULT_CONFIG.summaryMaxTokens : Math.max(500, Math.min(30000, newSummaryMaxTokens));
       CONFIG.flomoApiUrl = newFlomoApiUrl;
       CONFIG.flomoTags = newFlomoTags;
