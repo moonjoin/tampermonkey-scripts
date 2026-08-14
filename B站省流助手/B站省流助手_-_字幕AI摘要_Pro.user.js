@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站省流助手 - 字幕AI摘要 Pro
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      5.0.14
+// @version      5.0.15
 // @description  自动提取B站视频字幕，通过自定义AI API生成极简摘要，支持模型切换、持续对话和评论区总结；支持自动解析开关、自动获取模型列表、flomo自动加标签、总结生图和API兜底功能
 // @author       次元饺子
 // @match        https://www.bilibili.com/video/*
@@ -6390,6 +6390,12 @@
       var signal = options.signal;
       var lengthErrorMessage = options.lengthErrorMessage;
 
+      function cancelPendingDelta() {
+        if (typeof onDelta === 'function' && typeof onDelta.cancel === 'function') {
+          onDelta.cancel();
+        }
+      }
+
       function consume(text, flush) {
         buffer += text;
         var lines = buffer.split(/\r?\n/);
@@ -6429,6 +6435,7 @@
           settled = true;
           var text = String(response.responseText || '');
           if (response.status < 200 || response.status >= 300) {
+            cancelPendingDelta();
             reject(new Error('API 错误: ' + response.status + ' ' + text.slice(0, 500)));
             return;
           }
@@ -6442,15 +6449,17 @@
               if (fullText && typeof onDelta === 'function') onDelta(fullText, fullText);
             } catch (e) {}
           }
+          cancelPendingDelta();
           if (finishReason === 'length') { reject(new Error(lengthErrorMessage)); return; }
           if (!fullText) { reject(new Error('API 响应格式异常')); return; }
           resolve(fullText);
         },
-        onerror: function() { if (!settled) { settled = true; reject(new Error('网络请求失败')); } },
-        ontimeout: function() { if (!settled) { settled = true; reject(new Error('API 请求超时')); } },
+        onerror: function() { if (!settled) { settled = true; cancelPendingDelta(); reject(new Error('网络请求失败')); } },
+        ontimeout: function() { if (!settled) { settled = true; cancelPendingDelta(); reject(new Error('API 请求超时')); } },
         onabort: function() {
           if (settled) return;
           settled = true;
+          cancelPendingDelta();
           if (fullText.trim()) resolve(fullText + '\n\n_⏹ 已被用户打断_');
           else { var error = new Error('用户已打断'); error.name = 'AbortError'; reject(error); }
         }
