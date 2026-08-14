@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站省流助手 - 字幕AI摘要 Pro
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      5.0.15
+// @version      5.0.16
 // @description  自动提取B站视频字幕，通过自定义AI API生成极简摘要，支持模型切换、持续对话和评论区总结；支持自动解析开关、自动获取模型列表、flomo自动加标签、总结生图和API兜底功能
 // @author       次元饺子
 // @match        https://www.bilibili.com/video/*
@@ -1739,19 +1739,20 @@
     let lastError = '';
     for (const body of bodies) {
       try {
-        const res = await fetch(candidate.url, {
+        const res = await gmRequest({
           method: 'POST',
+          url: candidate.url,
           headers: {
             'Content-Type': 'application/json',
             'Authorization': 'Bearer ' + apiKey
           },
-          body: JSON.stringify(body),
+          data: JSON.stringify(body),
           signal: signal
         });
-        const text = await res.text();
+        const text = String(res.responseText || '');
         let data = null;
         try { data = text ? JSON.parse(text) : null; } catch (e) {}
-        if (!res.ok) {
+        if (res.status < 200 || res.status >= 300) {
           lastError = 'HTTP ' + res.status + ': ' + (text || '').slice(0, 200);
           continue;
         }
@@ -5474,16 +5475,17 @@
     btn.textContent = '⏳ 发送中...';
     btn.disabled = true;
     try {
-      const res = await fetchWithTimeout(CONFIG.flomoApiUrl, {
+      const res = await gmRequest({
         method: 'POST',
+        url: CONFIG.flomoApiUrl,
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ content: content })
-      }, AUX_REQUEST_TIMEOUT_MS);
-      if (!res.ok) {
-        const errText = await res.text();
-        throw new Error('HTTP ' + res.status + ' ' + errText);
+        data: JSON.stringify({ content: content }),
+        timeout: AUX_REQUEST_TIMEOUT_MS
+      });
+      if (res.status < 200 || res.status >= 300) {
+        throw new Error('HTTP ' + res.status + ' ' + String(res.responseText || ''));
       }
-      const data = await res.json();
+      const data = JSON.parse(res.responseText || '{}');
       if (data.code === 0 || data.code === 200 || data.message === 'ok') {
         btn.textContent = '✅ 已发送';
         setTimeout(() => { btn.textContent = '发送 FLOMO'; btn.disabled = false; }, 2000);
@@ -6386,6 +6388,7 @@
       var receivedLength = 0;
       var buffer = '';
       var finishReason = '';
+      var receivedDone = false;
       var settled = false;
       var signal = options.signal;
       var lengthErrorMessage = options.lengthErrorMessage;
@@ -6404,7 +6407,8 @@
           var trimmed = line.trim();
           if (!trimmed || !trimmed.startsWith('data:')) return;
           var payload = trimmed.slice(5).trim();
-          if (!payload || payload === '[DONE]') return;
+          if (!payload) return;
+          if (payload === '[DONE]') { receivedDone = true; return; }
           try {
             var json = JSON.parse(payload);
             var choice = json.choices && json.choices[0];
@@ -6429,6 +6433,14 @@
           if (text.length <= receivedLength) return;
           consume(text.slice(receivedLength), false);
           receivedLength = text.length;
+          if (receivedDone && !settled) {
+            settled = true;
+            cancelPendingDelta();
+            if (finishReason === 'length') reject(new Error(lengthErrorMessage));
+            else if (!fullText) reject(new Error('API 响应格式异常'));
+            else resolve(fullText);
+            try { request.abort(); } catch (e) {}
+          }
         },
         onload: function(response) {
           if (settled) return;
@@ -6525,147 +6537,6 @@
       lengthErrorMessage: lengthErrorMessage
     });
 
-    let res;
-    try {
-      res = await fetch(apiUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': 'Bearer ' + apiKey
-        },
-        body: JSON.stringify(buildReqBody(model, messages, { temperature: temperature, maxTokens: maxTokens, stream: true })),
-        signal: signal // 🆕 关键！把 AbortSignal 传给 fetch
-      });
-    } catch (netErr) {
-      // 🆕 区分用户主动打断和真实网络错误
-      if (isAbortError(netErr)) {
-        const abortErr = new Error('用户已打断');
-        abortErr.name = 'AbortError';
-        throw abortErr;
-      }
-      throw new Error('网络请求失败: ' + netErr.message);
-    }
-
-    if (!res.ok) {
-      const errText = await res.text().catch(() => '');
-      throw new Error('API 错误: ' + res.status + ' ' + errText);
-    }
-
-    const ct = (res.headers.get('content-type') || '').toLowerCase();
-    if (!ct.includes('text/event-stream')) {
-      console.warn('[省流助手-流式] API 不支持 stream，降级为一次性返回');
-      const data = await res.json();
-      const fullText = data.choices?.[0]?.message?.content || '';
-      if (data.choices?.[0]?.finish_reason === 'length') {
-        const lengthErr = new Error(lengthErrorMessage);
-        lengthErr.name = 'LengthFinishError';
-        throw lengthErr;
-      }
-      if (typeof onDelta === 'function' && fullText) {
-        try { onDelta(fullText, fullText); } catch (e) {}
-      }
-      return fullText;
-    }
-
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder('utf-8');
-    let fullText = '';
-    let buffer = '';
-    let userAborted = false;
-    let finishReason = '';
-
-    // 🆕 监听 signal abort，立即取消 reader
-    const onAbortSignal = function() {
-      userAborted = true;
-      try { reader.cancel(); } catch(e) {}
-    };
-    if (signal) {
-      if (signal.aborted) {
-        onAbortSignal();
-      } else {
-        signal.addEventListener('abort', onAbortSignal);
-      }
-    }
-
-    try {
-      while (true) {
-        // 🆕 每轮循环检查打断状态
-        if (signal && signal.aborted) {
-          userAborted = true;
-          try { reader.cancel(); } catch(e) {}
-          break;
-        }
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
-
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed || !trimmed.startsWith('data:')) continue;
-          const dataStr = trimmed.slice(5).trim();
-          if (dataStr === '[DONE]') continue;
-          try {
-            const json = JSON.parse(dataStr);
-            if (json.choices?.[0]?.finish_reason) {
-              finishReason = json.choices[0].finish_reason;
-            }
-            const delta = json.choices?.[0]?.delta?.content
-                       || json.choices?.[0]?.message?.content
-                       || '';
-            if (delta) {
-              fullText += delta;
-              if (typeof onDelta === 'function') {
-                try { onDelta(fullText, delta); } catch (e) {}
-              }
-            }
-          } catch (e) {}
-        }
-      }
-    } catch (streamErr) {
-      // 🆕 区分用户打断
-      if (isAbortError(streamErr)) {
-        userAborted = true;
-      } else if (!fullText) {
-        if (typeof onDelta === 'function' && typeof onDelta.cancel === 'function') {
-          onDelta.cancel();
-        }
-        if (signal) signal.removeEventListener('abort', onAbortSignal);
-        throw new Error('流式读取失败: ' + streamErr.message);
-      } else {
-        console.warn('[省流助手-流式] 流中断，使用已收到内容:', streamErr.message);
-      }
-    }
-
-    // 🆕 移除 signal 监听
-    if (signal) signal.removeEventListener('abort', onAbortSignal);
-
-    if (typeof onDelta === 'function' && typeof onDelta.cancel === 'function') {
-      onDelta.cancel();
-    }
-
-    // 🆕 如果是用户主动打断
-    if (userAborted) {
-      if (fullText.trim()) {
-        return fullText + '\n\n_⏹ 已被用户打断_';
-      } else {
-        const abortErr = new Error('用户已打断');
-        abortErr.name = 'AbortError';
-        throw abortErr;
-      }
-    }
-
-    if (!fullText.trim()) {
-      throw new Error('AI 未返回任何内容');
-    }
-    if (finishReason === 'length') {
-      const lengthErr = new Error(lengthErrorMessage);
-      lengthErr.name = 'LengthFinishError';
-      throw lengthErr;
-    }
-    return fullText;
   }
 
   /**
