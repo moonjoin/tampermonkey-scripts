@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Folo 网站增强工具
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      14.0.7
+// @version      14.0.11
 // @description  Folo 增强：Jina Reader + Readability + 启发式三级抓取 + AI 总结 + 自动总结 + 手动列表全量预加载 + 后续对话 + 多配置管理 + 坚果云 WebDAV 同步 + 复制对话 + 保存到 flomo
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
@@ -564,6 +564,10 @@
             .trim() || "无标题";
     }
 
+    // 14.0.8 曾把这段固定后缀自动写进 ai_overview_prompt。仅用它精确恢复旧用户提示词，不能按“相似标题”删除。
+    const OVERVIEW_VOICE_BRIEF_PROMPT = `# 🎧 语音简报
+用 300-500 中文字写一段可直接朗读的语音简报。自然口语，重点优先，短句。少用编号和符号。说清最值得关注的主题、优先阅读内容、风险或机会，不要重复上面的详细结构。`;
+
     const DEFAULT_OVERVIEW_PROMPT = `你是一个信息分析助手。下面是一份包含 {{total}} 篇文章的 RSS 订阅列表。
 {{analysisHint}}
 规则：
@@ -577,8 +581,92 @@
 **值得优先看**：从上面的文章中挑 3-5 篇最值得关注的，引用标题，每篇一句话说清为什么值得看
 **信号与趋势**：从这些文章里能看出什么趋势、风险或机会
 **可以跳过**：哪些文章明显是重复或低价值的，引用标题，简要说明原因`;
-    function getOverviewPrompt() { return GM_getValue("ai_overview_prompt", DEFAULT_OVERVIEW_PROMPT); }
-    function setOverviewPrompt(v) { GM_setValue("ai_overview_prompt", v || DEFAULT_OVERVIEW_PROMPT); }
+
+    const OVERVIEW_VOICE_END_MARKER = '<!-- FOLO_VOICE_END -->';
+    const DEFAULT_OVERVIEW_VOICE_PROMPT = `你是一个 RSS 信息播报编辑。下面是一份包含 {{total}} 篇文章的订阅列表。
+{{analysisHint}}
+
+只输出一篇可直接播报的正文。第一行可以且只能是“# 🎧 语音播报正文”，随后直接写正文，最后单独输出 ${OVERVIEW_VOICE_END_MARKER}。不要输出任何其他内容。
+
+正文要适合耳朵听，不要像书面报告。自然口语、短句、自然过渡，通俗易懂，避免套话和重复。按实际信息选择并串联这些内容：先说总体结论；再说今天最重要的若干变化；然后说真正值得关注或阅读的内容；有必要时再说风险、机会或可以略过的内容。不要堆 Markdown 小标题、表格、列表符号、编号清单、逐篇标题、URL、自检文字，也不要为了凑长度逐条复述文章。
+
+保留关键事实、数字、时间、主体和不确定性。信息少时约 180-350 中文字，普通情况约 350-650 中文字，信息密集时可到 650-1000 中文字；以讲清重点为准，明显短于详细文字分析。`;
+
+    // 14.0.9 的默认值曾被写入本地存储。只用完整字符串相等判断，绝不覆盖用户自己编辑过的提示词。
+    const LEGACY_DEFAULT_OVERVIEW_VOICE_PROMPT = `你是一个 RSS 信息播报编辑。下面是一份包含 {{total}} 篇文章的订阅列表。
+{{analysisHint}}
+
+请严格按下面顺序输出。第一块必须从第一行开始，标题必须完全是“# 🎧 语音播报正文”；播报正文结束后，紧接一个同级标题“# 📎 来源索引与覆盖”。
+
+# 🎧 语音播报正文
+把最值得听的信息整合成一段可直接朗读的中文简报。自然口语，短句，重点明确。保留关键事实、数字、时间和不确定性；不要逐篇念标题，不要用 Markdown、URL、编号列表和空话。
+长度按信息价值与文章数量自适应：信息稀疏约 500-800 中文字，普通情况约 800-1400 中文字，信息密集可到 1400-2200 中文字。整体必须明显短于详细文字分析。文章无需全在正文里逐一朗读。
+
+# 📎 来源索引与覆盖
+用尽量短的索引列出主题对应的文章编号/标题，确保 {{total}} 篇文章都能在索引或覆盖数中核对；最后写“共覆盖 X/{{total}} 篇”。`;
+
+    function stripLegacyOverviewVoiceBriefSuffix(prompt) {
+        const text = String(prompt || "");
+        const twoLineSuffix = `\n\n${OVERVIEW_VOICE_BRIEF_PROMPT}`;
+        const oneLineSuffix = `\n${OVERVIEW_VOICE_BRIEF_PROMPT}`;
+        if (text.endsWith(twoLineSuffix)) return text.slice(0, -twoLineSuffix.length);
+        if (text.endsWith(oneLineSuffix)) return text.slice(0, -oneLineSuffix.length);
+        return text;
+    }
+    function getOverviewPrompt() {
+        const saved = GM_getValue("ai_overview_prompt", null);
+        if (typeof saved !== "string" || !saved.length) return DEFAULT_OVERVIEW_PROMPT;
+        const migrated = stripLegacyOverviewVoiceBriefSuffix(saved);
+        if (migrated !== saved) GM_setValue("ai_overview_prompt", migrated);
+        return migrated || DEFAULT_OVERVIEW_PROMPT;
+    }
+    function setOverviewPrompt(v) {
+        const prompt = typeof v === "string" && v.length > 0 ? v : DEFAULT_OVERVIEW_PROMPT;
+        GM_setValue("ai_overview_prompt", stripLegacyOverviewVoiceBriefSuffix(prompt));
+    }
+    function getOverviewVoiceMode() { return GM_getValue("ai_overview_voice_mode", false) === true; }
+    function setOverviewVoiceMode(v) { GM_setValue("ai_overview_voice_mode", v === true); }
+    function getOverviewVoicePrompt() {
+        const saved = GM_getValue("ai_overview_voice_prompt", "");
+        if (saved === LEGACY_DEFAULT_OVERVIEW_VOICE_PROMPT) {
+            GM_setValue("ai_overview_voice_prompt", DEFAULT_OVERVIEW_VOICE_PROMPT);
+            return DEFAULT_OVERVIEW_VOICE_PROMPT;
+        }
+        return typeof saved === "string" && saved.length > 0 ? saved : DEFAULT_OVERVIEW_VOICE_PROMPT;
+    }
+    function setOverviewVoicePrompt(v) { GM_setValue("ai_overview_voice_prompt", typeof v === "string" && v.length > 0 ? v : DEFAULT_OVERVIEW_VOICE_PROMPT); }
+    function getOverviewPromptForMode(voiceMode) { return voiceMode ? getOverviewVoicePrompt() : getOverviewPrompt(); }
+
+    const DEFAULT_TTS_CONFIG = {
+        autoPlay: false,
+        url: "https://api.xiaomimimo.com/v1/chat/completions",
+        model: "mimo-v2.5-tts",
+        voice: "冰糖",
+        style: "新闻简报式普通话，清晰自然，语速稍快，重点明确。"
+    };
+    const OVERVIEW_TTS_SAMPLE_RATE = 24000;
+    const VOICE_BRIEF_FALLBACK_MAX_CHARS = 2200;
+    let activeOverviewAudioSession = null;
+    let activeOverviewTtsRequest = null;
+    let overviewTtsRequestToken = 0;
+    let overviewAnalysisRequestToken = 0;
+
+    function getTtsConfig() {
+        const saved = GM_getValue("ai_overview_tts_config", {});
+        return { ...DEFAULT_TTS_CONFIG, ...(saved && typeof saved === "object" ? saved : {}) };
+    }
+    function setTtsConfig(config) {
+        const safe = config && typeof config === "object" ? config : {};
+        GM_setValue("ai_overview_tts_config", {
+            autoPlay: safe.autoPlay === true,
+            url: String(safe.url || DEFAULT_TTS_CONFIG.url).trim(),
+            model: String(safe.model || DEFAULT_TTS_CONFIG.model).trim(),
+            voice: ["冰糖", "茉莉", "苏打", "白桦"].includes(safe.voice) ? safe.voice : DEFAULT_TTS_CONFIG.voice,
+            style: String(safe.style || DEFAULT_TTS_CONFIG.style).trim()
+        });
+    }
+    function getTtsApiKey() { return GM_getValue("ai_overview_tts_api_key", ""); }
+    function setTtsApiKey(value) { GM_setValue("ai_overview_tts_api_key", String(value || "").trim()); }
 
     function getProfiles() {
         let profiles = GM_getValue("ai_profiles", []);
@@ -1494,6 +1582,8 @@
                         <button data-act="clear-cache" style="display:none">清空缓存</button>
                         <button data-act="retry-failed" style="display:none">重试失败</button>
                         <button data-act="overview" class="preload-act-primary" style="background:linear-gradient(135deg,#7c3aed,#2563eb);color:white;">✨ 生成列表总览</button>
+                        <button data-act="tts-play" disabled title="播报列表分析中的语音简报">🔊 播报</button>
+                        <button data-act="tts-stop" disabled title="停止并释放当前语音">⏹ 停止</button>
                         <button data-act="settings">设置</button>
                     </div>
                     <div class="my-ai-content preload-overview-content" style="display:none;"></div>
@@ -1601,6 +1691,13 @@
             panel.querySelector('[data-act="clear-cache"]').onclick = () => {
                 if (!confirm("确定清空所有 AI 总结缓存？这不会删除当前排队任务。")) return;
                 clearSummaryCacheOnly();
+            };
+            panel.querySelector('[data-act="tts-play"]').onclick = () => {
+                playOverviewTts(panel, panel.__summaryContent || '', { auto: false });
+            };
+            panel.querySelector('[data-act="tts-stop"]').onclick = () => {
+                stopOverviewTts(panel);
+                setPreloadStatus('已停止语音播报', 'info');
             };
             panel.querySelector('[data-act="settings"]').onclick = showSettingsModal;
         }
@@ -1862,6 +1959,12 @@
 
     function resetListOverviewChat(wrapper) {
         if (!wrapper) return;
+        overviewAnalysisRequestToken++;
+        stopOverviewTts(wrapper);
+        wrapper.querySelectorAll('[data-act="overview"]').forEach(button => {
+            button.disabled = false;
+            button.innerText = '✨ 生成列表总览';
+        });
         wrapper.__chatHistory = null;
         wrapper.__articleContext = null;
         wrapper.__summaryContent = null;
@@ -1872,6 +1975,411 @@
         if (chatArea) chatArea.style.display = 'none';
         if (historyDiv) historyDiv.innerHTML = '';
         if (input) { input.value = ''; input.style.height = 'auto'; }
+        setOverviewTtsButtons(wrapper, 'idle');
+    }
+
+    function setOverviewTtsButtons(wrapper, state) {
+        if (!wrapper) return;
+        const playBtn = wrapper.querySelector('[data-act="tts-play"]');
+        const stopBtn = wrapper.querySelector('[data-act="tts-stop"]');
+        const hasResult = !!wrapper.__summaryContent;
+        if (playBtn) {
+            playBtn.disabled = state === 'loading' || !hasResult;
+            playBtn.innerText = state === 'loading' ? '🔊 生成语音...' : '🔊 播报';
+        }
+        if (stopBtn) stopBtn.disabled = state !== 'playing' && state !== 'loading';
+    }
+
+    function stopOverviewTts(wrapper) {
+        overviewTtsRequestToken++;
+        if (activeOverviewTtsRequest && typeof activeOverviewTtsRequest.abort === 'function') {
+            try { activeOverviewTtsRequest.abort(); } catch (_) { /* 请求可能已结束 */ }
+        }
+        activeOverviewTtsRequest = null;
+        const session = activeOverviewAudioSession;
+        activeOverviewAudioSession = null;
+        if (session) {
+            session.sources.forEach(source => {
+                source.onended = null;
+                try { source.stop(0); } catch (_) { /* 已停止 */ }
+            });
+            session.sources.clear();
+            if (session.context && session.context.state !== 'closed') session.context.close().catch(() => {});
+        }
+        if (wrapper) setOverviewTtsButtons(wrapper, 'idle');
+    }
+
+    function cleanMarkdownForTts(markdown) {
+        return String(markdown || '')
+            .replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1')
+            .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+            .replace(/`{1,3}([^`]+)`{1,3}/g, '$1')
+            .replace(/^\s{0,3}#{1,6}\s*/gm, '')
+            .replace(/^\s*(?:[-*+] |\d+[.)] )/gm, '')
+            .replace(/[*_~>#|]/g, ' ')
+            .replace(/https?:\/\/\S+/g, '')
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+
+    function getOverviewVoiceSection(markdown, requireClosed) {
+        const text = String(markdown || '').replace(/\r\n?/g, '\n');
+        const header = /^#{1,6}\s*🎧\s*语音播报正文\s*$/m.exec(text);
+        if (!header) return { text: '', source: 'missing', truncated: false, closed: false };
+        const bodyStart = header.index + header[0].length;
+        const afterHeader = text.slice(bodyStart).replace(/^\n+/, '');
+        const markerAt = afterHeader.indexOf(OVERVIEW_VOICE_END_MARKER);
+        // 只能由隐藏结束标记闭合；不能误把模型临时生成的同级标题当作正文结束。
+        const body = markerAt >= 0 ? afterHeader.slice(0, markerAt) : afterHeader;
+        const closed = markerAt >= 0;
+        const brief = cleanMarkdownForTts(body);
+        if (requireClosed && !closed) return { text: '', source: 'voice', truncated: false, closed: false };
+        return { text: brief, source: 'voice', truncated: false, closed };
+    }
+
+    function extractClosedOverviewVoiceBrief(markdown) { return getOverviewVoiceSection(markdown, true); }
+
+    function extractOverviewVoiceBrief(markdown) {
+        const section = getOverviewVoiceSection(markdown, false);
+        if (section.text) return section;
+        const text = String(markdown || '');
+        const cleaned = cleanMarkdownForTts(text);
+        return {
+            text: cleaned.slice(0, VOICE_BRIEF_FALLBACK_MAX_CHARS),
+            source: 'fallback',
+            truncated: cleaned.length > VOICE_BRIEF_FALLBACK_MAX_CHARS
+        };
+    }
+
+    function shouldAutoStartOverviewTts({ voiceMode, autoPlay, alreadyStarted, brief }) {
+        return voiceMode === true && autoPlay === true && alreadyStarted !== true && !!(brief && brief.source === 'voice' && brief.closed && brief.text);
+    }
+
+    function createSseIncrementalParser(onData) {
+        let lineBuffer = '';
+        let eventDataLines = [];
+        const flushEvent = () => {
+            if (!eventDataLines.length) return;
+            const payload = eventDataLines.join('\n');
+            eventDataLines = [];
+            onData(payload);
+        };
+        const consume = (chunk, isFinal) => {
+            lineBuffer += chunk;
+            const lines = lineBuffer.split('\n');
+            lineBuffer = isFinal ? '' : lines.pop();
+            lines.forEach(rawLine => {
+                const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
+                if (!line) { flushEvent(); return; }
+                if (line.startsWith('data:')) eventDataLines.push(line.slice(5).replace(/^ /, ''));
+            });
+            if (isFinal) flushEvent();
+        };
+        return {
+            push(chunk) {
+                if (chunk) {
+                    consume(String(chunk), false);
+                }
+            },
+            finish() { consume('', true); }
+        };
+    }
+
+    function decodePcm16ToFloat32(base64Audio) {
+        const binary = atob(String(base64Audio || ''));
+        const samples = new Float32Array(Math.floor(binary.length / 2));
+        for (let i = 0; i < samples.length; i++) {
+            const low = binary.charCodeAt(i * 2);
+            const high = binary.charCodeAt(i * 2 + 1);
+            const value = (high << 8) | low;
+            samples[i] = (value & 0x8000 ? value - 0x10000 : value) / 32768;
+        }
+        return samples;
+    }
+
+    function buildOverviewTtsRequestBody(text, ttsConfig) {
+        return {
+            model: ttsConfig.model,
+            stream: true,
+            messages: [
+                { role: 'user', content: ttsConfig.style },
+                { role: 'assistant', content: text }
+            ],
+            audio: { format: 'pcm16', voice: ttsConfig.voice }
+        };
+    }
+
+    function requestOverviewTtsStream(text, requestToken, onPcm) {
+        const ttsConfig = getTtsConfig();
+        if (!ttsConfig.url || !ttsConfig.model || !getTtsApiKey()) {
+            return Promise.reject(new Error('请先在设置中填写 MiMo TTS URL、API Key 和模型'));
+        }
+        return new Promise((resolve, reject) => {
+            let audioChunks = 0;
+            let done = false;
+            let parseError = null;
+            let settled = false;
+            let reader = null;
+            let readPromise = null;
+            let request = null;
+            const settle = (callback, value) => {
+                if (settled) return;
+                settled = true;
+                if (activeOverviewTtsRequest === streamRequest) activeOverviewTtsRequest = null;
+                callback(value);
+            };
+            const rejectOnce = error => settle(reject, error);
+            const resolveOnce = () => settle(resolve);
+            const parser = createSseIncrementalParser(payload => {
+                if (requestToken !== overviewTtsRequestToken || parseError || payload === '[DONE]') {
+                    if (payload === '[DONE]') done = true;
+                    return;
+                }
+                try {
+                    const event = JSON.parse(payload);
+                    if (event?.error) throw new Error(event.error.message || JSON.stringify(event.error));
+                    const base64Audio = event?.choices?.[0]?.delta?.audio?.data;
+                    if (!base64Audio) return;
+                    const samples = decodePcm16ToFloat32(base64Audio);
+                    if (!samples.length) return;
+                    audioChunks++;
+                    onPcm(samples);
+                } catch (error) {
+                    parseError = new Error(`TTS 流式音频解析失败：${error.message || error}`);
+                }
+            });
+            const consumeStream = async stream => {
+                reader = stream.getReader();
+                const decoder = new TextDecoder('utf-8');
+                try {
+                    while (requestToken === overviewTtsRequestToken) {
+                        const { value, done: streamDone } = await reader.read();
+                        if (value && value.length) parser.push(decoder.decode(value, { stream: !streamDone }));
+                        if (streamDone) break;
+                    }
+                    const finalText = decoder.decode();
+                    if (finalText) parser.push(finalText);
+                    parser.finish();
+                } finally {
+                    reader = null;
+                }
+            };
+            const streamRequest = {
+                abort() {
+                    rejectOnce(new Error('TTS 请求已取消'));
+                    if (reader) reader.cancel().catch(() => {});
+                    if (request && typeof request.abort === 'function') request.abort();
+                }
+            };
+            request = GM_xmlhttpRequest({
+                method: 'POST',
+                url: ttsConfig.url,
+                headers: {
+                    'Content-Type': 'application/json',
+                    'api-key': getTtsApiKey()
+                },
+                data: JSON.stringify(buildOverviewTtsRequestBody(text, ttsConfig)),
+                responseType: 'stream',
+                onloadstart: (res) => {
+                    if (requestToken !== overviewTtsRequestToken || settled) return;
+                    const stream = (res && res.response) || res;
+                    if (!stream || typeof stream.getReader !== 'function') {
+                        rejectOnce(new Error('当前 Tampermonkey 不支持流式响应'));
+                        streamRequest.abort();
+                        return;
+                    }
+                    readPromise = consumeStream(stream).catch(error => {
+                        if (requestToken === overviewTtsRequestToken && !settled) {
+                            rejectOnce(new Error(`TTS 流式读取失败：${error.message || error}`));
+                            streamRequest.abort();
+                        }
+                    });
+                },
+                onload: async (res) => {
+                    if (requestToken !== overviewTtsRequestToken || settled) return;
+                    if (!readPromise) {
+                        rejectOnce(new Error('当前 Tampermonkey 不支持流式响应'));
+                        return;
+                    }
+                    await readPromise;
+                    if (requestToken !== overviewTtsRequestToken || settled) return;
+                    const status = Number(res && res.status) || 0;
+                    if (status === 401) {
+                        rejectOnce(new Error('TTS 认证失败（401，请检查 API Key）'));
+                        return;
+                    }
+                    if (status < 200 || status >= 300) {
+                        rejectOnce(new Error(`TTS 请求失败（HTTP ${status}）：${String((res && res.responseText) || '服务未返回可用音频').slice(0, 160)}`));
+                        return;
+                    }
+                    if (parseError) return rejectOnce(parseError);
+                    if (!audioChunks) return rejectOnce(new Error(done ? 'TTS 流式响应未返回音频，请确认 mimo-v2.5-tts 支持 PCM16 流式输出。' : 'TTS 流式响应结束但没有 [DONE] 或音频。'));
+                    resolveOnce();
+                },
+                onerror: () => {
+                    if (requestToken === overviewTtsRequestToken) {
+                        rejectOnce(new Error('TTS 网络请求失败'));
+                        streamRequest.abort();
+                    }
+                },
+                onabort: () => {
+                    if (requestToken === overviewTtsRequestToken) rejectOnce(new Error('TTS 请求已取消'));
+                },
+                ontimeout: () => {
+                    if (requestToken === overviewTtsRequestToken) {
+                        rejectOnce(new Error('TTS 请求超时'));
+                        streamRequest.abort();
+                    }
+                },
+                timeout: 60000
+            });
+            if (settled) {
+                streamRequest.abort();
+                return;
+            }
+            activeOverviewTtsRequest = streamRequest;
+        });
+    }
+
+    function closeOverviewAudioContext(context) {
+        if (context && context.state !== 'closed') context.close().catch(() => {});
+    }
+
+    function createOverviewAudioSessionState(context, requestToken, options = {}) {
+        return {
+            context,
+            sources: new Set(),
+            nextTime: 0,
+            streamDone: false,
+            requestToken,
+            analysisToken: options.analysisToken || 0,
+            preUnlocked: options.preUnlocked === true,
+            ready: null
+        };
+    }
+
+    function createAutoPlayBlockedError() {
+        const blocked = new Error('浏览器阻止自动播放，请点击“播报”开始。');
+        blocked.name = 'NotAllowedError';
+        return blocked;
+    }
+
+    // 必须在点击“生成列表总览”的同步调用栈中调用，才能保留浏览器的用户激活。
+    function preUnlockOverviewAudioSession(analysisToken) {
+        const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+        if (!AudioContextCtor) return null;
+        const context = new AudioContextCtor({ sampleRate: OVERVIEW_TTS_SAMPLE_RATE });
+        const session = createOverviewAudioSessionState(context, 0, { analysisToken, preUnlocked: true });
+        activeOverviewAudioSession = session;
+        // 这里不 await：resume() 的调用本身必须发生在用户点击的同步栈内。
+        session.ready = Promise.resolve(context.resume()).then(() => {
+            if (context.state !== 'running') throw createAutoPlayBlockedError();
+            return session;
+        }).catch(error => {
+            if (activeOverviewAudioSession === session) activeOverviewAudioSession = null;
+            closeOverviewAudioContext(context);
+            throw error && error.name === 'NotAllowedError' ? error : createAutoPlayBlockedError();
+        });
+        // 分析失败时可能不会进入播放流程，提前接住拒绝，避免控制台出现未处理 Promise。
+        session.ready.catch(() => {});
+        return session;
+    }
+
+    async function createOverviewAudioSession(requestToken) {
+        const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+        if (!AudioContextCtor) throw new Error('当前浏览器不支持 AudioContext，无法播放 PCM16 流。');
+        const context = new AudioContextCtor({ sampleRate: OVERVIEW_TTS_SAMPLE_RATE });
+        const session = createOverviewAudioSessionState(context, requestToken);
+        try {
+            await context.resume();
+            if (context.state !== 'running') throw createAutoPlayBlockedError();
+        } catch (error) {
+            closeOverviewAudioContext(context);
+            throw error && error.name === 'NotAllowedError' ? error : createAutoPlayBlockedError();
+        }
+        if (requestToken !== overviewTtsRequestToken) {
+            closeOverviewAudioContext(context);
+            return null;
+        }
+        activeOverviewAudioSession = session;
+        return session;
+    }
+
+    function finishOverviewAudioSession(wrapper, session, requestToken) {
+        if (requestToken !== overviewTtsRequestToken || activeOverviewAudioSession !== session || !session.streamDone || session.sources.size) return;
+        activeOverviewAudioSession = null;
+        activeOverviewTtsRequest = null;
+        if (session.context.state !== 'closed') session.context.close().catch(() => {});
+        setOverviewTtsButtons(wrapper, 'idle');
+        setPreloadStatus('语音播报完成', 'ok');
+    }
+
+    function scheduleOverviewPcm(session, samples, wrapper, requestToken) {
+        if (requestToken !== overviewTtsRequestToken || activeOverviewAudioSession !== session) return;
+        const buffer = session.context.createBuffer(1, samples.length, OVERVIEW_TTS_SAMPLE_RATE);
+        buffer.copyToChannel(samples, 0);
+        const source = session.context.createBufferSource();
+        source.buffer = buffer;
+        source.connect(session.context.destination);
+        session.sources.add(source);
+        const startAt = Math.max(session.context.currentTime + 0.03, session.nextTime || 0);
+        session.nextTime = startAt + buffer.duration;
+        source.onended = () => {
+            session.sources.delete(source);
+            finishOverviewAudioSession(wrapper, session, requestToken);
+        };
+        source.start(startAt);
+        setOverviewTtsButtons(wrapper, 'playing');
+        setPreloadStatus('正在播报语音简报', 'ok');
+    }
+
+    async function playOverviewTts(wrapper, markdown, options = {}) {
+        if (options.analysisToken && options.analysisToken !== overviewAnalysisRequestToken) return;
+        const brief = options.brief || extractOverviewVoiceBrief(markdown);
+        if (!brief.text) {
+            setPreloadStatus('没有可播报的列表分析内容', 'warn');
+            return;
+        }
+        const preUnlockedSession = options.auto === true && options.preUnlockedSession
+            && activeOverviewAudioSession === options.preUnlockedSession
+            && options.preUnlockedSession.preUnlocked === true
+            && options.preUnlockedSession.analysisToken === options.analysisToken
+            && options.preUnlockedSession.context.state !== 'closed'
+            ? options.preUnlockedSession
+            : null;
+        if (!preUnlockedSession) stopOverviewTts(wrapper);
+        const requestToken = ++overviewTtsRequestToken;
+        setOverviewTtsButtons(wrapper, 'loading');
+        if (brief.source === 'fallback') {
+            const notice = brief.truncated
+                ? `未找到“语音播报正文”区块，改为朗读完整结果前 ${VOICE_BRIEF_FALLBACK_MAX_CHARS} 字。`
+                : '未找到“语音播报正文”区块，改为朗读清理后的完整结果。';
+            setPreloadStatus(notice, 'warn');
+        } else {
+            setPreloadStatus('正在生成语音简报...', 'info');
+        }
+        try {
+            const session = preUnlockedSession
+                ? await preUnlockedSession.ready
+                : await createOverviewAudioSession(requestToken);
+            if (!session || requestToken !== overviewTtsRequestToken) return;
+            session.preUnlocked = false;
+            session.requestToken = requestToken;
+            await requestOverviewTtsStream(brief.text, requestToken, samples => scheduleOverviewPcm(session, samples, wrapper, requestToken));
+            if (requestToken !== overviewTtsRequestToken || activeOverviewAudioSession !== session) return;
+            activeOverviewTtsRequest = null;
+            session.streamDone = true;
+            finishOverviewAudioSession(wrapper, session, requestToken);
+        } catch (error) {
+            if (requestToken !== overviewTtsRequestToken) return;
+            stopOverviewTts(wrapper);
+            const message = error && error.name === 'NotAllowedError'
+                ? (options.auto === true
+                    ? '自动播报预解锁失败，文字分析已保留；请点击“播报”开始。'
+                    : '浏览器阻止播放，请再点击“播报”开始。')
+                : `语音播报失败：${error.message || error}`;
+            setPreloadStatus(message, 'err');
+        }
     }
 
     function bindListOverviewChat(wrapper) {
@@ -2036,6 +2544,19 @@
             showSettingsModal();
             return;
         }
+        const voiceMode = getOverviewVoiceMode();
+        const autoPlay = voiceMode && getTtsConfig().autoPlay === true;
+        const panel = document.getElementById("my-ai-preload-panel");
+        if (!panel) return;
+        const overviewBtns = panel.querySelectorAll('[data-act="overview"]');
+        const setOvBtn = (disabled, text) => overviewBtns.forEach(b => { b.disabled = disabled; b.innerText = text; });
+        const resultDiv = panel.querySelector('.preload-overview-content');
+
+        // reset 会停止旧语音；预解锁必须紧跟其后，且不能等扫描/流式请求开始后再做。
+        resetListOverviewChat(panel);
+        const analysisToken = ++overviewAnalysisRequestToken;
+        const preUnlockedSession = autoPlay ? preUnlockOverviewAudioSession(analysisToken) : null;
+
         // Collect articles: primarily from PRELOAD_ARTICLES (accumulates across scroll),
         // filtered to current scope, then supplement with any DOM-only articles
         const route = getTimelineRouteInfo(location.href);
@@ -2072,6 +2593,7 @@
         });
 
         if (!articles.length) {
+            stopOverviewTts(panel);
             setPreloadStatus("当前列表没有扫描到文章，请稍等页面加载", "warn");
             return;
         }
@@ -2091,44 +2613,73 @@
             : "目前只有文章标题，请基于标题进行主题归纳和趋势分析。";
 
         const total = useItems.length;
-        const promptTemplate = getOverviewPrompt();
+        const promptTemplate = getOverviewPromptForMode(voiceMode);
         const prompt = promptTemplate
             .replace(/\{\{total\}\}/g, total)
             .replace(/\{\{analysisHint\}\}/g, analysisHint)
             + `\n\n当前列表共 ${articles.length} 篇，本次分析 ${total} 篇。\n\n${joined}`;
 
-        const panel = document.getElementById("my-ai-preload-panel");
-        const overviewBtns = panel ? panel.querySelectorAll('[data-act="overview"]') : [];
-        const setOvBtn = (disabled, text) => overviewBtns.forEach(b => { b.disabled = disabled; b.innerText = text; });
         setOvBtn(true, "生成中...");
         setPreloadStatus(`正在生成列表总览：${useItems.length} 篇`, "info");
-        const resultDiv = panel.querySelector('.preload-overview-content');
-        resetListOverviewChat(panel);
         if (resultDiv) { resultDiv.style.display = 'block'; resultDiv.innerHTML = '<div style="opacity:0.6">⏳ 正在生成...</div>'; }
 
         let streamStarted = false;
+        let autoTtsStarted = false;
+        const overviewSystemPrompt = voiceMode
+            ? "你是 RSS 信息播报编辑。只根据提供的文章材料写可直接朗读的中文正文，不要输出 URL、文章编号、来源说明或额外自检内容。"
+            : "你是 RSS 信息分析助手，擅长从文章标题和简介中提取趋势、分组主题、发现重点。引用文章时保留输入材料里的 #N 原始编号，方便用户定位和统计。";
         callAIChat(
             [
-                { role: "system", content: "你是 RSS 信息分析助手，擅长从文章标题和简介中提取趋势、分组主题、发现重点。引用文章时保留输入材料里的 #N 原始编号，方便用户定位和统计。" },
+                { role: "system", content: overviewSystemPrompt },
                 { role: "user", content: prompt }
             ],
             (content) => {
+                if (analysisToken !== overviewAnalysisRequestToken) return;
+                const activeScopeKey = getTimelineScopeCompareKey(getTimelineRouteInfo(location.href).scopePath);
+                if (activeScopeKey !== currentScopeKey) {
+                    stopOverviewTts(panel);
+                    return;
+                }
                 setOvBtn(false, "✨ 生成列表总览");
                 if (resultDiv) resultDiv.innerHTML = _md(content);
                 initListOverviewChat(panel, content, { sourceText: joined });
                 setPreloadStatus("列表总览生成完成", "ok");
+                if (autoPlay && !autoTtsStarted) {
+                    autoTtsStarted = true;
+                    playOverviewTts(panel, content, { auto: true, analysisToken, preUnlockedSession });
+                } else if (!autoTtsStarted) {
+                    setOverviewTtsButtons(panel, 'idle');
+                }
             },
             (err) => {
+                if (analysisToken !== overviewAnalysisRequestToken) return;
+                stopOverviewTts(panel);
+                if (getTimelineScopeCompareKey(getTimelineRouteInfo(location.href).scopePath) !== currentScopeKey) return;
                 setOvBtn(false, "✨ 生成列表总览");
                 if (resultDiv) resultDiv.innerHTML = '<div style="color:red">❌ ' + (err.message || err) + '</div>';
                 setPreloadStatus(`列表总览失败：${err.message || err}`, "err");
             },
             (delta, full) => {
+                if (analysisToken !== overviewAnalysisRequestToken) return;
+                if (getTimelineScopeCompareKey(getTimelineRouteInfo(location.href).scopePath) !== currentScopeKey) {
+                    stopOverviewTts(panel);
+                    return;
+                }
                 if (!streamStarted) {
                     streamStarted = true;
                     if (resultDiv) resultDiv.innerHTML = '';
                 }
                 if (resultDiv) resultDiv.innerHTML = _md(full) + '<span style="opacity:0.5">▍</span>';
+                const readyBrief = extractClosedOverviewVoiceBrief(full);
+                if (shouldAutoStartOverviewTts({
+                    voiceMode,
+                    autoPlay,
+                    alreadyStarted: autoTtsStarted,
+                    brief: readyBrief
+                })) {
+                    autoTtsStarted = true;
+                    playOverviewTts(panel, full, { auto: true, analysisToken, brief: readyBrief, preUnlockedSession });
+                }
             }
         );
     }
@@ -2168,6 +2719,10 @@
             preloadIgnoredScopes: getIgnoredPreloadScopes(),
             fetchFulltext: getFetchFulltextEnabled(),
             maxChars: getMaxChars(),
+            overviewPrompt: getOverviewPrompt(),
+            overviewVoiceMode: getOverviewVoiceMode(),
+            overviewVoicePrompt: getOverviewVoicePrompt(),
+            overviewTts: getTtsConfig(),
             flomoApiUrl: getFlomoApiUrl(),
             flomoTags: getFlomoTags()
         };
@@ -2187,6 +2742,10 @@
         if (remote.preloadIgnoredScopes && typeof remote.preloadIgnoredScopes === 'object') GM_setValue("ai_preload_ignored_scopes", remote.preloadIgnoredScopes);
         if (typeof remote.fetchFulltext === 'boolean') setFetchFulltextEnabled(remote.fetchFulltext);
         if (typeof remote.maxChars === 'number') setMaxChars(remote.maxChars);
+        if (typeof remote.overviewPrompt === 'string') setOverviewPrompt(remote.overviewPrompt);
+        if (typeof remote.overviewVoiceMode === 'boolean') setOverviewVoiceMode(remote.overviewVoiceMode);
+        if (typeof remote.overviewVoicePrompt === 'string') setOverviewVoicePrompt(remote.overviewVoicePrompt);
+        if (remote.overviewTts && typeof remote.overviewTts === 'object') setTtsConfig(remote.overviewTts);
         if (typeof remote.flomoApiUrl === 'string') setFlomoApiUrl(remote.flomoApiUrl);
         if (typeof remote.flomoTags === 'string') setFlomoTags(remote.flomoTags);
     }
@@ -2581,7 +3140,7 @@
         }
         #my-ai-preload-panel .preload-actions {
             display: grid;
-            grid-template-columns: repeat(3, minmax(0, 1fr));
+            grid-template-columns: minmax(0, 1.6fr) repeat(3, minmax(0, 1fr));
             gap: 6px;
             margin-bottom: 10px;
         }
@@ -2594,12 +3153,12 @@
             cursor: pointer;
             font-size: 11px;
             line-height: 1.2;
-            white-space: normal;
+            white-space: nowrap;
             word-break: keep-all;
-            overflow-wrap: anywhere;
             min-width: 0;
             min-height: 34px;
             overflow: hidden;
+            text-overflow: ellipsis;
         }
         #my-ai-preload-panel .preload-actions button[data-act="preload-list"] {
             grid-column: 1 / -1;
@@ -3036,6 +3595,12 @@
         .dark .auto-summary-row { background: #1a2e1f; border-color: #2d5a3a; }
         .auto-summary-row label { display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer; font-weight: 600; }
         .auto-summary-row .desc { font-size: 11px; color: #888; margin-left: 24px; }
+        .tts-settings { margin: 12px 0; border: 1px solid #bfdbfe; border-radius: 6px; padding: 8px 10px; background: #eff6ff; }
+        .tts-settings summary { cursor: pointer; color: #1d4ed8; font-size: 13px; font-weight: 600; }
+        .dark .tts-settings { background: #172554; border-color: #1e40af; }
+        .dark .tts-settings summary { color: #bfdbfe; }
+        .tts-auto-play-row.is-disabled { opacity: 0.5; }
+        .tts-auto-play-row.is-disabled label { cursor: not-allowed; }
 
         .flomo-section { padding: 10px; background: #ecfdf5; border-radius: 6px; border: 1px solid #6ee7b7; }
         .dark .flomo-section { background: #0f2a1f; border-color: #15803d; }
@@ -3201,11 +3766,31 @@
                     <div class="my-input-group">
                         <label class="my-input-label">📊 列表分析</label>
                         <div class="auto-summary-row">
-                            <div style="font-size:11px;color:#888;margin-bottom:4px;">分析提示词（可用变量：{{total}} 文章数，{{analysisHint}} 分析提示）</div>
+                            <label><input type="checkbox" id="cfg-overview-voice-mode"> 启用语音播报模式</label>
+                            <div class="desc">决定列表分析使用哪套提示词；关闭时保留详细文字分析，开启时只输出更短、可直接播报的正文。</div>
+                            <div style="font-size:11px;color:#888;margin:8px 0 4px;">文字模式提示词（可用变量：{{total}} 文章数，{{analysisHint}} 分析提示）</div>
                             <textarea id="cfg-overview-prompt" class="my-input" rows="8" style="font-size:12px;line-height:1.5;resize:vertical;"></textarea>
-                            <div class="desc">修改提示词可调整分析风格和输出结构。留空恢复默认。</div>
+                            <div class="desc">关闭语音模式时使用。留空恢复默认。</div>
+                            <div style="font-size:11px;color:#888;margin:8px 0 4px;">语音模式提示词（可用变量：{{total}} 文章数，{{analysisHint}} 分析提示）</div>
+                            <textarea id="cfg-overview-voice-prompt" class="my-input" rows="8" style="font-size:12px;line-height:1.5;resize:vertical;"></textarea>
+                            <div class="desc">开启语音模式时使用。默认只生成“# 🎧 语音播报正文”和隐藏结束标记，正文生成后即可自动播报；留空恢复默认。</div>
                         </div>
                     </div>
+
+                    <details class="tts-settings">
+                        <summary>🎧 语音播报（MiMo TTS）</summary>
+                        <div class="auto-summary-row" style="margin-top:8px;">
+                            <div class="tts-auto-play-row" id="cfg-tts-auto-play-row">
+                                <label><input type="checkbox" id="cfg-tts-auto-play"> 语音模式下自动播放</label>
+                                <div class="desc">默认关闭。浏览器若拦截自动播放，会保留“播报”按钮供手动开始。</div>
+                            </div>
+                            <div><div style="font-size:11px;color:#888;margin-bottom:3px;">TTS URL</div><input id="cfg-tts-url" class="my-input" type="url"></div>
+                            <div><div style="font-size:11px;color:#888;margin-bottom:3px;">TTS API Key</div><input id="cfg-tts-key" class="my-input" type="password" autocomplete="off"><div class="desc" style="margin-left:0;">只保存在本机脚本存储，不会上传到 WebDAV 同步文件。</div></div>
+                            <div><div style="font-size:11px;color:#888;margin-bottom:3px;">TTS 模型</div><input id="cfg-tts-model" class="my-input"></div>
+                            <div><div style="font-size:11px;color:#888;margin-bottom:3px;">预置音色</div><select id="cfg-tts-voice" class="my-input"><option value="冰糖">冰糖</option><option value="茉莉">茉莉</option><option value="苏打">苏打</option><option value="白桦">白桦</option></select></div>
+                            <div><div style="font-size:11px;color:#888;margin-bottom:3px;">播报风格</div><textarea id="cfg-tts-style" class="my-input" rows="3" style="resize:vertical;"></textarea></div>
+                        </div>
+                    </details>
 
                     <div class="my-input-group">
                         <label class="my-input-label">📡 原文抓取策略（按勾选顺序依次尝试）</label>
@@ -3277,7 +3862,8 @@
         loadStrategiesUI();
         document.getElementById('cfg-auto-summarize').checked = getAutoSummarizeEnabled();
         document.getElementById("cfg-thinking").checked = getThinkingEnabled();
-        document.getElementById('cfg-overview-prompt').value = getOverviewPrompt();
+        loadOverviewConfigUI();
+        loadTtsConfigUI();
         document.getElementById('cfg-flomo-url').value = getFlomoApiUrl();
         document.getElementById('cfg-flomo-tags').value = getFlomoTags();
         document.getElementById('webdav-user').value = getWebDAVUser();
@@ -3301,6 +3887,52 @@
         if (document.getElementById('strat-heuristic').checked) arr.push('heuristic');
         if (arr.length === 0) arr.push('heuristic');
         setExtractStrategies(arr);
+    }
+
+    function loadTtsConfigUI() {
+        const config = getTtsConfig();
+        document.getElementById('cfg-tts-auto-play').checked = config.autoPlay === true;
+        document.getElementById('cfg-tts-url').value = config.url;
+        document.getElementById('cfg-tts-key').value = getTtsApiKey();
+        document.getElementById('cfg-tts-model').value = config.model;
+        document.getElementById('cfg-tts-voice').value = config.voice;
+        document.getElementById('cfg-tts-style').value = config.style;
+        updateOverviewVoiceModeUi();
+    }
+
+    function loadOverviewConfigUI() {
+        document.getElementById('cfg-overview-voice-mode').checked = getOverviewVoiceMode();
+        document.getElementById('cfg-overview-prompt').value = getOverviewPrompt();
+        document.getElementById('cfg-overview-voice-prompt').value = getOverviewVoicePrompt();
+    }
+
+    function updateOverviewVoiceModeUi() {
+        const voiceModeCheckbox = document.getElementById('cfg-overview-voice-mode');
+        const autoPlayCheckbox = document.getElementById('cfg-tts-auto-play');
+        const autoPlayRow = document.getElementById('cfg-tts-auto-play-row');
+        if (!voiceModeCheckbox || !autoPlayCheckbox || !autoPlayRow) return;
+        const voiceMode = voiceModeCheckbox.checked === true;
+        autoPlayCheckbox.disabled = !voiceMode;
+        autoPlayCheckbox.setAttribute('aria-disabled', String(!voiceMode));
+        autoPlayRow.setAttribute('aria-disabled', String(!voiceMode));
+        autoPlayRow.classList.toggle('is-disabled', !voiceMode);
+    }
+
+    function saveOverviewConfigFromUI() {
+        setOverviewVoiceMode(document.getElementById('cfg-overview-voice-mode').checked);
+        setOverviewPrompt(document.getElementById('cfg-overview-prompt').value.trim());
+        setOverviewVoicePrompt(document.getElementById('cfg-overview-voice-prompt').value.trim());
+    }
+
+    function saveTtsConfigFromUI() {
+        setTtsConfig({
+            autoPlay: document.getElementById('cfg-tts-auto-play').checked,
+            url: document.getElementById('cfg-tts-url').value,
+            model: document.getElementById('cfg-tts-model').value,
+            voice: document.getElementById('cfg-tts-voice').value,
+            style: document.getElementById('cfg-tts-style').value
+        });
+        setTtsApiKey(document.getElementById('cfg-tts-key').value);
     }
 
     function renderProfiles(selectEl) {
@@ -3407,6 +4039,7 @@
 
         const webdavPassInput = document.getElementById('webdav-pass');
         document.getElementById('btn-toggle-webdav-pw').onclick = () => webdavPassInput.type = webdavPassInput.type === "password" ? "text" : "password";
+        document.getElementById('cfg-overview-voice-mode').onchange = () => updateOverviewVoiceModeUi();
 
         const btnUp = document.getElementById('btn-webdav-up');
         const btnDown = document.getElementById('btn-webdav-down');
@@ -3423,6 +4056,8 @@
             saveStrategiesFromUI();
             setAutoSummarizeEnabled(document.getElementById('cfg-auto-summarize').checked);
             setThinkingEnabled(document.getElementById("cfg-thinking").checked);
+            saveOverviewConfigFromUI();
+            saveTtsConfigFromUI();
             setFlomoApiUrl(document.getElementById('cfg-flomo-url').value);
             setFlomoTags(document.getElementById('cfg-flomo-tags').value);
             persistWebDAVCredsFromForm();
@@ -3452,7 +4087,8 @@
                 loadFormData(getActiveConfig());
                 loadStrategiesUI();
                 document.getElementById('cfg-auto-summarize').checked = getAutoSummarizeEnabled();
-                document.getElementById('cfg-overview-prompt').value = getOverviewPrompt();
+                loadOverviewConfigUI();
+                loadTtsConfigUI();
                 document.getElementById('cfg-flomo-url').value = getFlomoApiUrl();
                 setWebDAVStatus(`✅ 下载成功 · 配置数:${merged.profiles.length} · ${new Date().toLocaleTimeString()}`, "success");
             } catch(e) {
@@ -3467,6 +4103,8 @@
             saveStrategiesFromUI();
             setAutoSummarizeEnabled(document.getElementById('cfg-auto-summarize').checked);
             setThinkingEnabled(document.getElementById("cfg-thinking").checked);
+            saveOverviewConfigFromUI();
+            saveTtsConfigFromUI();
             setFlomoApiUrl(document.getElementById('cfg-flomo-url').value);
             setFlomoTags(document.getElementById('cfg-flomo-tags').value);
             persistWebDAVCredsFromForm();
@@ -3532,7 +4170,8 @@
             saveStrategiesFromUI();
             setAutoSummarizeEnabled(document.getElementById('cfg-auto-summarize').checked);
             setThinkingEnabled(document.getElementById("cfg-thinking").checked);
-            setOverviewPrompt(document.getElementById('cfg-overview-prompt').value.trim());
+            saveOverviewConfigFromUI();
+            saveTtsConfigFromUI();
             setFlomoApiUrl(document.getElementById('cfg-flomo-url').value);
             setFlomoTags(document.getElementById('cfg-flomo-tags').value);
             persistWebDAVCredsFromForm();
