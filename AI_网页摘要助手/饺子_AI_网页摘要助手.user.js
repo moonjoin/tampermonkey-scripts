@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         饺子 AI 网页摘要助手
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      3.0.4
+// @version      3.0.5
 // @description  指定网站自动弹出 AI 网页摘要，支持连续对话、多预设、多模板、SPA路由、摘要生图、flomo、坚果云双文件云同步。Shadow DOM 隔离样式。
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
@@ -1991,6 +1991,10 @@
         padding: 10px 14px;
         font-size: 14px; line-height: 1.7;
         min-height: 0;
+        pointer-events: auto;
+        user-select: text;
+        -webkit-user-select: text;
+        cursor: text;
       }
       .tabbit-placeholder { color: #888; }
 
@@ -2003,6 +2007,10 @@
       .tabbit-msg-content {
         padding: 10px 14px; border-radius: 12px;
         background: #f7f8fc;
+        pointer-events: auto;
+        user-select: text;
+        -webkit-user-select: text;
+        cursor: text;
       }
       .tabbit-msg-user .tabbit-msg-content {
         background: linear-gradient(135deg, #eef2ff, #e0e7ff);
@@ -2088,7 +2096,7 @@
       .tabbit-body code { background: rgba(139,92,246,.12); padding: 1px 6px; border-radius: 4px; font-size: .88em; color: #be185d; }
       .tabbit-body pre { background: rgba(15,23,42,.05); padding: .7em; border-radius: 8px; overflow-x: auto; }
       .tabbit-body blockquote { border-left: 3px solid #7c3aed; padding: .3em .8em; background: rgba(139,92,246,.08); margin: .5em 0; border-radius: 0 6px 6px 0; }
-      .tabbit-body a { color: #2563eb; text-decoration: underline; }
+      .tabbit-body a { color: #2563eb; text-decoration: underline; cursor: pointer; }
 
       .tabbit-input-area {
         flex-shrink: 0;
