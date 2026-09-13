@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         饺子 AI 网页摘要助手
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      3.0.6
+// @version      3.0.7
 // @description  指定网站自动弹出 AI 网页摘要，支持连续对话、多预设、多模板、SPA路由、摘要生图、flomo、坚果云双文件云同步。Shadow DOM 隔离样式。
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
@@ -2536,19 +2536,33 @@
         background: linear-gradient(135deg, rgba(139, 92, 246, .12), rgba(59, 130, 246, .08));
       }
 
+      .tabbit-sheet-handle { display: none; }
+
       /* 手机布局覆盖桌面保存的位置和尺寸，避免面板落在屏幕外。 */
       @media (max-width: 600px), (max-height: 500px) and (pointer: coarse) {
         #${PANEL_ID} {
+          --tabbit-sheet-visible-height: min(var(--tabbit-sheet-height, 90dvh), calc(var(--tabbit-viewport-height, 100dvh) - 16px - env(safe-area-inset-top) - env(safe-area-inset-bottom)));
           left: max(8px, env(safe-area-inset-left)) !important;
           right: max(8px, env(safe-area-inset-right)) !important;
-          top: calc(var(--tabbit-viewport-top, 0px) + 8px + env(safe-area-inset-top)) !important;
+          top: calc(var(--tabbit-viewport-top, 0px) + var(--tabbit-viewport-height, 100dvh) - var(--tabbit-sheet-visible-height) - 8px - env(safe-area-inset-bottom)) !important;
           bottom: auto !important;
           width: auto !important;
           height: calc(100vh - 16px - env(safe-area-inset-top) - env(safe-area-inset-bottom)) !important;
-          height: calc(var(--tabbit-viewport-height, 100dvh) - 16px - env(safe-area-inset-top) - env(safe-area-inset-bottom)) !important;
+          height: var(--tabbit-sheet-visible-height) !important;
           min-width: 0; min-height: 0; max-width: none; max-height: none;
           border-radius: 14px;
         }
+        .tabbit-sheet-handle {
+          display: flex; flex-direction: column; align-items: center; justify-content: center;
+          gap: 3px; width: 100%; height: 44px; flex-shrink: 0;
+          border: 0; background: #f5f3ff; color: #6d5c9a; font-family: inherit; font-size: 11px; line-height: 1.2;
+          touch-action: none; user-select: none; -webkit-user-select: none; cursor: ns-resize;
+        }
+        .tabbit-sheet-handle::before { content: ''; width: 36px; height: 4px; border-radius: 4px; background: #b3a5d5; }
+        .tabbit-sheet-compact .tabbit-header select,
+        .tabbit-sheet-compact .tabbit-toolbar button:not(#tabbit-run-btn),
+        .tabbit-sheet-compact .tabbit-followup-presets { display: none; }
+        .tabbit-sheet-compact #tabbit-chat-input { max-height: 60px; }
         .tabbit-header {
           display: grid; grid-template-columns: minmax(0, 1fr) minmax(44px, .65fr) 44px;
           gap: 6px; padding: 8px 10px; cursor: default;
@@ -2581,6 +2595,10 @@
         .tabbit-send-btn { height: 44px; font-size: 15px; }
         .tabbit-input-hint, .tabbit-resize-handle { display: none; }
         .tabbit-panel-open #${FLOAT_BTN_ID} { visibility: hidden; }
+      }
+
+      @media (max-height: 500px) and (pointer: coarse) {
+        .tabbit-header, .tabbit-toolbar, .tabbit-input-area { padding-top: 4px; padding-bottom: 4px; }
       }
 
       /* 🥟 浮动按钮（Shadow DOM 内） */
@@ -2894,6 +2912,7 @@
     panelEl.id = PANEL_ID;
     panelEl.classList.add('tabbit-hidden');
     panelEl.innerHTML = `
+      <button type="button" class="tabbit-sheet-handle" id="tabbit-sheet-handle" aria-label="拖动调整高度，点击切换高度">上下拖动调整 · 点击切换</button>
       <div class="tabbit-header" id="tabbit-drag-handle">
         <div class="tabbit-title">🥟 饺子 AI 摘要</div>
         <div class="tabbit-header-actions">
@@ -2977,16 +2996,7 @@
       input.style.height = Math.min(140, input.scrollHeight) + 'px';
     });
 
-    // 跟随软键盘与浏览器地址栏改变后的可视区域，不写回桌面尺寸。
-    const syncMobileViewport = () => {
-      const viewport = window.visualViewport;
-      panelEl.style.setProperty('--tabbit-viewport-height', (viewport?.height || window.innerHeight) + 'px');
-      panelEl.style.setProperty('--tabbit-viewport-top', (viewport?.offsetTop || 0) + 'px');
-    };
-    syncMobileViewport();
-    window.addEventListener('resize', syncMobileViewport);
-    window.visualViewport?.addEventListener('resize', syncMobileViewport);
-    window.visualViewport?.addEventListener('scroll', syncMobileViewport);
+    enableMobileSheet();
 
     enablePanelDrag();
     enablePanelResize();
@@ -3004,6 +3014,74 @@
       if (target && target.closest && target.closest('.tabbit-image-preview-overlay')) return;
       closePanel();
     }, true);
+  }
+
+  function enableMobileSheet() {
+    const media = window.matchMedia('(max-width: 600px), (max-height: 500px) and (pointer: coarse)');
+    const stops = [0.35, 0.6, 0.95];
+    const handle = panelEl.querySelector('#tabbit-sheet-handle');
+    const input = panelEl.querySelector('#tabbit-chat-input');
+    let ratio = stops.includes(config.panel?.mobileHeightRatio) ? config.panel.mobileHeightRatio : 0.95;
+    let drag = null;
+    let suppressClick = false;
+    const availableHeight = () => {
+      return Math.max(0, (window.visualViewport?.height || window.innerHeight) - 16);
+    };
+    const heightFor = value => Math.min(availableHeight(), Math.max(280, availableHeight() * value));
+    const render = height => {
+      const viewport = window.visualViewport;
+      panelEl.style.setProperty('--tabbit-viewport-height', (viewport?.height || window.innerHeight) + 'px');
+      panelEl.style.setProperty('--tabbit-viewport-top', (viewport?.offsetTop || 0) + 'px');
+      const nextHeight = height ?? heightFor(shadowRoot.activeElement === input ? 0.95 : ratio);
+      panelEl.style.setProperty('--tabbit-sheet-height', nextHeight + 'px');
+      panelEl.classList.toggle('tabbit-sheet-compact', nextHeight < 440 && (nextHeight < heightFor(0.95) - 1 || availableHeight() < 340));
+      handle.textContent = (ratio === 0.35 ? '小窗' : ratio === 0.6 ? '半屏' : '全屏') + ' · 上下拖动 / 点击切换';
+    };
+    const persist = value => {
+      ratio = value;
+      config.panel = { ...config.panel, mobileHeightRatio: ratio };
+      saveConfig();
+      render();
+    };
+    handle.addEventListener('pointerdown', event => {
+      if (!media.matches || !event.isPrimary || event.button !== 0) return;
+      input.blur();
+      suppressClick = false;
+      drag = { id: event.pointerId, y: event.clientY, height: panelEl.getBoundingClientRect().height, moved: false };
+      handle.setPointerCapture(event.pointerId);
+    });
+    handle.addEventListener('pointermove', event => {
+      if (!drag || event.pointerId !== drag.id) return;
+      const delta = drag.y - event.clientY;
+      if (Math.abs(delta) > 6) drag.moved = true;
+      if (drag.moved) render(Math.min(heightFor(0.95), Math.max(heightFor(0.35), drag.height + delta)));
+    });
+    const finish = event => {
+      if (!drag || event.pointerId !== drag.id) return;
+      const ended = drag;
+      drag = null;
+      suppressClick = ended.moved;
+      if (event.type === 'pointerup' && ended.moved) {
+        const height = panelEl.getBoundingClientRect().height;
+        persist(stops.reduce((best, stop) => Math.abs(heightFor(stop) - height) < Math.abs(heightFor(best) - height) ? stop : best, ratio));
+      } else render();
+      if (handle.hasPointerCapture(ended.id)) handle.releasePointerCapture(ended.id);
+    };
+    handle.addEventListener('pointerup', finish);
+    handle.addEventListener('pointercancel', finish);
+    handle.addEventListener('lostpointercapture', finish);
+    handle.addEventListener('click', () => {
+      if (suppressClick) { suppressClick = false; return; }
+      persist(stops[(stops.indexOf(ratio) + 1) % stops.length]);
+    });
+    const sync = () => { drag = null; render(); };
+    window.addEventListener('resize', sync);
+    window.visualViewport?.addEventListener('resize', sync);
+    window.visualViewport?.addEventListener('scroll', () => render());
+    media.addEventListener('change', sync);
+    input.addEventListener('focus', () => render());
+    input.addEventListener('blur', () => render());
+    render();
   }
 
   function enablePanelDrag() {
