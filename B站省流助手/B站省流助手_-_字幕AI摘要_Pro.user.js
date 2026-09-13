@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站省流助手 - 字幕AI摘要 Pro
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      5.0.16
+// @version      5.0.17
 // @description  自动提取B站视频字幕，通过自定义AI API生成极简摘要，支持模型切换、持续对话和评论区总结；支持自动解析开关、自动获取模型列表、flomo自动加标签、总结生图和API兜底功能
 // @author       次元饺子
 // @match        https://www.bilibili.com/video/*
@@ -928,6 +928,7 @@
     skipDuration: 60,
     autoParse: true,
     autoOpenPanelWhileProcessing: false,
+    showWindowControls: false,
     enableThinking: true,
     promptPresets: DEFAULT_PRESETS,
     activePresetId: 'preset_default',
@@ -3569,6 +3570,27 @@
         border-right: 2px solid rgba(102,126,234,0.55);
         border-bottom: 2px solid rgba(102,126,234,0.55);
       }
+      #tabbit-ai-summary-panel.tabbit-window-managed { min-width: 0; min-height: 0; max-width: none; max-height: none; }
+      #tabbit-ai-summary-panel[data-window-mode="right"] .tabbit-panel-resizer,
+      #tabbit-ai-summary-panel[data-window-mode="full"] .tabbit-panel-resizer { display: none; }
+      #tabbit-ai-summary-panel .tabbit-window-menu[hidden], #tabbit-window-button[hidden],
+      .tabbit-window-menu [hidden] { display: none !important; }
+      .tabbit-window-menu { position: absolute; right: 6px; z-index: 20; box-sizing: border-box; max-width: calc(100% - 12px); padding: 1em; background: white; color: #333; border: 1px solid #e5e5ef; border-radius: 12px; box-shadow: 0 8px 30px #0003; overflow: auto; overscroll-behavior: contain; line-height: 1.5; }
+      .tabbit-window-menu button { font: inherit; min-height: 3em; padding: .4em; border: 1px solid #e2e2eb; border-radius: 8px; color: #444; background: #f5f5fa; cursor: pointer; }
+      .tabbit-window-managed .tabbit-panel-header > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .tabbit-window-managed .tabbit-header-actions { flex-shrink: 0; }
+      .tabbit-window-modes { display: flex; gap: .4em; margin: .8em 0; flex-wrap: wrap; }
+      .tabbit-window-modes button { flex: 1; white-space: nowrap; }
+      .tabbit-window-menu button[aria-pressed="true"], .tabbit-window-menu [data-window-done] { background: #7660df; color: white; }
+      .tabbit-window-menu label { display: block; margin-top: .5em; }
+      .tabbit-window-menu output { float: right; color: #7660df; }
+      .tabbit-window-menu input[type="range"] { display: block; width: 100%; height: 3em; margin: 0; accent-color: #7660df; touch-action: none; font-size: inherit; appearance: none; background: transparent; }
+      .tabbit-window-menu input[type="range"]::-webkit-slider-runnable-track { height: .35em; background: #e7e4f3; border-radius: 1em; }
+      .tabbit-window-menu input[type="range"]::-webkit-slider-thumb { appearance: none; width: 1.5em; height: 1.5em; margin-top: -.575em; border-radius: 50%; background: #7660df; border: 2px solid white; box-shadow: 0 1px 5px #0003; }
+      .tabbit-window-menu input[type="range"]::-moz-range-track { height: .35em; background: #e7e4f3; border-radius: 1em; }
+      .tabbit-window-menu input[type="range"]::-moz-range-thumb { width: 1.5em; height: 1.5em; border-radius: 50%; background: #7660df; border: 2px solid white; }
+      .tabbit-window-menu p { margin: .5em 0; color: #777; font-size: .85em; }
+      .tabbit-window-footer { display: flex; justify-content: space-between; gap: .5em; margin-top: .6em; }
       .tabbit-panel-header {
         display: flex;
         justify-content: space-between;
@@ -4846,6 +4868,7 @@
 
     handle.addEventListener('mousedown', function(e) {
       if (e.button !== 0) return;
+      if (target._windowTools && !target._windowTools.canDrag()) return;
       if (!handleIsTarget) {
         if (e.target.tagName === 'BUTTON' || e.target.closest('button')) return;
         if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
@@ -4938,6 +4961,7 @@
 
     handle.addEventListener('mousedown', function(e) {
       if (e.button !== 0) return;
+      if (panel._windowTools && !panel._windowTools.canDrag()) return;
       const rect = panel.getBoundingClientRect();
       isResizing = true;
       startX = e.clientX;
@@ -5002,13 +5026,150 @@
     });
   }
 
+  // 窗口布局独立于字幕流程；比例基于可视视口，兼容手机的桌面网页缩放。
+  function setupWindowTools(panel) {
+    const button = panel.querySelector('#tabbit-window-button');
+    const menu = panel.querySelector('.tabbit-window-menu');
+    const widthInput = menu.querySelector('[data-window-width]');
+    const heightInput = menu.querySelector('[data-window-height]');
+    const events = new AbortController();
+    const touch = () => navigator.maxTouchPoints > 0;
+    const slotKey = () => !touch() ? 'desktop' :
+      ((screen.orientation?.type || (screen.width > screen.height ? 'landscape' : 'portrait')).startsWith('landscape') ? 'landscape' : 'portrait');
+    const viewport = () => {
+      const v = window.visualViewport;
+      const gap = 8 / (v?.scale || 1);
+      return { x: (v?.offsetLeft || 0) + gap, y: (v?.offsetTop || 0) + gap,
+        w: Math.max(1, (v?.width || innerWidth) - 2 * gap), h: Math.max(1, (v?.height || innerHeight) - 2 * gap) };
+    };
+    const bound = (v, low, high) => Math.max(low, Math.min(Number.isFinite(v) ? v : low, high));
+    const getState = () => POSITIONS.windowLayouts?.[slotKey()];
+    const normalize = () => {
+      const v = viewport(), r = panel.getBoundingClientRect();
+      return { x: bound((r.x - v.x) / v.w, 0, 1), y: bound((r.y - v.y) / v.h, 0, 1),
+        w: bound(r.width / v.w, .25, 1), h: bound(r.height / v.h, .25, 1) };
+    };
+    const ensureState = () => {
+      if (!POSITIONS.windowLayouts) POSITIONS.windowLayouts = {};
+      const key = slotKey();
+      if (!POSITIONS.windowLayouts[key]) POSITIONS.windowLayouts[key] = { mode: 'free', width: .42, free: normalize() };
+      return POSITIONS.windowLayouts[key];
+    };
+    let open = false, drag = null;
+    const setOpen = value => {
+      open = value;
+      menu.hidden = !value;
+      button.setAttribute('aria-expanded', String(value));
+    };
+    const render = () => {
+      const state = getState(), v = viewport();
+      button.hidden = !CONFIG.showWindowControls;
+      if (button.hidden) setOpen(false);
+      panel.classList.toggle('tabbit-window-managed', !!state);
+      panel.dataset.windowMode = state?.mode || 'free';
+      const minHeightRatio = Math.min(1, Math.max(.25, 180 / (touch() ? (window.visualViewport?.scale || 1) : 1) / v.h));
+      heightInput.min = String(Math.ceil(minHeightRatio * 100));
+      if (state) {
+        const free = state.free || { x: .5, y: 0, w: .5, h: .8 };
+        const w = v.w * (state.mode === 'full' ? 1 : state.mode === 'right' ? bound(state.width, .25, .75) : bound(free.w, .25, 1));
+        const h = v.h * (state.mode === 'free' ? bound(free.h, minHeightRatio, 1) : 1);
+        const x = state.mode === 'right' ? v.x + v.w - w : state.mode === 'full' ? v.x : v.x + bound(free.x * v.w, 0, v.w - w);
+        const y = state.mode === 'free' ? v.y + bound(free.y * v.h, 0, v.h - h) : v.y;
+        Object.assign(panel.style, { left: x + 'px', top: y + 'px', width: w + 'px', height: h + 'px', right: 'auto', bottom: 'auto', transform: 'none' });
+      }
+      const mode = state?.mode || 'free', free = state?.free || normalize();
+      menu.querySelectorAll('[data-window-mode]').forEach(el => el.setAttribute('aria-pressed', String(el.dataset.windowMode === mode)));
+      widthInput.disabled = mode === 'full';
+      widthInput.max = mode === 'free' ? '100' : '75';
+      widthInput.value = Math.round((mode === 'full' ? 1 : mode === 'right' ? state.width : free.w) * 100);
+      heightInput.value = Math.max(Number(heightInput.min), Math.round(free.h * 100));
+      menu.querySelector('[data-width-value]').textContent = widthInput.value + '%';
+      menu.querySelector('[data-height-value]').textContent = heightInput.value + '%';
+      menu.querySelector('[data-height-row]').hidden = mode !== 'free';
+      menu.querySelector('[data-height-hint]').hidden = mode === 'free';
+      // 菜单控件按手机实际缩放补偿，避免电脑模式下滑块太小。
+      const scale = touch() ? 1 / (window.visualViewport?.scale || 1) : 1;
+      button.style.fontSize = 16 * scale + 'px';
+      button.style.minWidth = 40 * scale + 'px';
+      button.style.minHeight = 40 * scale + 'px';
+      button.setAttribute('aria-label', '调整窗口');
+      menu.style.fontSize = 14 * scale + 'px';
+      menu.style.width = Math.min(320 * scale, v.w - 12) + 'px';
+      const header = panel.querySelector('.tabbit-panel-header').getBoundingClientRect();
+      menu.style.top = header.height + 'px';
+      menu.style.maxHeight = Math.max(44 * scale, panel.getBoundingClientRect().height - header.height - 8) + 'px';
+    };
+    const save = () => { savePositions(POSITIONS); };
+    const reset = () => {
+      if (POSITIONS.windowLayouts) delete POSITIONS.windowLayouts[slotKey()];
+      panel.classList.remove('tabbit-window-managed');
+      Object.assign(panel.style, { left: '', top: '', right: '', bottom: '', width: '', height: '', transform: '' });
+      applyPanelPosition(panel); setOpen(false); render(); save();
+    };
+    button.addEventListener('click', () => { render(); setOpen(!open); });
+    menu.querySelectorAll('[data-window-mode]').forEach(el => el.addEventListener('click', () => {
+      const state = ensureState(); state.mode = el.dataset.windowMode; render(); save();
+    }));
+    widthInput.addEventListener('input', () => {
+      const state = ensureState();
+      if (state.mode === 'right') state.width = Number(widthInput.value) / 100;
+      else if (state.mode === 'free') state.free.w = Number(widthInput.value) / 100;
+      render();
+    });
+    heightInput.addEventListener('input', () => { ensureState().free.h = Number(heightInput.value) / 100; render(); });
+    [widthInput, heightInput].forEach(el => el.addEventListener('change', save));
+    menu.querySelector('[data-window-done]').addEventListener('click', () => setOpen(false));
+    menu.querySelector('[data-window-reset]').addEventListener('click', reset);
+    panel.addEventListener('pointerdown', e => { if (!menu.contains(e.target) && !button.contains(e.target)) setOpen(false); });
+    panel.addEventListener('keydown', e => { if (e.key === 'Escape' && open) { setOpen(false); button.focus(); } });
+    const header = panel.querySelector('.tabbit-panel-header');
+    header.style.touchAction = 'none';
+    header.addEventListener('pointerdown', e => {
+      if (e.pointerType === 'mouse' || !e.isPrimary || e.target.closest('button') || (getState()?.mode || 'free') !== 'free') return;
+      const r = panel.getBoundingClientRect();
+      drag = { id: e.pointerId, x: e.clientX, y: e.clientY, left: r.x, top: r.y, width: r.width, height: r.height };
+      header.setPointerCapture(e.pointerId);
+    });
+    header.addEventListener('pointermove', e => {
+      if (!drag || drag.id !== e.pointerId) return;
+      const v = viewport();
+      Object.assign(panel.style, { left: bound(drag.left + e.clientX - drag.x, v.x, v.x + Math.max(0, v.w - drag.width)) + 'px',
+        top: bound(drag.top + e.clientY - drag.y, v.y, v.y + Math.max(0, v.h - drag.height)) + 'px', right: 'auto', bottom: 'auto', transform: 'none' });
+    });
+    const finish = e => {
+      if (!drag || drag.id !== e.pointerId) return;
+      if (e.type === 'pointerup') { ensureState().free = normalize(); save(); }
+      else { panel.style.left = drag.left + 'px'; panel.style.top = drag.top + 'px'; }
+      drag = null;
+      if (header.hasPointerCapture(e.pointerId)) header.releasePointerCapture(e.pointerId);
+    };
+    header.addEventListener('pointerup', finish);
+    header.addEventListener('pointercancel', finish);
+    header.addEventListener('lostpointercapture', finish);
+    let lastKey = slotKey();
+    const sync = () => {
+      if (!panel.isConnected) { events.abort(); return; }
+      const key = slotKey();
+      if (lastKey !== key) { lastKey = key; drag = null; if (!getState()) { panel.classList.remove('tabbit-window-managed'); Object.assign(panel.style, { left: '', top: '', right: '', bottom: '', transform: '' }); applyPanelPosition(panel); } }
+      render();
+    };
+    window.addEventListener('resize', sync, { signal: events.signal });
+    window.visualViewport?.addEventListener('resize', sync, { signal: events.signal });
+    window.visualViewport?.addEventListener('scroll', sync, { signal: events.signal });
+    screen.orientation?.addEventListener('change', sync, { signal: events.signal });
+    panel._windowTools = { refresh: render, reset, dispose: () => events.abort(),
+      canDrag: () => !touch() && (getState()?.mode || 'free') === 'free',
+      saveFree: () => { if (getState()) { getState().mode = 'free'; getState().free = normalize(); save(); render(); } } };
+    render();
+  }
+
   function applyPanelPosition(panel) {
     clampPanelGeometry(panel, POSITIONS.panel || {});
   }
 
   function createPanel(videoInfo) {
     const existing = document.querySelector('#tabbit-ai-summary-panel');
-    if (existing) existing.remove();
+    if (existing) { existing._windowTools?.dispose(); existing.remove(); }
 
     const panel = document.createElement('div');
     panel.id = 'tabbit-ai-summary-panel';
@@ -5021,9 +5182,23 @@
       <div class="tabbit-panel-header">
         <span>🎬 b 站省流助手</span>
         <div class="tabbit-header-actions">
+          <button class="tabbit-settings-icon-btn" id="tabbit-window-button" hidden aria-expanded="false" aria-controls="tabbit-window-menu" title="调整窗口">▣</button>
           <button class="tabbit-settings-icon-btn" id="tabbit-open-settings" title="设置">⚙️</button>
           <button class="tabbit-close-btn">&times;</button>
         </div>
+      </div>
+      <div class="tabbit-window-menu" id="tabbit-window-menu" hidden>
+        <strong>调整窗口</strong>
+        <div class="tabbit-window-modes">
+          <button type="button" data-window-mode="right">右侧满高</button>
+          <button type="button" data-window-mode="full">全屏</button>
+          <button type="button" data-window-mode="free">自由浮窗</button>
+        </div>
+        <label>宽度 <output data-width-value></output><input type="range" min="25" max="75" step="1" data-window-width aria-label="窗口宽度"></label>
+        <label data-height-row>高度 <output data-height-value></output><input type="range" min="25" max="100" step="1" data-window-height aria-label="窗口高度"></label>
+        <p data-height-hint>高度随可视区域铺满</p>
+        <p>横竖屏分别自动记住</p>
+        <div class="tabbit-window-footer"><button type="button" data-window-reset>还原初始浮窗</button><button type="button" data-window-done>完成</button></div>
       </div>
       <details class="tabbit-model-bar">
         <summary class="tabbit-model-bar-summary">
@@ -5070,10 +5245,12 @@
 
     applyPanelPosition(panel);
     document.body.appendChild(panel);
+    setupWindowTools(panel);
 
     const header = panel.querySelector('.tabbit-panel-header');
     makeDraggable(panel, header, function(left, top) {
       const geom = readPanelGeometry(panel);
+      panel._windowTools?.saveFree();
       POSITIONS.panel = { left, top, width: geom.width, height: geom.height };
       savePositions(POSITIONS);
     });
@@ -5081,6 +5258,7 @@
     const resizer = panel.querySelector('.tabbit-panel-resizer');
     if (resizer) {
       makeResizable(panel, resizer, function(geom) {
+        panel._windowTools?.saveFree();
         POSITIONS.panel = geom;
         savePositions(POSITIONS);
       });
@@ -8425,6 +8603,10 @@
                 <div class="tabbit-settings-hint">TXT/SRT 保存在这里；自动保存的图片进入“图片”子目录。评论、弹幕、全面分析和配置导出不会保存到这里。</div>
               </div>
               <div class="tabbit-settings-group">
+                <div class="tabbit-switch-row">
+                  <div><div class="tabbit-settings-label">显示窗口调整按钮</div><div class="tabbit-settings-hint">在标题栏显示入口。关闭只隐藏按钮，已调整的窗口布局仍然保留。</div></div>
+                  <label class="tabbit-switch"><input type="checkbox" id="ts-showWindowControls" ${CONFIG.showWindowControls ? 'checked' : ''}><span class="tabbit-slider"></span></label>
+                </div>
                 <div class="tabbit-settings-label">📍 位置和尺寸</div>
                 <button class="tabbit-settings-btn tabbit-settings-btn-secondary" id="ts-reset-pos">重置面板/悬浮窗位置和尺寸</button>
               </div>
@@ -8886,6 +9068,7 @@
     overlay.querySelector('#ts-reset-pos').addEventListener('click', function() {
       POSITIONS = {};
       savePositions(POSITIONS);
+      mainPanel?._windowTools?.reset();
       if (mainPanel) {
         mainPanel.style.left = '';
         mainPanel.style.top = '';
@@ -9038,6 +9221,7 @@
       const newImageGenPromptText = (overlay.querySelector('#ts-imageGenPromptText').value || '').trim();
       CONFIG.imageGenPromptText = newImageGenPromptText || IMAGE_GEN_PROMPT_TEXT;
       CONFIG.resultActionButtons = normalizeResultActionButtons(editingResultActionButtons);
+      CONFIG.showWindowControls = overlay.querySelector('#ts-showWindowControls').checked;
       currentModel = CONFIG.model;
       if (!saveConfig(CONFIG)) {
         alert('配置保存失败，请检查浏览器本地存储是否可用。');
@@ -9049,6 +9233,7 @@
       });
 
       if (mainPanel) {
+        mainPanel._windowTools?.refresh();
         const modelListEl = mainPanel.querySelector('.tabbit-model-list');
         if (modelListEl) {
           modelListEl.innerHTML = CONFIG.modelList.map(function(m) {
@@ -9195,6 +9380,7 @@
       overlay.querySelector('#ts-commentMinDelay').value = DEFAULT_CONFIG.commentMinDelay;
       overlay.querySelector('#ts-commentMaxDelay').value = DEFAULT_CONFIG.commentMaxDelay;
       overlay.querySelector('#ts-skipDuration').value = DEFAULT_CONFIG.skipDuration;
+      overlay.querySelector('#ts-showWindowControls').checked = DEFAULT_CONFIG.showWindowControls;
       overlay.querySelector('#ts-autoParse').checked = DEFAULT_CONFIG.autoParse;
       overlay.querySelector('#ts-autoOpenPanelWhileProcessing').checked = DEFAULT_CONFIG.autoOpenPanelWhileProcessing;
       overlay.querySelector('#ts-enableImageGen').checked = false;
