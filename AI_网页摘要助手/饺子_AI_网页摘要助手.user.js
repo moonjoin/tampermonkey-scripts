@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         饺子 AI 网页摘要助手
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      3.0.7
+// @version      3.0.8
 // @description  指定网站自动弹出 AI 网页摘要，支持连续对话、多预设、多模板、SPA路由、摘要生图、flomo、坚果云双文件云同步。Shadow DOM 隔离样式。
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
@@ -2536,7 +2536,7 @@
         background: linear-gradient(135deg, rgba(139, 92, 246, .12), rgba(59, 130, 246, .08));
       }
 
-      .tabbit-sheet-handle { display: none; }
+      .tabbit-sheet-handle, .tabbit-more-btn, .tabbit-mobile-more { display: none; }
 
       /* 手机布局覆盖桌面保存的位置和尺寸，避免面板落在屏幕外。 */
       @media (max-width: 600px), (max-height: 500px) and (pointer: coarse) {
@@ -2552,53 +2552,51 @@
           min-width: 0; min-height: 0; max-width: none; max-height: none;
           border-radius: 14px;
         }
+        .tabbit-header { display: flex; gap: 4px; padding: 4px 8px; cursor: default; }
+        .tabbit-title { display: none; }
+        .tabbit-header-actions { display: contents; }
         .tabbit-sheet-handle {
-          display: flex; flex-direction: column; align-items: center; justify-content: center;
-          gap: 3px; width: 100%; height: 44px; flex-shrink: 0;
-          border: 0; background: #f5f3ff; color: #6d5c9a; font-family: inherit; font-size: 11px; line-height: 1.2;
+          display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0; height: 44px;
+          padding: 0 4px; border: 0; background: transparent; color: #fff;
+          font-family: inherit; font-size: 14px; font-weight: 600; white-space: nowrap;
           touch-action: none; user-select: none; -webkit-user-select: none; cursor: ns-resize;
         }
-        .tabbit-sheet-handle::before { content: ''; width: 36px; height: 4px; border-radius: 4px; background: #b3a5d5; }
-        .tabbit-sheet-compact .tabbit-header select,
-        .tabbit-sheet-compact .tabbit-toolbar button:not(#tabbit-run-btn),
-        .tabbit-sheet-compact .tabbit-followup-presets { display: none; }
-        .tabbit-sheet-compact #tabbit-chat-input { max-height: 60px; }
-        .tabbit-header {
-          display: grid; grid-template-columns: minmax(0, 1fr) minmax(44px, .65fr) 44px;
-          gap: 6px; padding: 8px 10px; cursor: default;
-        }
-        .tabbit-title { grid-column: 1; grid-row: 1; font-size: 15px; }
-        .tabbit-header-actions { display: contents; }
-        #tabbit-settings-btn { grid-column: 2; grid-row: 1; }
-        #tabbit-close-btn { grid-column: 3; grid-row: 1; }
+        .tabbit-sheet-handle::before { content: ''; width: 20px; height: 4px; border-radius: 4px; background: rgba(255,255,255,.6); }
         .tabbit-header .tabbit-icon-btn { width: 44px; height: 44px; }
-        .tabbit-header .tabbit-profile-select { grid-column: 1; grid-row: 2; }
-        .tabbit-header .tabbit-model-select { grid-column: 2 / 4; grid-row: 2; }
-        #tabbit-settings-btn { justify-self: end; }
-        .tabbit-header select, .tabbit-toolbar select {
-          width: 100%; min-width: 0; max-width: none; height: 44px;
-          font-size: 16px; text-overflow: ellipsis;
+        .tabbit-more-btn { display: block; font-size: 13px; }
+        .tabbit-mobile-more {
+          display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 8px;
+          position: absolute; top: 56px; left: 8px; right: 8px; z-index: 20;
+          max-height: calc(100% - 120px); overflow-y: auto; overscroll-behavior: contain;
+          padding: 10px; border: 1px solid #e5e5ea; border-radius: 12px;
+          background: #fff; box-shadow: 0 8px 28px rgba(0,0,0,.2);
         }
-        .tabbit-toolbar { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); padding: 8px 10px; }
-        #tabbit-run-btn { grid-column: span 2; }
-        #tabbit-prompt-select { grid-column: span 4; }
-        .tabbit-toolbar button { min-width: 0; min-height: 44px; padding: 6px; font-size: 15px; }
+        .tabbit-mobile-more select {
+          width: 100%; min-width: 0; max-width: none; height: 44px;
+          font-size: 16px; text-overflow: ellipsis; background: #f5f5f7;
+        }
+        .tabbit-mobile-more .tabbit-toolbar {
+          display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px;
+          grid-column: 1 / -1; padding: 0; border: 0;
+        }
+        .tabbit-mobile-more #tabbit-prompt-select { grid-column: 1 / -1; }
+        .tabbit-mobile-more button { min-height: 44px; padding: 6px; font-size: 13px; }
+        .tabbit-mobile-more button[data-mobile-label]::after { content: ' ' attr(data-mobile-label); }
+        .tabbit-mobile-more #tabbit-settings-btn { width: auto; background: #f5f5f7; color: #333; grid-column: 1 / -1; }
+        .tabbit-mobile-more .tabbit-followup-presets { grid-column: 1 / -1; margin-bottom: 0; }
+        .tabbit-input-row #tabbit-run-btn { flex-shrink: 0; height: 44px; padding: 6px 10px; font-size: 13px; }
         .tabbit-status:empty { display: none; }
         .tabbit-body { padding: 8px 10px; overscroll-behavior: contain; overflow-wrap: anywhere; }
         .tabbit-msg-content { padding: 10px 12px; }
         .tabbit-msg-role { overflow-wrap: anywhere; }
         .tabbit-msg-actions button { min-height: 40px; }
-        .tabbit-input-area { padding: 8px 10px; }
+        .tabbit-input-area { padding: 6px 8px; }
         .tabbit-followup-presets { flex-wrap: nowrap; overflow-x: auto; }
         .tabbit-followup-btn { flex-shrink: 0; min-height: 40px; }
         #tabbit-chat-input { font-size: 16px; min-height: 44px; max-height: 96px; }
         .tabbit-send-btn { height: 44px; font-size: 15px; }
         .tabbit-input-hint, .tabbit-resize-handle { display: none; }
         .tabbit-panel-open #${FLOAT_BTN_ID} { visibility: hidden; }
-      }
-
-      @media (max-height: 500px) and (pointer: coarse) {
-        .tabbit-header, .tabbit-toolbar, .tabbit-input-area { padding-top: 4px; padding-bottom: 4px; }
       }
 
       /* 🥟 浮动按钮（Shadow DOM 内） */
@@ -2912,8 +2910,9 @@
     panelEl.id = PANEL_ID;
     panelEl.classList.add('tabbit-hidden');
     panelEl.innerHTML = `
-      <button type="button" class="tabbit-sheet-handle" id="tabbit-sheet-handle" aria-label="拖动调整高度，点击切换高度">上下拖动调整 · 点击切换</button>
       <div class="tabbit-header" id="tabbit-drag-handle">
+        <button type="button" class="tabbit-sheet-handle" id="tabbit-sheet-handle" aria-label="拖动调整高度，点击切换高度">🥟 AI 摘要</button>
+        <button type="button" class="tabbit-icon-btn tabbit-more-btn" id="tabbit-more-btn" aria-expanded="false" aria-controls="tabbit-mobile-more">更多</button>
         <div class="tabbit-title">🥟 饺子 AI 摘要</div>
         <div class="tabbit-header-actions">
           <select id="tabbit-profile-select" class="tabbit-profile-select" title="切换 API 配置预设"></select>
@@ -2934,6 +2933,7 @@
         <button id="tabbit-clear-btn" class="tabbit-danger-btn" title="清空对话">🗑</button>
       </div>
 
+      <div id="tabbit-mobile-more" class="tabbit-mobile-more tabbit-hidden" aria-label="摘要工具"></div>
       <div id="tabbit-status" class="tabbit-status"></div>
 
       <div id="tabbit-body" class="tabbit-body">
@@ -2996,6 +2996,7 @@
       input.style.height = Math.min(140, input.scrollHeight) + 'px';
     });
 
+    enableMobileControls();
     enableMobileSheet();
 
     enablePanelDrag();
@@ -3016,6 +3017,53 @@
     }, true);
   }
 
+  function enableMobileControls() {
+    const media = window.matchMedia('(max-width: 600px), (max-height: 500px) and (pointer: coarse)');
+    const menu = panelEl.querySelector('#tabbit-mobile-more');
+    const toggle = panelEl.querySelector('#tabbit-more-btn');
+    const inputRow = panelEl.querySelector('.tabbit-input-row');
+    // 移动原控件而非复制，保留模型切换、加载状态及原事件绑定。
+    const ids = ['tabbit-profile-select', 'tabbit-model-select', 'tabbit-settings-btn',
+      'tabbit-run-btn', 'tabbit-followup-presets'];
+    const controls = [...ids.map(id => panelEl.querySelector('#' + id)), panelEl.querySelector('.tabbit-toolbar')]
+      .map(node => {
+        const anchor = document.createComment('mobile-control-home');
+        node.before(anchor);
+        return { node, anchor };
+      });
+    const labels = { 'tabbit-settings-btn': '设置', 'tabbit-preview-btn': '正文', 'tabbit-addrule-btn': '规则',
+      'tabbit-copy-btn': '复制', 'tabbit-image-btn': '配图', 'tabbit-flomo-btn': 'flomo', 'tabbit-clear-btn': '清空' };
+    Object.entries(labels).forEach(([id, label]) => { panelEl.querySelector('#' + id).dataset.mobileLabel = label; });
+    const setOpen = open => {
+      menu.classList.toggle('tabbit-hidden', !open);
+      toggle.setAttribute('aria-expanded', String(open));
+    };
+    const sync = () => {
+      setOpen(false);
+      controls.forEach(({ node, anchor }) => {
+        if (media.matches) {
+          if (node.id === 'tabbit-run-btn') inputRow.prepend(node);
+          else menu.appendChild(node);
+        } else anchor.after(node);
+      });
+    };
+    toggle.addEventListener('click', () => setOpen(toggle.getAttribute('aria-expanded') !== 'true'));
+    panelEl.addEventListener('pointerdown', event => {
+      if (!menu.contains(event.target) && !toggle.contains(event.target)) setOpen(false);
+    });
+    menu.addEventListener('click', event => {
+      if (event.target.closest('button')) setOpen(false);
+    });
+    panelEl.addEventListener('keydown', event => {
+      if (event.key === 'Escape' && toggle.getAttribute('aria-expanded') === 'true') {
+        setOpen(false);
+        toggle.focus();
+      }
+    });
+    media.addEventListener('change', sync);
+    sync();
+  }
+
   function enableMobileSheet() {
     const media = window.matchMedia('(max-width: 600px), (max-height: 500px) and (pointer: coarse)');
     const stops = [0.35, 0.6, 0.95];
@@ -3034,8 +3082,7 @@
       panelEl.style.setProperty('--tabbit-viewport-top', (viewport?.offsetTop || 0) + 'px');
       const nextHeight = height ?? heightFor(shadowRoot.activeElement === input ? 0.95 : ratio);
       panelEl.style.setProperty('--tabbit-sheet-height', nextHeight + 'px');
-      panelEl.classList.toggle('tabbit-sheet-compact', nextHeight < 440 && (nextHeight < heightFor(0.95) - 1 || availableHeight() < 340));
-      handle.textContent = (ratio === 0.35 ? '小窗' : ratio === 0.6 ? '半屏' : '全屏') + ' · 上下拖动 / 点击切换';
+      handle.title = (ratio === 0.35 ? '小窗' : ratio === 0.6 ? '半屏' : '全屏') + '：上下拖动调整，点击切换高度';
     };
     const persist = value => {
       ratio = value;
