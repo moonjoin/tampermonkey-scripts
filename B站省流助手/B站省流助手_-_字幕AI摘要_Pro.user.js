@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站省流助手 - 字幕AI摘要 Pro
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      5.0.17
+// @version      5.0.18
 // @description  自动提取B站视频字幕，通过自定义AI API生成极简摘要，支持模型切换、持续对话和评论区总结；支持自动解析开关、自动获取模型列表、flomo自动加标签、总结生图和API兜底功能
 // @author       次元饺子
 // @match        https://www.bilibili.com/video/*
@@ -907,6 +907,7 @@
     apiKey: 'sk-xxxx',
     model: 'deepseek-v4-flash',
     flomoApiUrl: '',
+    flomoAutoSend: false,
     flomoTags: '#B站省流助手 #视频摘要',
     modelList: [
       'claude-opus-4-6',
@@ -5613,17 +5614,17 @@
   }
 
   // ==================== 发送到 flomo ====================
-  function buildFlomoContent(text, videoInfo) {
+  function buildFlomoContent(text, videoInfo, pageUrl = window.location.href, kind = '视频摘要', includeDialog = true) {
     const lines = [];
     if (videoInfo) {
       lines.push('📄 ' + (videoInfo.title || '未知标题'));
-      lines.push('🔗 ' + window.location.href);
+      lines.push('🔗 ' + pageUrl);
       lines.push('');
     }
     lines.push('===== 🤖 AI 总结 =====');
     lines.push(text);
     // 后续对话（跳过第一条 user 消息，那是含字幕的完整 prompt）
-    const dialog = conversationHistory.filter(m => m.role !== 'system').slice(2);
+    const dialog = includeDialog ? conversationHistory.filter(m => m.role !== 'system').slice(2) : [];
     if (dialog.length) {
       lines.push('');
       lines.push('===== 💬 后续对话 =====');
@@ -5635,46 +5636,74 @@
         lines.push('');
       }
     }
-    const tags = (CONFIG.flomoTags || '').trim();
-    if (tags) {
-      lines.push('---');
-      lines.push(tags);
-    }
-    return lines.join('\n');
+    return formatFlomoNote(lines.join('\n'), 'B站', kind, CONFIG.flomoTags);
   }
 
-  async function sendToFlomo(text, btn) {
+  // 两个摘要脚本保持相同的检索标签和请求结果规则。
+  function formatFlomoNote(text, source, kind, customTags) {
+    const tags = [...new Set(('#AI摘要 #AI摘要/' + source + ' ' + (customTags || ''))
+      .split(/\s+/).filter(Boolean).map(tag => '#' + tag.replace(/^#+/, '')))];
+    return text.trim() + '\n\n类型：' + kind + '\n\n' + tags.join(' ');
+  }
+
+  const flomoPending = new Set();
+  function postFlomoNote(content, apiUrl) {
+    // 阻止同一页面上自动发送与手动点击同时提交同一条笔记；不自动重试超时请求。
+    const key = apiUrl + '\n' + content;
+    if (flomoPending.has(key)) return Promise.resolve(false);
+    flomoPending.add(key);
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method: 'POST', url: apiUrl,
+        headers: { 'Content-Type': 'application/json' },
+        data: JSON.stringify({ content }), timeout: 30000,
+        onload(res) {
+          try {
+            const data = JSON.parse(res.responseText || '{}');
+            const ok = res.status >= 200 && res.status < 300 &&
+              (data.code === 0 || data.code === 200 ||
+                (data.code == null && (data.message === 'ok' || data.message === 'success')));
+            if (!ok) throw new Error(data.message || 'HTTP ' + res.status);
+            resolve(true);
+          } catch (err) { reject(err); }
+        },
+        onerror() { reject(new Error('网络错误')); },
+        ontimeout() { reject(new Error('发送超时，可能已送达，请先检查 flomo')); },
+        onabort() { reject(new Error('发送已取消')); }
+      });
+    }).finally(() => flomoPending.delete(key));
+  }
+
+  function showFlomoStatus(message) {
+    const notice = document.createElement('div');
+    notice.textContent = message;
+    notice.style.cssText = 'position:fixed;bottom:24px;right:24px;z-index:2147483647;background:#263238;color:white;padding:12px 18px;border-radius:8px;max-width:360px;font-size:14px';
+    document.body.appendChild(notice);
+    setTimeout(() => notice.remove(), 5000);
+  }
+
+  async function sendToFlomo(text, btn, options = {}) {
     if (!CONFIG.flomoApiUrl) {
-      alert('请先在设置中配置 flomo API 地址');
+      if (!options.auto) alert('请先在设置中配置 flomo API 地址');
       return;
     }
-    const content = buildFlomoContent(text, currentVideoInfo);
-    const originalText = btn.textContent;
-    btn.textContent = '⏳ 发送中...';
-    btn.disabled = true;
+    if (!String(text || '').trim()) return;
+    const content = buildFlomoContent(text, options.videoInfo || currentVideoInfo,
+      options.pageUrl || window.location.href, options.kind || '视频摘要', !options.auto && !options.kind);
+    const originalText = btn?.textContent;
+    if (btn) { btn.textContent = '⏳ 发送中...'; btn.disabled = true; }
     try {
-      const res = await gmRequest({
-        method: 'POST',
-        url: CONFIG.flomoApiUrl,
-        headers: { 'Content-Type': 'application/json' },
-        data: JSON.stringify({ content: content }),
-        timeout: AUX_REQUEST_TIMEOUT_MS
-      });
-      if (res.status < 200 || res.status >= 300) {
-        throw new Error('HTTP ' + res.status + ' ' + String(res.responseText || ''));
-      }
-      const data = JSON.parse(res.responseText || '{}');
-      if (data.code === 0 || data.code === 200 || data.message === 'ok') {
-        btn.textContent = '✅ 已发送';
-        setTimeout(() => { btn.textContent = '发送 FLOMO'; btn.disabled = false; }, 2000);
-      } else {
-        throw new Error(data.message || '发送失败');
-      }
+      if (await postFlomoNote(content, CONFIG.flomoApiUrl)) showFlomoStatus('✅ 已发送到 flomo');
     } catch (err) {
-      console.error('[省流助手] 发送到flomo失败:', err);
-      alert('发送到 flomo 失败: ' + err.message);
-      btn.textContent = originalText;
-      btn.disabled = false;
+      showFlomoStatus('发送到 flomo 失败：' + err.message);
+    } finally {
+      if (btn) { btn.textContent = originalText; btn.disabled = false; }
+    }
+  }
+
+  function autoSendFlomo(text, videoInfo, pageUrl, kind = '视频摘要') {
+    if (CONFIG.flomoAutoSend === true && CONFIG.flomoApiUrl) {
+      void sendToFlomo(text, null, { auto: true, videoInfo, pageUrl, kind });
     }
   }
 
@@ -7558,6 +7587,7 @@
         setSummaryReady(panel, contentDiv, videoInfo);
         finishSummaryRun(true);
 
+        autoSendFlomo(textContent, videoInfo, pageUrl);
         startAsyncImageGeneration(contentDiv, textContent, videoInfo);
 
         return;
@@ -7585,6 +7615,7 @@
           title: videoInfo.title
         });
 
+        autoSendFlomo(reply, videoInfo, pageUrl);
         finalizeSummaryUI(contentDiv, reply, pageUrl, videoInfo);
         setSummaryReady(panel, contentDiv, videoInfo);
         finishSummaryRun(true);
@@ -7621,6 +7652,7 @@
 
   // ==================== 评论区总结主流程（流式 + 打断） ====================
   async function runCommentSummary(panel, videoInfo) {
+    const flomoSourceUrl = window.location.href;
     if (isCommentSummarizing) return;
     isCommentSummarizing = true;
 
@@ -7721,6 +7753,7 @@
       });
 
       const reply = await callAIStream(messages, onDelta, buildSummaryStreamOptions(localController.signal));
+      autoSendFlomo(reply, videoInfo, flomoSourceUrl, '评论总结');
 
       commentConversationHistory = [
         { role: 'user', content: fullPrompt },
@@ -7745,7 +7778,7 @@
       }
       const flomoCommentBtn = commentSection.querySelector('#tabbit-flomo-comment');
       if (flomoCommentBtn) {
-        flomoCommentBtn.addEventListener('click', function() { sendToFlomo(reply, this); });
+        flomoCommentBtn.addEventListener('click', function() { sendToFlomo(reply, this, { videoInfo, pageUrl: flomoSourceUrl, kind: '评论总结' }); });
       }
       const exportCommentBtn = commentSection.querySelector('#tabbit-export-comment');
       if (exportCommentBtn) {
@@ -7788,6 +7821,7 @@
 
   // ==================== 弹幕分析主流程（流式 + 打断） ====================
   async function runDanmakuSummary(panel, videoInfo) {
+    const flomoSourceUrl = window.location.href;
     if (isDanmakuAnalyzing) return;
     isDanmakuAnalyzing = true;
 
@@ -7885,6 +7919,7 @@
       });
 
       const reply = await callAIStream(messages, onDelta, buildSummaryStreamOptions(localController.signal));
+      autoSendFlomo(reply, videoInfo, flomoSourceUrl, '弹幕总结');
 
       resultEl.innerHTML = parseMarkdown(reply);
 
@@ -7904,7 +7939,7 @@
       }
       const flomoDanmakuBtn = danmakuSection.querySelector('#tabbit-flomo-danmaku');
       if (flomoDanmakuBtn) {
-        flomoDanmakuBtn.addEventListener('click', function() { sendToFlomo(reply, this); });
+        flomoDanmakuBtn.addEventListener('click', function() { sendToFlomo(reply, this, { videoInfo, pageUrl: flomoSourceUrl, kind: '弹幕总结' }); });
       }
       const exportDanmakuBtn = danmakuSection.querySelector('#tabbit-export-danmaku');
       if (exportDanmakuBtn) {
@@ -7953,6 +7988,7 @@
   const FULL_ANALYSIS_PROMPT = '你是一个专业的视频内容全面分析师。请对以下视频的字幕内容、弹幕和评论进行综合分析，输出一份完整的分析报告，包括：\n1. 【视频核心内容】用简洁的话概括视频到底在讲什么\n2. 【弹幕热评联动】哪些字幕片段引发了最热烈的弹幕/评论讨论，分析观众的反应和情绪\n3. 【观众共鸣点】弹幕和评论中反复出现的话题、梗或观点\n4. 【争议与分歧】弹幕/评论中存在对立看法的地方\n5. 【时间轴亮点】按时间线标注视频中哪些时刻引发了最多的弹幕互动\n6. 【综合评价】综合字幕+弹幕+评论，给出这个视频的整体质量和口碑\n7. 我理解能力差、没耐心，别讲铺垫、别讲背景、别讲废话，只告诉我核心结论和关键点。\n\n重要约束：\n- 只能引用输入数据里已经出现的时间范围，禁止自行猜测、补写或编造时间点。\n- 如果某个结论无法从输入中定位到明确时间范围，直接写“未定位到明确时间点”，不要硬写时间。\n- 优先使用输入中的 [开始-结束] 时间范围；不要把一个时间范围私自改写成别的时间点。';
 
   async function runFullAnalysis(panel, videoInfo) {
+    const flomoSourceUrl = window.location.href;
     if (isFullAnalyzing) return;
     isFullAnalyzing = true;
 
@@ -8077,6 +8113,7 @@
       });
 
       const reply = await callAIStream(messages, onDelta, buildSummaryStreamOptions(localController.signal));
+      autoSendFlomo(reply, videoInfo, flomoSourceUrl, '全面分析');
 
       resultEl.innerHTML = parseMarkdown(reply);
 
@@ -8096,7 +8133,7 @@
       }
       const flomoFullBtn = fullSection.querySelector('#tabbit-flomo-full');
       if (flomoFullBtn) {
-        flomoFullBtn.addEventListener('click', function() { sendToFlomo(reply, this); });
+        flomoFullBtn.addEventListener('click', function() { sendToFlomo(reply, this, { videoInfo, pageUrl: flomoSourceUrl, kind: '全面分析' }); });
       }
       const exportFullBtn = fullSection.querySelector('#tabbit-export-full');
       if (exportFullBtn) {
@@ -8379,6 +8416,8 @@
             </div>
             <div class="tabbit-collapse-body">
               <div class="tabbit-settings-group">
+                <label><input id="ts-flomoAutoSend" type="checkbox" ${CONFIG.flomoAutoSend === true ? 'checked' : ''} /> 总结完成后自动发送到 flomo</label>
+                <div class="tabbit-settings-hint">默认关闭；配置 API 后生效。新生成的视频、评论、弹幕和全面总结会发送，缓存与追问不发送。</div>
                 <div class="tabbit-settings-label">Flomo API</div>
                 <input class="tabbit-settings-input" id="ts-flomoApiUrl" type="text" value="${escapeHtml(CONFIG.flomoApiUrl || '')}" placeholder="https://flomoapp.com/iwh/xxx/xxx/" />
                 <div class="tabbit-settings-hint">flomo 的 API 地址，在 flomo 设置 → API 中获取</div>
@@ -8386,7 +8425,7 @@
               <div class="tabbit-settings-group">
                 <div class="tabbit-settings-label">🏷️ 自动标签</div>
                 <input class="tabbit-settings-input" id="ts-flomoTags" type="text" value="${escapeHtml(CONFIG.flomoTags || '')}" placeholder="#B站省流助手 #视频摘要" />
-                <div class="tabbit-settings-hint">发送到 flomo 时自动追加在内容末尾，多个标签用空格分隔</div>
+                <div class="tabbit-settings-hint">自动附加 #AI摘要 #AI摘要/B站；这里填写额外标签，多个标签用空格分隔</div>
               </div>
             </div>
           </div>
@@ -9150,6 +9189,7 @@
       CONFIG.apiProfiles = editingApiProfiles;
       CONFIG.activeApiProfileId = editingActiveApiProfileId;
       CONFIG.summaryMaxTokens = isNaN(newSummaryMaxTokens) ? DEFAULT_CONFIG.summaryMaxTokens : Math.max(500, Math.min(30000, newSummaryMaxTokens));
+      CONFIG.flomoAutoSend = overlay.querySelector('#ts-flomoAutoSend').checked;
       CONFIG.flomoApiUrl = newFlomoApiUrl;
       CONFIG.flomoTags = newFlomoTags;
       CONFIG.modelList = newModelList.length > 0 ? newModelList : DEFAULT_CONFIG.modelList;
@@ -9289,6 +9329,7 @@
             if (Array.isArray(imported.modelList)) {
               overlay.querySelector('#ts-modelList').value = imported.modelList.join('\n');
             }
+            overlay.querySelector('#ts-flomoAutoSend').checked = imported.flomoAutoSend === true;
             if (imported.flomoApiUrl !== undefined) overlay.querySelector('#ts-flomoApiUrl').value = imported.flomoApiUrl;
             if (imported.flomoTags !== undefined) overlay.querySelector('#ts-flomoTags').value = imported.flomoTags;
             if (imported.commentPromptText) overlay.querySelector('#ts-commentPromptText').value = imported.commentPromptText;
@@ -9368,6 +9409,7 @@
       overlay.querySelector('#ts-model').value = DEFAULT_CONFIG.model;
       var summaryMaxTokensReset = overlay.querySelector('#ts-summaryMaxTokens'); if (summaryMaxTokensReset) summaryMaxTokensReset.value = DEFAULT_CONFIG.summaryMaxTokens;
       overlay.querySelector('#ts-modelList').value = DEFAULT_CONFIG.modelList.join('\n');
+      overlay.querySelector('#ts-flomoAutoSend').checked = false;
       overlay.querySelector('#ts-flomoApiUrl').value = '';
       overlay.querySelector('#ts-flomoTags').value = DEFAULT_CONFIG.flomoTags;
       overlay.querySelector('#ts-commentPromptText').value = COMMENT_PROMPT_TEXT;

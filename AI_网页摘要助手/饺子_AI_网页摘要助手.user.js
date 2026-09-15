@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         饺子 AI 网页摘要助手
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      3.0.8
+// @version      3.0.9
 // @description  指定网站自动弹出 AI 网页摘要，支持连续对话、多预设、多模板、SPA路由、摘要生图、flomo、坚果云双文件云同步。Shadow DOM 隔离样式。
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
@@ -65,6 +65,7 @@
     profiles: [clone(DEFAULT_PROFILE)],
     currentProfileId: 'default',
     flomoApiUrl: '',
+    flomoAutoSend: false,
     promptTemplates: [
       { id: 'default', name: '默认总结', text: DEFAULT_PROMPT_TEXT },
       { id: 'plain', name: '大白话解释', text: '请用非常简单、直白、短句的方式解释这个网页。\n\n请输出：\n1. 一句话说明它在说什么\n2. 三个最重要的点\n3. 普通人应该怎么理解' },
@@ -3324,54 +3325,64 @@
     setStatus('已复制全部对话到剪贴板', 'ok', 1500);
   }
 
-  function sendToFlomo() {
+  // 两个摘要脚本保持相同的检索标签和请求结果规则。
+  function formatFlomoNote(text, source, kind, customTags) {
+    const tags = [...new Set(('#AI摘要 #AI摘要/' + source + ' ' + (customTags || ''))
+      .split(/\s+/).filter(Boolean).map(tag => '#' + tag.replace(/^#+/, '')))];
+    return text.trim() + '\n\n类型：' + kind + '\n\n' + tags.join(' ');
+  }
+
+  const flomoPending = new Set();
+  function postFlomoNote(content, apiUrl) {
+    // 阻止同一页面上自动发送与手动点击同时提交同一条笔记；不自动重试超时请求。
+    const key = apiUrl + '\n' + content;
+    if (flomoPending.has(key)) return Promise.resolve(false);
+    flomoPending.add(key);
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method: 'POST', url: apiUrl,
+        headers: { 'Content-Type': 'application/json' },
+        data: JSON.stringify({ content }), timeout: 30000,
+        onload(res) {
+          try {
+            const data = JSON.parse(res.responseText || '{}');
+            const ok = res.status >= 200 && res.status < 300 &&
+              (data.code === 0 || data.code === 200 ||
+                (data.code == null && (data.message === 'ok' || data.message === 'success')));
+            if (!ok) throw new Error(data.message || 'HTTP ' + res.status);
+            resolve(true);
+          } catch (err) { reject(err); }
+        },
+        onerror() { reject(new Error('网络错误')); },
+        ontimeout() { reject(new Error('发送超时，可能已送达，请先检查 flomo')); },
+        onabort() { reject(new Error('发送已取消')); }
+      });
+    }).finally(() => flomoPending.delete(key));
+  }
+
+  async function sendToFlomo(options = {}) {
     if (!config.flomoApiUrl) {
-      alert('请先在设置中配置 flomo API 地址。');
-      openSettings(); return;
+      if (!options.auto) { alert('请先在设置中配置 flomo API 地址。'); openSettings(); }
+      return;
     }
-    const text = buildConversationText();
+    const text = options.text === undefined ? buildConversationText() : options.text;
     if (!text.trim()) { setStatus('没有可发送的内容', 'error', 1500); return; }
-
-    const tags = (config.flomoTags || '').trim();
-    const content = tags ? `${text}\n\n---\n${tags}` : text;
-
-    const root = shadowRoot;
-    const btn = root?.querySelector('#tabbit-flomo-btn');
+    const content = formatFlomoNote(text, '网页', '网页摘要', config.flomoTags);
+    const btn = shadowRoot?.querySelector('#tabbit-flomo-btn');
     if (btn) { btn.disabled = true; btn.textContent = '⏳'; }
-    setStatus('正在发送到 flomo…', 'loading');
+    try {
+      if (await postFlomoNote(content, config.flomoApiUrl)) setStatus('已发送到 flomo', 'ok', 2000);
+    } catch (err) {
+      setStatus('发送到 flomo 失败：' + err.message, 'error', 5000);
+      if (options.auto) acShowToast('发送到 flomo 失败：' + err.message);
+    } finally {
+      if (btn) { btn.textContent = '🌱'; btn.disabled = false; }
+    }
+  }
 
-    GM_xmlhttpRequest({
-      method: 'POST',
-      url: config.flomoApiUrl,
-      headers: { 'Content-Type': 'application/json' },
-      data: JSON.stringify({ content }),
-      timeout: 30000,
-      onload(res) {
-        try {
-          const data = JSON.parse(res.responseText || '{}');
-          const ok = res.status >= 200 && res.status < 300 &&
-                     (data.code === 0 || data.code === 200 || data.message === 'ok' || data.message === 'success');
-          if (ok) {
-            setStatus('已发送到 flomo', 'ok', 2000);
-            if (btn) {
-              btn.textContent = '✅';
-              setTimeout(() => { btn.textContent = '🌱'; btn.disabled = false; }, 2000);
-            }
-          } else throw new Error(data.message || `HTTP ${res.status}`);
-        } catch (err) {
-          setStatus('发送失败：' + err.message, 'error', 3000);
-          if (btn) { btn.textContent = '🌱'; btn.disabled = false; }
-        }
-      },
-      onerror() {
-        setStatus('发送失败：网络错误', 'error', 3000);
-        if (btn) { btn.textContent = '🌱'; btn.disabled = false; }
-      },
-      ontimeout() {
-        setStatus('发送超时', 'error', 3000);
-        if (btn) { btn.textContent = '🌱'; btn.disabled = false; }
-      }
-    });
+  function autoSendFlomo(text, source) {
+    if (config.flomoAutoSend !== true || !config.flomoApiUrl || !String(text || '').trim()) return;
+    void sendToFlomo({ auto: true, text: `📄 ${source.title}\n🔗 ${source.url}\n\n===== 🤖 AI 总结 =====\n${text}` });
   }
 
   function handleClearConversation() {
@@ -3509,6 +3520,7 @@
    * 14. 总结 + 💬 连续对话
    ******************************************************************/
   async function runSummary(isAuto) {
+    const flomoSource = { title: document.title, url: location.href };
     if (!panelEl) createPanel();
     if (panelEl.classList.contains('tabbit-hidden')) panelEl.classList.remove('tabbit-hidden');
     if (!checkApiConfig()) return;
@@ -3563,6 +3575,7 @@
       if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
       renderConversation();
       setStatus('完成', 'ok', 1500);
+      autoSendFlomo(finalText, flomoSource);
       if (config.enableImageGen === true) {
         triggerImageGenForMessage(conversation.indexOf(streamingMsg), null, { auto: true });
       }
@@ -3585,6 +3598,7 @@
 
   /* ─── 🤫 静默分析：后台执行，不弹出面板 ─── */
   async function runSummarySilent() {
+    const flomoSource = { title: document.title, url: location.href };
     if (!checkApiConfig()) return;
 
     const profile = getCurrentProfile();
@@ -3628,6 +3642,7 @@
         conversation: silentConv,
         pageContextLoaded: true
       };
+      autoSendFlomo(finalText, flomoSource);
       showFloatBadge();
       console.log('[饺子AI-静默] ✅ 分析完成，点击悬浮球查看');
     } catch (err) {
@@ -3636,6 +3651,7 @@
   }
 
   async function runSummaryAppend(template) {
+    const flomoSource = { title: document.title, url: location.href };
     if (!panelEl) createPanel();
     if (panelEl.classList.contains('tabbit-hidden')) panelEl.classList.remove('tabbit-hidden');
     if (!checkApiConfig()) return;
@@ -3684,6 +3700,7 @@
       if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
       renderConversation();
       setStatus('完成', 'ok', 1500);
+      autoSendFlomo(finalText, flomoSource);
       if (config.enableImageGen === true) {
         triggerImageGenForMessage(conversation.indexOf(streamingMsg), null, { auto: true });
       }
@@ -3947,12 +3964,14 @@
             <span class="tabbit-collapse-arrow">▶</span>
           </div>
           <div class="tabbit-collapse-content">
+            <label class="tabbit-field"><span><input id="tabbit-set-flomo-auto" type="checkbox"> 总结完成后自动发送到 flomo</span>
+              <small>默认关闭；配置 API 后生效。含静默总结与重新总结，不含普通追问。</small></label>
             <label class="tabbit-field"><span>flomo API（可选，PRO 会员功能）</span>
               <input id="tabbit-set-flomo-api" type="text" placeholder="https://flomoapp.com/iwh/...">
             </label>
             <label class="tabbit-field"><span>🏷️ flomo 标签</span>
               <input id="tabbit-set-flomo-tags" type="text" placeholder="#饺子AI摘要">
-              <small>发送到 flomo 时自动追加在内容末尾，多个标签用空格分隔</small>
+              <small>自动附加 #AI摘要 #AI摘要/网页；这里填写额外标签，多个标签用空格分隔</small>
             </label>
           </div>
         </div>
@@ -4223,8 +4242,9 @@
     settingsEl.querySelector('#tabbit-set-auto-run').checked = !!config.autoRun;
     settingsEl.querySelector('#tabbit-set-silent-auto-run').checked = !!config.silentAutoRun;
     settingsEl.querySelector("#tabbit-set-enable-thinking").checked = !!config.enableThinking;
+    settingsEl.querySelector('#tabbit-set-flomo-auto').checked = config.flomoAutoSend === true;
     settingsEl.querySelector('#tabbit-set-flomo-api').value = config.flomoApiUrl || '';
-    settingsEl.querySelector('#tabbit-set-flomo-tags').value = config.flomoTags || '#饺子AI摘要';
+    settingsEl.querySelector('#tabbit-set-flomo-tags').value = config.flomoTags ?? '#饺子AI摘要';
     settingsEl.querySelector('#tabbit-set-auto-copy').checked = config.autoCopy?.enabled !== false;
     settingsEl.querySelector('#tabbit-set-auto-copy-source').checked = !!config.autoCopy?.withSource;
     settingsEl.querySelector('#tabbit-set-enable-image-gen').checked = config.enableImageGen === true;
@@ -4417,8 +4437,9 @@
     if (mdEn2) config.systemPromptMdEnabled = mdEn2.checked;
     const mdSys2 = settingsEl.querySelector('#tabbit-set-md-as-system');
     if (mdSys2) config.systemPromptMdAsSystem = mdSys2.checked;
+    config.flomoAutoSend = settingsEl.querySelector('#tabbit-set-flomo-auto').checked;
     config.flomoApiUrl = settingsEl.querySelector('#tabbit-set-flomo-api').value.trim();
-    config.flomoTags = settingsEl.querySelector('#tabbit-set-flomo-tags').value.trim() || '#饺子AI摘要';
+    config.flomoTags = settingsEl.querySelector('#tabbit-set-flomo-tags').value.trim();
     config.autoCopy = {
       enabled: settingsEl.querySelector('#tabbit-set-auto-copy').checked,
       withSource: settingsEl.querySelector('#tabbit-set-auto-copy-source').checked
