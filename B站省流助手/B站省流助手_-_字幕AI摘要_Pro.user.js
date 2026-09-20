@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站省流助手 - 字幕AI摘要 Pro
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      5.0.18
+// @version      5.0.19
 // @description  自动提取B站视频字幕，通过自定义AI API生成极简摘要，支持模型切换、持续对话和评论区总结；支持自动解析开关、自动获取模型列表、flomo自动加标签、总结生图和API兜底功能
 // @author       次元饺子
 // @match        https://www.bilibili.com/video/*
@@ -1113,6 +1113,7 @@
     return [
       'v2',
       bvid,
+      String(videoInfo?.cid || videoInfo?.part || ''),
       model || '',
       presetId || '',
       hashString(promptText || ''),
@@ -1306,11 +1307,77 @@
   // 🆕 流式渲染节流间隔（ms），控制 UI 重绘频率
   const STREAM_RENDER_THROTTLE = 80;
 
-  class BiliRiskControlError extends Error {
-    constructor(message) {
+  // 借鉴 bpi-rs 的语义错误分类；只保存诊断字段，不附带 Cookie 或原始响应。
+  // https://github.com/Yuelioi/bpi-rs/blob/main/src/err/error.rs
+  class BiliApiError extends Error {
+    constructor(message, kind, code, retryable) {
       super(message);
+      this.name = 'BiliApiError';
+      this.kind = kind;
+      this.code = code;
+      this.retryable = retryable === true;
+    }
+  }
+
+  class BiliRiskControlError extends BiliApiError {
+    constructor(message, code) {
+      super(message, 'risk_control', code, false);
       this.name = 'BiliRiskControlError';
     }
+  }
+
+  function makeBiliError(code, isHttp) {
+    const label = (isHttp ? 'HTTP ' : 'code=') + code;
+    if ((isHttp && code === 401) || (!isHttp && [-101, -401, 800501007].includes(code))) {
+      return new BiliApiError('需要登录或登录已失效（' + label + '），请登录后重试', 'login', code, false);
+    }
+    if (!isHttp && [-106, -650].includes(code)) {
+      return new BiliApiError('当前账号缺少会员权限（' + label + '）', 'permission', code, false);
+    }
+    if ((isHttp && code === 412) || (!isHttp && [-352, -412].includes(code))) {
+      return new BiliRiskControlError('B站风控拦截（' + label + '），已停止自动重试，请稍后再试', code);
+    }
+    if (isHttp && code === 429) {
+      return new BiliApiError('B站请求过于频繁（HTTP 429），已停止自动重试，请稍后再试', 'rate_limit', code, false);
+    }
+    if ((isHttp && code === 403) || (!isHttp && [-403, -4].includes(code))) {
+      return new BiliApiError('B站拒绝访问（' + label + '），请检查账号权限', 'permission', code, false);
+    }
+    return new BiliApiError('B站接口请求失败（' + label + '）', isHttp ? 'http' : 'business', code,
+      isHttp && (code === 408 || code >= 500));
+  }
+
+  function checkBiliHttp(response) {
+    if (!response.ok) throw makeBiliError(response.status, true);
+  }
+
+  async function readBiliJson(response, signal) {
+    checkBiliHttp(response);
+    throwIfAborted(signal);
+    let data;
+    try {
+      data = await response.json();
+    } catch (err) {
+      if (isAbortError(err)) throw err;
+      if (err.name !== 'SyntaxError') {
+        throw new BiliApiError('读取B站响应失败，请稍后重试', 'network', null, true);
+      }
+      throw new BiliApiError('B站响应不是有效 JSON，请稍后重试', 'decode', null, false);
+    }
+    throwIfAborted(signal);
+    return data;
+  }
+
+  async function readBiliPayload(response, signal) {
+    const envelope = await readBiliJson(response, signal);
+    if (!envelope || typeof envelope.code !== 'number') {
+      throw new BiliApiError('B站响应缺少业务状态码', 'decode', null, false);
+    }
+    if (envelope.code !== 0) throw makeBiliError(envelope.code, false);
+    if (!envelope.data || typeof envelope.data !== 'object' || Array.isArray(envelope.data)) {
+      throw new BiliApiError('B站响应缺少有效数据', 'decode', null, false);
+    }
+    return envelope.data;
   }
 
   const SAFE_FETCH_HEADERS = {
@@ -1806,14 +1873,25 @@
 
   function getVideoInfo() {
     let cid = null, bvid = null, aid = null, title = '', upName = '', desc = '', duration = 0;
+    const urlParams = new URLSearchParams(window.location.search);
+    const routeBvid = location.pathname.match(/\/video\/(BV\w+)/)?.[1] || urlParams.get('bvid');
+    const requestedPage = urlParams.get('p');
+    let part = requestedPage === null ? 1 : Number(requestedPage);
+    const validPart = Number.isInteger(part) && part > 0;
     try {
       const pageWindow = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
       const state = pageWindow.__INITIAL_STATE__ || window.__INITIAL_STATE__;
-      if (state?.videoData) {
+      // SPA 切换时 INITIAL_STATE 可能仍属于上一条视频，不能拿它的 cid 发请求。
+      if (state?.videoData && (!routeBvid || state.videoData.bvid === routeBvid)) {
         bvid = state.videoData.bvid;
-        aid = state.aid || state.videoData.aid;
-        cid = state.videoData.cid || state.videoData.pages?.[0]?.cid;
+        aid = state.videoData.aid || state.aid;
+        const pages = Array.isArray(state.videoData.pages) ? state.videoData.pages : [];
+        const currentPage = requestedPage === null ? pages.find(page => String(page.cid) === String(state.videoData.cid)) : null;
+        const selectedPage = currentPage || (validPart ? pages.find((page, index) => Number(page.page || index + 1) === part) : null);
+        if (currentPage) part = Number(currentPage.page || pages.indexOf(currentPage) + 1);
+        cid = selectedPage?.cid || (validPart && part === 1 ? state.videoData.cid : null);
         title = state.videoData.title || '';
+        if (selectedPage && pages.length > 1) title += ' - P' + part + ' ' + (selectedPage.part || '');
         upName = state.videoData.owner?.name || '';
         desc = cleanVideoDescription(state.videoData.desc || '');
         if (!desc && Array.isArray(state.videoData.desc_v2)) {
@@ -1821,11 +1899,12 @@
             return item && item.raw_text ? item.raw_text : '';
           }).filter(Boolean).join('\n'));
         }
-        duration = state.videoData.duration || 0;
+        duration = selectedPage?.duration ?? state.videoData.duration ?? 0;
       }
     } catch(e) {
       console.log('[省流助手] 无法从 __INITIAL_STATE__ 获取信息:', e.message);
     }
+    if (routeBvid) bvid = routeBvid;
     if (!bvid) {
       const match = location.pathname.match(/\/video\/(BV\w+)/);
       if (match) bvid = match[1];
@@ -1834,14 +1913,14 @@
       const urlParams = new URLSearchParams(window.location.search);
       aid = urlParams.get('aid');
     }
-    if (!cid) {
+    if (!cid && requestedPage === null) {
       const player = document.querySelector('iframe[src*="cid="]');
       if (player) {
         const match = player.src.match(/cid=(\d+)/);
         if (match) cid = match[1];
       }
     }
-    if (!cid) {
+    if (!cid && requestedPage === null) {
       const urlParams = new URLSearchParams(window.location.search);
       cid = urlParams.get('cid');
     }
@@ -1857,70 +1936,60 @@
     if (!desc) {
       desc = pickDescriptionFromDom();
     }
-    return { bvid, cid, aid, title, upName, desc, duration };
+    return { bvid, cid, aid, title, upName, desc, duration, part };
   }
 
   // ==================== 字幕获取部分 ====================
   async function fetchSubtitlesResult(cid, bvid, signal) {
     if (!cid || !bvid) {
       console.warn('[省流助手] 缺少 cid 或 bvid，跳过字幕接口请求:', { cid: cid, bvid: bvid });
-      return { subtitles: [], status: 'error', reason: '缺少 cid 或 bvid' };
+      return { subtitles: [], status: 'error', reason: '缺少当前分 P 的 cid 或 bvid，请等待播放器就绪后重试', retryable: false };
     }
     throwIfAborted(signal);
-    let successfulResponses = 0;
-    let lastError = '';
-    try {
-      const url = 'https://api.bilibili.com/x/player/wbi/v2?cid=' + cid + '&bvid=' + bvid;
-      const res = await fetchWithTimeout(url, { credentials: 'include', signal: signal }, BILI_API_TIMEOUT_MS);
-      if (!res.ok) throw new Error('HTTP ' + res.status);
-      const data = await res.json();
-      successfulResponses += 1;
-      if (data?.data?.subtitle?.subtitles?.length > 0) {
-        return { subtitles: data.data.subtitle.subtitles, status: 'available', reason: '' };
+    let lastError = null;
+    // 优先已有的普通接口，避免先向 WBI 接口发送未签名请求而触发风控。
+    for (const endpoint of ['/x/player/v2', '/x/player/wbi/v2']) {
+      throwIfAborted(signal);
+      try {
+        const url = 'https://api.bilibili.com' + endpoint + '?cid=' + encodeURIComponent(cid) + '&bvid=' + encodeURIComponent(bvid);
+        const res = await fetchWithTimeout(url, { credentials: 'include', signal: signal }, BILI_API_TIMEOUT_MS);
+        const data = await readBiliPayload(res, signal);
+        const subtitles = data.subtitle?.subtitles;
+        if (!Array.isArray(subtitles) || subtitles.some(s => !s || typeof s.subtitle_url !== 'string' || !s.subtitle_url.trim())) {
+          throw new BiliApiError('字幕列表格式异常，不能判定为无字幕', 'decode', null, false);
+        }
+        if (subtitles.length) return { subtitles, status: 'available', reason: '' };
+        // 一次明确的成功空列表足够结束本轮；主流程仍会二次确认。
+        return { subtitles: [], status: 'empty', reason: '' };
+      } catch (err) {
+        if (isAbortError(err)) throw err;
+        lastError = err;
+        if (['login', 'permission', 'risk_control', 'rate_limit'].includes(err.kind)) break;
       }
-    } catch(e) {
-      if (isAbortError(e)) throw e;
-      lastError = e.message || String(e);
-      console.log('[省流助手] wbi API 失败:', e.message);
     }
-    throwIfAborted(signal);
-    try {
-      const url = 'https://api.bilibili.com/x/player/v2?cid=' + cid + '&bvid=' + bvid;
-      const res = await fetchWithTimeout(url, { credentials: 'include', signal: signal }, BILI_API_TIMEOUT_MS);
-      if (!res.ok) throw new Error('HTTP ' + res.status);
-      const data = await res.json();
-      successfulResponses += 1;
-      if (data?.data?.subtitle?.subtitles?.length > 0) {
-        return { subtitles: data.data.subtitle.subtitles, status: 'available', reason: '' };
-      }
-    } catch(e) {
-      if (isAbortError(e)) throw e;
-      lastError = e.message || String(e);
-      console.log('[省流助手] v2 API 失败:', e.message);
-    }
-    if (successfulResponses > 0) return { subtitles: [], status: 'empty', reason: '' };
-    return { subtitles: [], status: 'error', reason: lastError || '字幕接口请求失败' };
+    return { subtitles: [], status: 'error', reason: lastError?.message || '字幕接口请求失败',
+      retryable: lastError?.retryable !== false, error: lastError };
   }
 
   async function fetchSubtitles(cid, bvid, signal) {
     const result = await fetchSubtitlesResult(cid, bvid, signal);
+    if (result.status === 'error') throw result.error || new BiliApiError(result.reason, 'data', null, false);
     return result.subtitles;
   }
 
   async function fetchSubtitleContent(subtitleUrl, signal) {
-    if (!subtitleUrl) return [];
+    if (!subtitleUrl) throw new BiliApiError('字幕地址缺失', 'data', null, false);
     throwIfAborted(signal);
-    try {
-      const url = subtitleUrl.startsWith('http') ? subtitleUrl : 'https:' + subtitleUrl;
-      const res = await fetchWithTimeout(url, { signal: signal }, BILI_SUBTITLE_TIMEOUT_MS);
-      if (!res.ok) throw new Error('HTTP ' + res.status);
-      const data = await res.json();
-      return normalizeSubtitleSegments(data);
-    } catch(e) {
-      if (isAbortError(e)) throw e;
-      console.log('[省流助手] 字幕内容获取失败:', e.message);
-      return [];
+    const url = subtitleUrl.startsWith('http') ? subtitleUrl : 'https:' + subtitleUrl;
+    const res = await fetchWithTimeout(url, { signal: signal }, BILI_SUBTITLE_TIMEOUT_MS);
+    const data = await readBiliJson(res, signal);
+    if (data && typeof data.code === 'number' && data.code !== 0) throw makeBiliError(data.code, false);
+    if (!Array.isArray(data) && !Array.isArray(data?.body)) {
+      throw new BiliApiError('字幕内容格式异常', 'decode', null, false);
     }
+    const segments = normalizeSubtitleSegments(data);
+    if (!segments.length) throw new BiliApiError('字幕文件没有有效文本，请稍后重试', 'data', null, false);
+    return segments;
   }
 
   function parseSubtitleJsonText(text) {
@@ -1962,7 +2031,21 @@
     return [];
   }
 
-  function acceptCapturedSubtitle(url, text, json) {
+  function getSubtitleCaptureContext() {
+    const info = getVideoInfo();
+    return { route: window.location.href, bvid: info.bvid, cid: String(info.cid || ''), part: info.part };
+  }
+
+  function isCurrentSubtitleCapture(context) {
+    if (!context) return false;
+    const current = getSubtitleCaptureContext();
+    return !!context.bvid && context.route === current.route && context.bvid === current.bvid &&
+      context.cid === current.cid && context.part === current.part;
+  }
+
+  function acceptCapturedSubtitle(url, text, json, context) {
+    // 在请求发出时绑定当前视频；切换后到达的旧响应不能污染新视频。
+    if (!isCurrentSubtitleCapture(context)) return;
     var payload = json || parseSubtitleJsonText(text);
     var segments = findSubtitleSegmentsDeep(payload);
     if (!segments.length) return;
@@ -1974,11 +2057,12 @@
       url: url || '',
       segments: segments,
       transcript: transcript,
+      context: context,
       createdAt: Date.now()
     };
     subtitleCaptureEntries.push(entry);
     if (subtitleCaptureEntries.length > 5) subtitleCaptureEntries.shift();
-    console.log('[省流助手-捕获模式] 已捕获字幕:', url, '段数:', segments.length);
+    console.log('[省流助手-捕获模式] 已捕获字幕，段数:', segments.length);
 
     var waiters = subtitleCaptureWaiters.slice();
     subtitleCaptureWaiters = [];
@@ -1997,13 +2081,14 @@
     var originalFetch = captureWindow.fetch;
     if (typeof originalFetch === 'function') {
       captureWindow.fetch = async function() {
+        var req = arguments[0];
+        var url = typeof req === 'string' ? req : (req && req.url) || '';
+        var context = urlRe.test(url) ? getSubtitleCaptureContext() : null;
         var response = await originalFetch.apply(this, arguments);
         try {
-          var req = arguments[0];
-          var url = typeof req === 'string' ? req : (req && req.url) || '';
-          if (urlRe.test(url) && response && typeof response.clone === 'function') {
+          if (context && response && response.ok && typeof response.clone === 'function') {
             response.clone().text().then(function(text) {
-              acceptCapturedSubtitle(url, text, null);
+              acceptCapturedSubtitle(url, text, null, context);
             }).catch(function(e) {
               console.log('[省流助手-捕获模式] fetch 响应读取失败:', e.message);
             });
@@ -2027,11 +2112,12 @@
         var xhr = this;
         var url = xhr._tabbitSubtitleCaptureUrl || '';
         if (urlRe.test(url)) {
+          var context = getSubtitleCaptureContext();
           xhr.addEventListener('readystatechange', function() {
-            if (xhr.readyState !== 4) return;
+            if (xhr.readyState !== 4 || xhr.status < 200 || xhr.status >= 300) return;
             try {
               var text = typeof xhr.responseText === 'string' ? xhr.responseText : '';
-              acceptCapturedSubtitle(url, text, null);
+              acceptCapturedSubtitle(url, text, null, context);
             } catch(e) {
               console.log('[省流助手-捕获模式] XHR 捕获失败:', e.message);
             }
@@ -2047,7 +2133,7 @@
   function waitForCapturedSubtitle(timeoutMs, signal, minCreatedAt) {
     installSubtitleCaptureInterceptor();
     var latest = subtitleCaptureEntries[subtitleCaptureEntries.length - 1];
-    if (latest && latest.createdAt >= (minCreatedAt || 0) && Date.now() - latest.createdAt < 60000) {
+    if (latest && isCurrentSubtitleCapture(latest.context) && latest.createdAt >= (minCreatedAt || 0) && Date.now() - latest.createdAt < 60000) {
       return Promise.resolve(latest);
     }
 
@@ -2055,7 +2141,7 @@
       var done = false;
       var waiter = {
         resolve: function(entry) {
-          if (entry && entry.createdAt >= (minCreatedAt || 0)) finish(entry);
+          if (entry && isCurrentSubtitleCapture(entry.context) && entry.createdAt >= (minCreatedAt || 0)) finish(entry);
         },
         reject: fail
       };
@@ -3053,6 +3139,7 @@
         return await fn();
       } catch (e) {
         if (isAbortError(e)) throw e;
+        if (e.retryable === false) throw e;
         if (attempt === maxRetries) throw e;
         const backoffDelay = baseDelay * Math.pow(2, attempt) + Math.random() * 1000;
         console.warn('[省流助手] 第' + (attempt + 1) + '次失败，' + (backoffDelay / 1000).toFixed(1) + 's 后重试: ' + e.message);
@@ -3070,9 +3157,7 @@
       });
       if (signal) mergedOptions.signal = signal;
       const resp = await fetchWithTimeout(url, mergedOptions, BILI_API_TIMEOUT_MS);
-      if (resp.status === 412) throw new BiliRiskControlError('触发B站风控(412)，请求被拒绝，请稍后再试');
-      if (resp.status === 403) throw new BiliRiskControlError('被B站拒绝访问(403)，可能需要登录或IP被限制');
-      if (resp.status === 429) throw new BiliRiskControlError('请求过于频繁(429)，触发限流');
+      checkBiliHttp(resp);
       return resp;
     };
   }
@@ -3092,12 +3177,11 @@
   async function fetchComments(safeFetch, aid, page) {
     const url = 'https://api.bilibili.com/x/v2/reply?type=1&oid=' + aid + '&pn=' + page + '&ps=' + COMMENT_CONFIG.pageSize + '&sort=' + COMMENT_CONFIG.sortType;
     const resp = await safeFetch(url);
-    if (!resp.ok) throw new Error('评论API请求失败: HTTP ' + resp.status);
-    const data = await resp.json();
-    if (data.code === -352) throw new BiliRiskControlError('触发B站风控(-352)，请稍后重试');
-    if (data.code === -401) throw new BiliRiskControlError('需要登录才能查看评论');
-    if (data.code !== 0) throw new Error('评论API返回错误: code=' + data.code + ', message=' + (data.message || ''));
-    return data.data;
+    const data = await readBiliPayload(resp);
+    if (data.replies !== null && !Array.isArray(data.replies)) {
+      throw new BiliApiError('评论列表格式异常', 'decode', null, false);
+    }
+    return data;
   }
 
   async function fetchAllComments(aid, statusCallback, signal) {
@@ -3152,6 +3236,7 @@
       } catch (e) {
         if (isAbortError(e)) throw e;
         console.warn('[省流助手] 获取第' + page + '页评论失败:', e.message);
+        if (!allComments.length) throw e;
         if (e instanceof BiliRiskControlError) {
           console.warn('[省流助手] 检测到风控，停止请求');
         }
@@ -3172,12 +3257,20 @@
   async function fetchDanmakuXml(safeFetch, cid) {
     const url = 'https://api.bilibili.com/x/v1/dm/list.so?oid=' + cid;
     const resp = await safeFetch(url);
-    if (!resp.ok) throw new Error('弹幕API请求失败: HTTP ' + resp.status);
+    checkBiliHttp(resp);
     const buf = await resp.arrayBuffer();
     const decoder = new TextDecoder('utf-8');
     const xmlText = decoder.decode(buf);
+    // XML 接口也可能返回 JSON 错误或 HTML 拦截页，不能把它们当作零条弹幕。
+    if (xmlText.trimStart().startsWith('{')) {
+      await readBiliPayload({ ok: true, json: async () => JSON.parse(xmlText) });
+      throw new BiliApiError('弹幕接口返回了非 XML 数据', 'decode', null, false);
+    }
     const parser = new DOMParser();
     const doc = parser.parseFromString(xmlText, 'text/xml');
+    if (doc.querySelector('parsererror') || doc.documentElement?.localName !== 'i') {
+      throw new BiliApiError('弹幕 XML 格式异常', 'decode', null, false);
+    }
     const dNodes = doc.querySelectorAll('d');
     const danmakuList = [];
     dNodes.forEach(function(d) {
@@ -3214,6 +3307,7 @@
       if (e instanceof BiliRiskControlError) {
         console.warn('[省流助手] 检测到风控，停止弹幕请求');
       }
+      throw e;
     }
     return allDanmaku.slice(0, maxDanmaku);
   }
@@ -9456,7 +9550,7 @@
     abortCurrentTask();
     clearSummaryNotice();
     currentSubtitleManualFallback = null;
-    // 捕获缓存没有可靠的视频 ID，切换 SPA 路由时必须清空，避免把上一条视频的字幕直接用于新视频。
+    // 捕获缓存已绑定请求发出时的视频上下文；切换路由后仍清理缓存和等待者。
     subtitleCaptureEntries = [];
     subtitleCaptureWaiters = [];
     isSubtitleCaptureInProgress = false;
@@ -9483,11 +9577,12 @@
     return generation !== routeGeneration || getRouteKey() !== lastRouteKey;
   }
 
-  function isStaleSummaryContext(generation, expectedBvid) {
+  function isStaleSummaryContext(generation, expectedBvid, expectedCid) {
     if (generation !== routeGeneration) return true;
+    if (isStaleRoute(generation)) return true;
     if (!expectedBvid) return isStaleRoute(generation);
-    const currentBvid = getVideoInfo().bvid;
-    return currentBvid !== expectedBvid;
+    const current = getVideoInfo();
+    return current.bvid !== expectedBvid || (expectedCid != null && String(current.cid) !== String(expectedCid));
   }
 
   function scheduleRouteRestart() {
@@ -9542,7 +9637,7 @@
     let overallTimer = null;
     let captureFallbackUsed = false;
     function isParsingVideoStale() {
-      return isStaleSummaryContext(parsingGeneration, videoInfo && videoInfo.bvid);
+      return isStaleSummaryContext(parsingGeneration, videoInfo && videoInfo.bvid, videoInfo && videoInfo.cid);
     }
     function cleanupSubtitleAbortUi() {
       if (subtitleAbortBtnWrap && subtitleAbortBtnWrap.parentNode) {
@@ -9699,6 +9794,9 @@
         const firstSubtitleResult = await fetchSubtitlesResult(videoInfo.cid, videoInfo.bvid, subtitleAbortController.signal);
         throwIfSubtitleForceStopped();
         if (isParsingVideoStale()) return 'stale';
+        if (firstSubtitleResult.status === 'error' && firstSubtitleResult.retryable === false) {
+          throw firstSubtitleResult.error || new Error(firstSubtitleResult.reason);
+        }
 
         let finalSubtitleResult = firstSubtitleResult;
         if (firstSubtitleResult.status !== 'available') {
