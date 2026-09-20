@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站省流助手 - 字幕AI摘要 Pro
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      5.0.19
+// @version      5.0.20
 // @description  自动提取B站视频字幕，通过自定义AI API生成极简摘要，支持模型切换、持续对话和评论区总结；支持自动解析开关、自动获取模型列表、flomo自动加标签、总结生图和API兜底功能
 // @author       次元饺子
 // @match        https://www.bilibili.com/video/*
@@ -1504,13 +1504,17 @@
     timeoutMs = timeoutMs || BILI_API_TIMEOUT_MS;
     const externalSignal = options.signal;
     const controller = new AbortController();
-    let timedOut = false;
-    let fetchResolved = false;
+    throwIfAborted(externalSignal);
+    let rejectStopped;
+    const stopped = new Promise(function(_, reject) { rejectStopped = reject; });
     const onExternalAbort = function() {
+      const err = new Error('用户已打断');
+      err.name = 'AbortError';
+      rejectStopped(err);
       try { controller.abort(); } catch(e) {}
     };
     const timer = setTimeout(function() {
-      timedOut = true;
+      rejectStopped(new BiliApiError('请求超时（' + Math.round(timeoutMs / 1000) + '秒），请稍后重试', 'network', null, true));
       try { controller.abort(); } catch(e) {}
     }, timeoutMs);
     if (externalSignal) {
@@ -1521,38 +1525,28 @@
       }
     }
 
-    // 🆕 Promise.race 兜底：即使 AbortController 在某些环境下静默失效，
-    // 也能保证请求不会永远挂起（常见于安卓 WebView / Tampermonkey）
-    var raceTimer = null;
-    var raceTimeoutPromise = new Promise(function(_, reject) {
-      raceTimer = setTimeout(function() {
-        if (!fetchResolved) {
-          reject(new Error('请求超时（' + Math.round(timeoutMs / 1000) + '秒）'));
-        }
-      }, timeoutMs + 3000);
-    });
-
     try {
-      var result = await Promise.race([
-        fetch(url, Object.assign({}, options, { signal: controller.signal })),
-        raceTimeoutPromise
+      // 此函数仅用于 B站非流式 JSON/XML；完整读取正文后才清理超时与取消监听。
+      // AI 流式请求使用自己的请求链路，不经过这里。
+      return await Promise.race([
+        (async function() {
+          const response = await fetch(url, Object.assign({}, options, { signal: controller.signal }));
+          if (controller.signal.aborted) throw Object.assign(new Error('用户已打断'), { name: 'AbortError' });
+          if (!response.ok) {
+            // 错误响应不等正文，立即让调用方按状态码分类。
+            if (response.body) response.body.cancel().catch(function() {});
+            return response;
+          }
+          const body = await response.arrayBuffer();
+          throwIfAborted(controller.signal);
+          return new Response([204, 205, 304].includes(response.status) ? null : body, {
+            status: response.status, statusText: response.statusText, headers: response.headers
+          });
+        })(),
+        stopped
       ]);
-      fetchResolved = true;
-      return result;
-    } catch (err) {
-      fetchResolved = true;
-      if (isAbortError(err)) {
-        if (externalSignal && externalSignal.aborted && !timedOut) {
-          const abortErr = new Error('用户已打断');
-          abortErr.name = 'AbortError';
-          throw abortErr;
-        }
-        throw new Error('请求超时（' + Math.round(timeoutMs / 1000) + '秒）');
-      }
-      throw err;
     } finally {
       clearTimeout(timer);
-      if (raceTimer) clearTimeout(raceTimer);
       if (externalSignal) externalSignal.removeEventListener('abort', onExternalAbort);
     }
   }
@@ -3186,6 +3180,7 @@
 
   async function fetchAllComments(aid, statusCallback, signal) {
     const allComments = [];
+    allComments.fetchMeta = { pagesFetched: 0, stop: 'page_limit', reason: '' };
     const safeFetch = createSafeFetcher(signal);
     const maxPages = CONFIG.commentMaxPages || COMMENT_CONFIG.maxPages;
     const commentLimit = CONFIG.commentLimit || COMMENT_CONFIG.commentLimit;
@@ -3208,7 +3203,11 @@
         throwIfAborted(signal);
 
         const replies = result?.replies;
-        if (!replies || replies.length === 0) break;
+        allComments.fetchMeta.pagesFetched = page;
+        if (!replies || replies.length === 0) {
+          allComments.fetchMeta.stop = 'end';
+          break;
+        }
 
         for (const reply of replies) {
           if (allComments.length >= commentLimit) break;
@@ -3230,13 +3229,21 @@
 
         if (statusCallback) statusCallback('已获取 ' + allComments.length + ' 条评论 (第' + page + '页)...');
 
-        if (replies.length < COMMENT_CONFIG.pageSize) break;
-        if (allComments.length >= commentLimit) break;
+        if (allComments.length >= commentLimit) {
+          allComments.fetchMeta.stop = 'item_limit';
+          break;
+        }
+        if (replies.length < COMMENT_CONFIG.pageSize) {
+          allComments.fetchMeta.stop = 'end';
+          break;
+        }
 
       } catch (e) {
         if (isAbortError(e)) throw e;
         console.warn('[省流助手] 获取第' + page + '页评论失败:', e.message);
         if (!allComments.length) throw e;
+        allComments.fetchMeta.stop = 'error';
+        allComments.fetchMeta.reason = '第' + page + '页获取失败：' + e.message;
         if (e instanceof BiliRiskControlError) {
           console.warn('[省流助手] 检测到风控，停止请求');
         }
@@ -3246,8 +3253,24 @@
     return allComments;
   }
 
+  function commentCoverageText(comments) {
+    const meta = comments && comments.fetchMeta;
+    if (!meta) return '评论采集范围未确认；不得据此推断整个评论区的观点。';
+    const reasons = { end: '当前分页已读完', page_limit: '达到设置的页数上限',
+      item_limit: '达到设置的评论条数上限', error: meta.reason, unavailable: meta.reason };
+    return '评论采集范围：已读取' + meta.pagesFetched + '页，保留' + comments.length + '条；' +
+      (reasons[meta.stop] || '采集范围未确认') + '。' +
+      (meta.stop === 'end' ? '' : '本次评论数据不完整。') +
+      '楼中楼仅包含接口附带的回复；仅分析本次样本，不代表整个评论区的观点。';
+  }
+
+  function commentCoverageHtml(comments) {
+    return '<div style="background:#fff3cd;color:#856404;padding:6px 10px;border-radius:6px;font-size:12px;margin-bottom:8px;">' +
+      escapeHtml(commentCoverageText(comments)) + '</div>';
+  }
+
   function formatCommentsText(comments) {
-    return comments.map((c, i) => {
+    return commentCoverageText(comments) + '\n\n' + comments.map((c, i) => {
       const prefix = c.isReply ? '  └' : '';
       return prefix + '[' + (i + 1) + '] ' + c.name + ' (👍' + c.like + '): ' + c.text;
     }).join('\n');
@@ -3365,6 +3388,8 @@
 
   function formatFullData(videoInfo, subtitleBody, danmaku, comments, fallbackTranscript) {
     var lines = [];
+    // 放在长字幕之前，避免范围说明被长度截断丢失。
+    lines.push('【评论采集范围】' + commentCoverageText(comments));
     lines.push('【视频信息】');
     lines.push('标题: ' + (videoInfo.title || ''));
     lines.push('UP主: ' + (videoInfo.upName || ''));
@@ -6150,6 +6175,8 @@
   // ==================== 手动获取字幕 ====================
   function setFetchBtnState(btn, text, icon, resetAfterMs) {
     if (!btn) return;
+    if (btn._tabbitFetchResetTimer) clearTimeout(btn._tabbitFetchResetTimer);
+    btn._tabbitFetchResetTimer = null;
     const spanEl = btn.querySelector('span:last-child');
     const iconEl = btn.querySelector('span:first-child');
     if (spanEl && !btn.dataset.defaultText) btn.dataset.defaultText = spanEl.textContent || '';
@@ -6157,7 +6184,8 @@
     if (spanEl) spanEl.textContent = text;
     if (iconEl) iconEl.textContent = icon;
     if (resetAfterMs) {
-      setTimeout(() => {
+      btn._tabbitFetchResetTimer = setTimeout(() => {
+        btn._tabbitFetchResetTimer = null;
         if (spanEl) spanEl.textContent = btn.dataset.defaultText || '手动获取字幕总结';
         if (iconEl) iconEl.textContent = btn.dataset.defaultIcon || '🔄';
         btn.disabled = false;
@@ -6601,13 +6629,26 @@
       return;
     }
 
+    abortCurrentTask();
+    const controller = new AbortController();
+    currentAbortController = controller;
+    contentDiv._tabbitManualSubtitleController = controller;
+    const generation = routeGeneration;
+    const context = getSubtitleCaptureContext();
+    const isCurrent = function() {
+      return contentDiv._tabbitManualSubtitleController === controller && panel.isConnected &&
+        generation === routeGeneration && isCurrentSubtitleCapture(context);
+    };
+    const abortBtn = insertInlineAbortBtn(contentDiv, function() { controller.abort(); }, '⏹ 停止获取字幕');
     if (fetchBtn) {
       fetchBtn.disabled = true;
       setFetchBtnState(fetchBtn, '正在获取字幕...', '⏳');
     }
 
     try {
-      const subtitles = await fetchSubtitles(videoInfo.cid, videoInfo.bvid);
+      const subtitles = await fetchSubtitles(videoInfo.cid, videoInfo.bvid, controller.signal);
+      if (!isCurrent()) return;
+      throwIfAborted(controller.signal);
 
       if (subtitles.length === 0) {
         setFetchBtnState(fetchBtn, '仍未获取到字幕，请稍后再试', '😢', 3000);
@@ -6615,7 +6656,9 @@
       }
 
       const targetSubtitle = subtitles.find(s => s.lan === 'zh-CN' || s.lan === 'ai-zh') || subtitles[0];
-      const content = await fetchSubtitleContent(targetSubtitle.subtitle_url);
+      const content = await fetchSubtitleContent(targetSubtitle.subtitle_url, controller.signal);
+      if (!isCurrent()) return;
+      throwIfAborted(controller.signal);
 
       if (content.length === 0) {
         setFetchBtnState(fetchBtn, '字幕内容为空，请稍后再试', '😢', 3000);
@@ -6632,11 +6675,23 @@
       rawTranscript = transcript;
       console.log('[省流助手] 手动获取成功！');
       panel.querySelectorAll('.tabbit-model-chip').forEach(c => c.classList.remove('disabled'));
-      await runSummary(panel, transcript, videoInfo, content);
+      abortBtn.remove();
+      if (currentAbortController === controller) currentAbortController = null;
+      await runSummary(panel, transcript, videoInfo, content, { generation: generation });
 
     } catch (err) {
+      if (!isCurrent()) return;
+      if (isAbortError(err)) {
+        setFetchBtnState(fetchBtn, '已停止获取字幕', '⏹', 3000);
+        return;
+      }
       console.error('[省流助手] 手动获取字幕失败:', err);
       setFetchBtnState(fetchBtn, '获取失败: ' + err.message, '❌', 3000);
+    } finally {
+      abortBtn.remove();
+      if (currentAbortController === controller) currentAbortController = null;
+      if (isCurrent() && fetchBtn) fetchBtn.disabled = false;
+      if (contentDiv._tabbitManualSubtitleController === controller) delete contentDiv._tabbitManualSubtitleController;
     }
   }
 
@@ -7824,6 +7879,7 @@
       commentSection.innerHTML = `
         <div class="tabbit-comment-section-title">💬 评论区总结 <span style="font-size:11px;color:#999;font-weight:400;">${comments.length}条评论</span></div>
         ${_cmtWarnHtml}
+        ${commentCoverageHtml(comments)}
         <div class="tabbit-comment-result"><span class="tabbit-typing-cursor"></span></div>
       `;
       const resultEl = commentSection.querySelector('.tabbit-comment-result');
@@ -8142,6 +8198,7 @@
 
       // 2. 获取评论
       let comments = [];
+      comments.fetchMeta = { pagesFetched: 0, stop: 'unavailable', reason: '未获取到视频 aid，未请求评论' };
       if (aid) {
         if (statusEl) statusEl.textContent = '正在获取评论...';
         try {
@@ -8151,6 +8208,7 @@
         } catch(e) {
           if (isAbortError(e)) throw e;
           console.warn('[省流助手-全面分析] 评论获取失败:', e.message);
+          comments.fetchMeta = { pagesFetched: 0, stop: 'unavailable', reason: '评论获取失败：' + e.message };
         }
       }
 
@@ -8178,12 +8236,13 @@
       }
       rawFullDataChatContext = '\n\n[全面分析原始数据]\n' + truncatedDataText;
       const activeFullPrompt = CONFIG.fullAnalysisPromptText || FULL_ANALYSIS_PROMPT;
-      const fullPrompt = activeFullPrompt + '\n\n以下是完整数据：\n' + truncatedDataText;
-      lastFullPromptText = activeFullPrompt + '\n\n以下是完整数据：\n' + fullDataText;
+      const fullPrompt = activeFullPrompt + '\n\n以下是本次采集数据，请遵守其中的范围说明：\n' + truncatedDataText;
+      lastFullPromptText = activeFullPrompt + '\n\n以下是本次采集数据，请遵守其中的范围说明：\n' + fullDataText;
 
       const totalItems = (rawSubtitleBody.length || 0) + danmaku.length + comments.length;
       fullSection.innerHTML = `
         <div class="tabbit-full-section-title">🔍 全面分析 <span style="font-size:11px;color:#999;font-weight:400;">（字幕${rawSubtitleBody.length}句 + 弹幕${danmaku.length}条 + 评论${comments.length}条）</span></div>
+        ${commentCoverageHtml(comments)}
         ${wasTruncated ? '<div style="background:#fff3cd;color:#856404;padding:6px 10px;border-radius:6px;font-size:12px;margin-bottom:8px;">⚠️ 原文数据量（' + fullDataText.length.toLocaleString() + '字符）超过上限（' + maxChars.toLocaleString() + '字符），AI 仅分析了前 ' + maxChars.toLocaleString() + ' 字符。点击「📄 导出原文」可获取完整数据。</div>' : ''}
         <div class="tabbit-full-result"><span class="tabbit-typing-cursor"></span></div>
       `;
