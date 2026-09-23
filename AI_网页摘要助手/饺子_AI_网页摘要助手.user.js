@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         饺子 AI 网页摘要助手
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      3.0.9
+// @version      3.0.10
 // @description  指定网站自动弹出 AI 网页摘要，支持连续对话、多预设、多模板、SPA路由、摘要生图、flomo、坚果云双文件云同步。Shadow DOM 隔离样式。
 // @author       次元饺子
 // @icon         https://img.icons8.com/?size=100&id=90385&format=png&color=000000
@@ -2392,7 +2392,7 @@
       }
       .tabbit-settings-content {
         background: #fff; color: #222;
-        width: 600px; max-width: 96vw; max-height: 90vh; overflow-y: auto;
+        width: min(920px, 96vw); max-width: 96vw; max-height: 90vh; overflow-y: auto; box-sizing: border-box;
         border-radius: 14px; padding: 16px 18px;
       }
       .tabbit-settings-header {
@@ -2449,12 +2449,21 @@
       .tabbit-md-textarea { width: 100%; min-height: 120px; padding: 8px; border: 1px solid #d9d9d9; border-radius: 6px; font-family: 'SF Mono', Monaco, Consolas, monospace; font-size: 12px; line-height: 1.5; resize: vertical; box-sizing: border-box; background: #fafafa; color: #333; }
       .tabbit-model-row {
         display: grid;
-        grid-template-columns: 1.6fr .7fr .8fr auto auto;
-        gap: 6px; margin-bottom: 6px; align-items: center;
+        grid-template-columns: minmax(0, 1fr) auto auto;
+        gap: 6px; margin-bottom: 8px; align-items: center; min-width: 0;
       }
+      .tabbit-model-row > .tabbit-model-value { width: 100%; min-width: 0; box-sizing: border-box; padding: 7px 9px; font-size: 13px; border: 1px solid #ddd; border-radius: 7px; }
       .tabbit-model-row input { padding: 5px 7px; font-size: 12px; border: 1px solid #ddd; border-radius: 6px; }
-      .tabbit-current-model { font-size: 11px; display: flex; align-items: center; gap: 3px; }
-      .tabbit-remove-model { background: #fee2e2; color: #b91c1c; border: none; border-radius: 6px; cursor: pointer; padding: 4px 8px; }
+      .tabbit-current-model { font-size: 12px; white-space: nowrap; display: flex; align-items: center; gap: 3px; }
+      .tabbit-model-advanced { grid-column: 1 / -1; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 7px 9px; background: #f8f7fc; border-radius: 7px; }
+      .tabbit-model-advanced summary { color: #71678f; font-size: 11px; cursor: pointer; }
+      .tabbit-model-advanced-fields { display: flex; gap: 6px; flex: 1; min-width: 200px; }
+      .tabbit-model-advanced-fields input { min-width: 0; width: 50%; box-sizing: border-box; }
+      .tabbit-remove-model { background: #fee2e2; color: #b91c1c; border: none; border-radius: 6px; cursor: pointer; padding: 6px 10px; }
+      @media (max-width: 520px) {
+        .tabbit-model-advanced-fields { min-width: 100%; }
+        .tabbit-settings-content { padding: 14px; }
+      }
       .tabbit-tpl-row {
         display: grid;
         grid-template-columns: 1.2fr 3fr auto auto;
@@ -3847,16 +3856,19 @@
               <button id="tabbit-test-api" class="tabbit-secondary-btn" type="button">⚡ 测试 API</button>
               <button id="tabbit-fetch-models" class="tabbit-secondary-btn" type="button">🔄 获取模型列表</button>
             </div>
-            <div class="tabbit-row-2">
-              <label class="tabbit-field"><span>默认 temperature</span>
-                <input id="tabbit-set-temperature" type="number" step="0.1" min="0" max="2">
-              </label>
-              <label class="tabbit-field"><span>默认 max_tokens</span>
-                <input id="tabbit-set-max-tokens" type="number" min="100">
-              </label>
-            </div>
+            <details class="tabbit-model-advanced">
+              <summary>默认生成参数（可选）</summary>
+              <div class="tabbit-model-advanced-fields">
+                <label class="tabbit-field"><span>默认 temperature</span>
+                  <input id="tabbit-set-temperature" type="number" step="0.1" min="0" max="2">
+                </label>
+                <label class="tabbit-field"><span>默认 max_tokens</span>
+                  <input id="tabbit-set-max-tokens" type="number" min="100">
+                </label>
+              </div>
+            </details>
             <div class="tabbit-section-title">🤖 模型预设</div>
-            <small class="tabbit-help">模型属于当前连接预设；可分别设置 temperature 和最大输出。</small>
+            <small class="tabbit-help">模型属于当前连接预设；常用操作保持简洁，高级参数按需展开。</small>
             <div id="tabbit-model-list"></div>
             <div class="tabbit-settings-actions">
               <button id="tabbit-add-model" class="tabbit-secondary-btn" type="button">➕ 添加模型</button>
@@ -4293,14 +4305,19 @@
       const row = document.createElement('div');
       row.className = 'tabbit-model-row';
       row.innerHTML = `
-        <input class="tabbit-model-value" type="text" placeholder="模型名" value="${escapeAttr(model.value || '')}">
-        <input class="tabbit-model-temp" type="number" step="0.1" placeholder="temp" value="${escapeAttr(model.temperature ?? '')}">
-        <input class="tabbit-model-tokens" type="number" placeholder="tokens" value="${escapeAttr(model.maxTokens ?? '')}">
-        <label class="tabbit-current-model">
+        <input class="tabbit-model-value" type="text" placeholder="模型名（如 gpt-4o-mini）" title="模型 ID" value="${escapeAttr(model.value || '')}">
+        <label class="tabbit-current-model" title="设为当前使用的模型">
           <input type="radio" name="tabbit-current-model" ${model.value === profile.currentModel ? 'checked' : ''}>
           当前
         </label>
-        <button class="tabbit-remove-model" type="button">×</button>
+        <button class="tabbit-remove-model" type="button" title="删除此模型">×</button>
+        <details class="tabbit-model-advanced">
+          <summary>高级参数（可选）</summary>
+          <div class="tabbit-model-advanced-fields">
+            <input class="tabbit-model-temp" type="number" step="0.1" placeholder="温度" aria-label="模型温度" value="${escapeAttr(model.temperature ?? '')}">
+            <input class="tabbit-model-tokens" type="number" placeholder="最大 Token" aria-label="模型最大 Token" value="${escapeAttr(model.maxTokens ?? '')}">
+          </div>
+        </details>
       `;
       row.querySelector('.tabbit-remove-model').addEventListener('click', () => {
         syncModelsFromSettings();
