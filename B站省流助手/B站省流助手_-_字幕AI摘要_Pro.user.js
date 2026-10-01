@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站省流助手 - 字幕AI摘要 Pro
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      5.0.20
+// @version      5.0.21
 // @description  自动提取B站视频字幕，通过自定义AI API生成极简摘要，支持模型切换、持续对话和评论区总结；支持自动解析开关、自动获取模型列表、flomo自动加标签、总结生图和API兜底功能
 // @author       次元饺子
 // @match        https://www.bilibili.com/video/*
@@ -1428,6 +1428,7 @@
   let currentSubtitleManualFallback = null;
   let subtitleCaptureInstalled = false;
   let subtitleCaptureEntries = [];
+  let subtitleListCaptureEntries = [];
   let subtitleCaptureWaiters = [];
   let isSubtitleCaptureInProgress = false;
 
@@ -1948,7 +1949,7 @@
         const url = 'https://api.bilibili.com' + endpoint + '?cid=' + encodeURIComponent(cid) + '&bvid=' + encodeURIComponent(bvid);
         const res = await fetchWithTimeout(url, { credentials: 'include', signal: signal }, BILI_API_TIMEOUT_MS);
         const data = await readBiliPayload(res, signal);
-        const subtitles = data.subtitle?.subtitles;
+        const subtitles = readSubtitleList(data.subtitle);
         if (!Array.isArray(subtitles) || subtitles.some(s => !s || typeof s.subtitle_url !== 'string' || !s.subtitle_url.trim())) {
           throw new BiliApiError('字幕列表格式异常，不能判定为无字幕', 'decode', null, false);
         }
@@ -2037,6 +2038,43 @@
       context.cid === current.cid && context.part === current.part;
   }
 
+  function readSubtitleList(subtitle) {
+    return subtitle?.list ?? subtitle?.subtitles;
+  }
+
+  function isPlayerSubtitleListUrl(url) {
+    try {
+      const parsed = new URL(url, location.href);
+      return parsed.hostname === 'api.bilibili.com' &&
+        ['/x/player/v2', '/x/player/wbi/v2'].includes(parsed.pathname);
+    } catch(e) { return false; }
+  }
+
+  function acceptCapturedSubtitleResponse(url, text, json, context) {
+    if (!isPlayerSubtitleListUrl(url)) {
+      acceptCapturedSubtitle(url, text, json, context);
+      return;
+    }
+    if (!isCurrentSubtitleCapture(context)) return;
+    const request = new URL(url, location.href);
+    // 同页预加载其他分 P 的请求也会经过监听，必须核对请求参数。
+    if (!context.cid || request.searchParams.get('cid') !== context.cid) return;
+    const bvid = request.searchParams.get('bvid');
+    if (bvid && bvid !== context.bvid) return;
+    const payload = json || parseSubtitleJsonText(text);
+    if (!payload || payload.code !== 0) return;
+    const subtitles = readSubtitleList(payload.data?.subtitle);
+    if (!Array.isArray(subtitles) || !subtitles.length ||
+        subtitles.some(s => !s || typeof s.subtitle_url !== 'string' || !s.subtitle_url.trim())) return;
+    subtitleListCaptureEntries.push({ subtitles, context, createdAt: Date.now() });
+    if (subtitleListCaptureEntries.length > 5) subtitleListCaptureEntries.shift();
+  }
+
+  function getCurrentCapturedSubtitleList() {
+    return subtitleListCaptureEntries.slice().reverse().find(entry =>
+      isCurrentSubtitleCapture(entry.context) && Date.now() - entry.createdAt < 60000);
+  }
+
   function acceptCapturedSubtitle(url, text, json, context) {
     // 在请求发出时绑定当前视频；切换后到达的旧响应不能污染新视频。
     if (!isCurrentSubtitleCapture(context)) return;
@@ -2077,12 +2115,12 @@
       captureWindow.fetch = async function() {
         var req = arguments[0];
         var url = typeof req === 'string' ? req : (req && req.url) || '';
-        var context = urlRe.test(url) ? getSubtitleCaptureContext() : null;
+        var context = (urlRe.test(url) || isPlayerSubtitleListUrl(url)) ? getSubtitleCaptureContext() : null;
         var response = await originalFetch.apply(this, arguments);
         try {
           if (context && response && response.ok && typeof response.clone === 'function') {
             response.clone().text().then(function(text) {
-              acceptCapturedSubtitle(url, text, null, context);
+              acceptCapturedSubtitleResponse(url, text, null, context);
             }).catch(function(e) {
               console.log('[省流助手-捕获模式] fetch 响应读取失败:', e.message);
             });
@@ -2105,13 +2143,14 @@
       XHR.prototype.send = function() {
         var xhr = this;
         var url = xhr._tabbitSubtitleCaptureUrl || '';
-        if (urlRe.test(url)) {
+        if (urlRe.test(url) || isPlayerSubtitleListUrl(url)) {
           var context = getSubtitleCaptureContext();
           xhr.addEventListener('readystatechange', function() {
             if (xhr.readyState !== 4 || xhr.status < 200 || xhr.status >= 300) return;
             try {
-              var text = typeof xhr.responseText === 'string' ? xhr.responseText : '';
-              acceptCapturedSubtitle(url, text, null, context);
+              var json = xhr.responseType === 'json' ? xhr.response : null;
+              var text = !xhr.responseType || xhr.responseType === 'text' ? xhr.responseText : '';
+              acceptCapturedSubtitleResponse(url, text, json, context);
             } catch(e) {
               console.log('[省流助手-捕获模式] XHR 捕获失败:', e.message);
             }
@@ -9611,6 +9650,7 @@
     currentSubtitleManualFallback = null;
     // 捕获缓存已绑定请求发出时的视频上下文；切换路由后仍清理缓存和等待者。
     subtitleCaptureEntries = [];
+    subtitleListCaptureEntries = [];
     subtitleCaptureWaiters = [];
     isSubtitleCaptureInProgress = false;
     rawMarkdownResult = '';
@@ -9795,6 +9835,31 @@
 
       var fetchFlow = (async function() {
         const loadingSpan = panel.querySelector('.tabbit-panel-content .tabbit-loading span');
+
+        // 优先复用当前视频的正文或播放器字幕列表，不需要改变播放器字幕开关。
+        throwIfSubtitleForceStopped();
+        const cachedBody = subtitleCaptureEntries.slice().reverse().find(entry =>
+          isCurrentSubtitleCapture(entry.context) && Date.now() - entry.createdAt < 60000);
+        if (cachedBody) {
+          rawSubtitleBody = cachedBody.segments;
+          return cachedBody.transcript;
+        }
+        const cachedList = getCurrentCapturedSubtitleList();
+        if (cachedList) {
+          try {
+            if (loadingSpan) loadingSpan.textContent = '正在读取播放器提供的字幕...';
+            const target = cachedList.subtitles.find(s => s.lan === 'zh-CN' || s.lan === 'ai-zh') || cachedList.subtitles[0];
+            const content = await fetchSubtitleContent(target.subtitle_url, subtitleAbortController.signal);
+            throwIfSubtitleForceStopped();
+            if (isParsingVideoStale() || !isCurrentSubtitleCapture(cachedList.context)) return 'stale';
+            rawSubtitleBody = content;
+            return formatTranscript(content);
+          } catch(err) {
+            if (isAbortError(err)) throw err;
+            throwIfSubtitleForceStopped();
+            console.warn('[省流助手] 播放器字幕地址读取失败，继续捕获和接口兜底:', err.message);
+          }
+        }
 
         // 自动解析默认走捕获模式：实际播放器响应通常比字幕接口更可靠。
         // 等待和自动触发共用当前 AbortController，因此「停止自动获取」会同时取消等待。
