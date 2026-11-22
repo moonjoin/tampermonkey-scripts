@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站省流助手 - 字幕AI摘要 Pro
 // @namespace    https://github.com/moonjoin/tampermonkey-scripts
-// @version      5.0.23
+// @version      5.0.24
 // @description  自动提取B站视频字幕，通过自定义AI API生成极简摘要，支持模型切换、持续对话和评论区总结；支持自动解析开关、自动获取模型列表、flomo自动加标签、总结生图和API兜底功能
 // @author       次元饺子
 // @match        https://www.bilibili.com/video/*
@@ -6875,6 +6875,37 @@
       var settled = false;
       var signal = options.signal;
       var lengthErrorMessage = options.lengthErrorMessage;
+      var reasoningLength = 0;
+      var usage = null;
+
+      // 截断诊断：已输出字数、思考字数、接口返回的 token 用量
+      function buildLengthDiagnostics() {
+        var parts = ['请求上限 ' + options.maxTokens + ' tokens', '正文 ' + fullText.length + ' 字'];
+        if (reasoningLength) parts.push('思考 ' + reasoningLength + ' 字');
+        if (usage) {
+          if (usage.prompt_tokens !== undefined) parts.push('输入 ' + usage.prompt_tokens + ' tokens');
+          if (usage.completion_tokens !== undefined) parts.push('输出 ' + usage.completion_tokens + ' tokens');
+          var details = usage.completion_tokens_details;
+          if (details && details.reasoning_tokens) parts.push('其中思考 ' + details.reasoning_tokens + ' tokens');
+        }
+        var hint = '';
+        if (usage && usage.completion_tokens !== undefined && usage.completion_tokens < options.maxTokens * 0.9) {
+          hint = '；实际输出远小于上限，接口/模型可能限制了最大输出';
+        } else if (reasoningLength && reasoningLength > fullText.length) {
+          hint = '；思考内容占用了大部分额度，可尝试关闭「思考」';
+        }
+        return '（' + parts.join('，') + hint + '）';
+      }
+
+      function finishWithLength() {
+        var diag = buildLengthDiagnostics();
+        if (fullText.trim()) {
+          var finalText = fullText + '\n\n---\n> ⚠️ ' + lengthErrorMessage + diag;
+          resolve(finalText);
+        } else {
+          reject(new Error(lengthErrorMessage + diag));
+        }
+      }
 
       function cancelPendingDelta() {
         if (typeof onDelta === 'function' && typeof onDelta.cancel === 'function') {
@@ -6894,8 +6925,11 @@
           if (payload === '[DONE]') { receivedDone = true; return; }
           try {
             var json = JSON.parse(payload);
+            if (json.usage) usage = json.usage;
             var choice = json.choices && json.choices[0];
             if (choice && choice.finish_reason) finishReason = choice.finish_reason;
+            var reasoningDelta = choice && choice.delta && (choice.delta.reasoning_content || choice.delta.reasoning);
+            if (typeof reasoningDelta === 'string') reasoningLength += reasoningDelta.length;
             var delta = choice && ((choice.delta && choice.delta.content) || (choice.message && choice.message.content)) || '';
             if (delta) {
               fullText += delta;
@@ -6919,7 +6953,7 @@
           if (receivedDone && !settled) {
             settled = true;
             cancelPendingDelta();
-            if (finishReason === 'length') reject(new Error(lengthErrorMessage));
+            if (finishReason === 'length') finishWithLength();
             else if (!fullText) reject(new Error('API 响应格式异常'));
             else resolve(fullText);
             try { request.abort(); } catch (e) {}
@@ -6941,11 +6975,14 @@
               var data = JSON.parse(text);
               fullText = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content || '';
               finishReason = data.choices && data.choices[0] && data.choices[0].finish_reason || finishReason;
+              if (data.usage) usage = data.usage;
+              var msg = data.choices && data.choices[0] && data.choices[0].message;
+              if (msg && typeof msg.reasoning_content === 'string') reasoningLength += msg.reasoning_content.length;
               if (fullText && typeof onDelta === 'function') onDelta(fullText, fullText);
             } catch (e) {}
           }
           cancelPendingDelta();
-          if (finishReason === 'length') { reject(new Error(lengthErrorMessage)); return; }
+          if (finishReason === 'length') { finishWithLength(); return; }
           if (!fullText) { reject(new Error('API 响应格式异常')); return; }
           resolve(fullText);
         },
